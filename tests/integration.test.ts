@@ -10,7 +10,9 @@ describe('integration: full task lifecycle', () => {
   let db: TaskDB
 
   beforeEach(() => {
-    try { unlinkSync(TEST_DB) } catch {}
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(TEST_DB + suffix) } catch {}
+    }
     db = new TaskDB(TEST_DB)
   })
 

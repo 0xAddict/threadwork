@@ -42,7 +42,9 @@ export class TaskDB {
   private db: Database
 
   constructor(dbPath: string = DB_PATH) {
-    this.db = new Database(dbPath)
+    this.db = new Database(dbPath, { create: true })
+    this.db.prepare('PRAGMA journal_mode=WAL').run()
+    this.db.prepare('PRAGMA busy_timeout=5000').run()
     this.migrate()
   }
 
