@@ -37,6 +37,33 @@ A shared MCP server backed by SQLite (WAL mode). Every agent connects to the sam
 | `list_tasks` | Query by assignee or status |
 | `send_note` | Append note to task + post to group |
 | `nudge_agent` | `tmux send-keys` to target session |
+| `save_memory` | Store a personal memory (learning, preference, fact, role) |
+| `recall_memories` | Search own + shared memories, boost importance on access |
+| `get_boot_briefing` | Load role + top memories + shared knowledge + recent tasks |
+| `promote_memory` | Share a personal memory with all agents |
+| `pin_memory` | Toggle pin status (pinned = never decays) |
+
+### 3b. Memory Layer (per-agent persistent memory)
+
+Each agent has personal memories stored in the same SQLite database. Memories have importance scores (1-5) that increase on access and decay over time if unused. A nightly consolidation job handles decay, archiving, and pruning.
+
+| Tool | Effect |
+|------|--------|
+| `save_memory` | Store a learning, preference, fact, or role definition |
+| `recall_memories` | Search own + shared memories (boosts importance on access) |
+| `get_boot_briefing` | Load role + top memories + shared knowledge + recent tasks |
+| `promote_memory` | Share a personal memory with all agents |
+| `pin_memory` | Prevent a memory from decaying |
+
+Auto-extraction: `complete_task` automatically creates a `task_summary` memory.
+
+### 3c. Consolidation Layer (nightly cron)
+
+A LaunchAgent runs `consolidate.ts` at 3:00 AM daily:
+1. Decay importance for unaccessed memories (-1 per 7-day period)
+2. Archive memories at importance 0
+3. Prune archived memories older than 90 days
+4. Generate per-agent boot briefing JSON files
 
 ### 4. Communication Layer (Telegram)
 
@@ -77,14 +104,17 @@ Agent A calls create_task(to="steve", description="...")
 │   ├── access.json        (not symlinked — contains secrets)
 │   ├── .env               (not symlinked — contains secrets)
 │   └── locks/             (runtime, not tracked)
-└── mcp-servers/task-board/
-    ├── server.ts          → threadwork/mcp-servers/task-board/server.ts
-    ├── db.ts              → ...
-    ├── config.ts          → ...
-    ├── notify.ts          → ...
-    ├── nudge.ts           → ...
-    ├── mcp.json           → ...
-    └── tasks.db           (runtime, not tracked)
+├── mcp-servers/task-board/
+│   ├── server.ts          → threadwork/mcp-servers/task-board/server.ts
+│   ├── db.ts              → ...
+│   ├── memory.ts          → ...  (NEW)
+│   ├── consolidate.ts     → ...  (NEW)
+│   ├── config.ts          → ...
+│   ├── notify.ts          → ...
+│   ├── nudge.ts           → ...
+│   ├── mcp.json           → ...
+│   ├── briefings/         (runtime, not tracked)
+│   └── tasks.db           (runtime, not tracked)
 ```
 
 Arrows indicate symlinks. The repo is the source of truth; `~/.claude/` is the runtime layout.

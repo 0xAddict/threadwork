@@ -21,5 +21,8 @@ bun.lockb
 # Logs
 *.log
 
+# Briefings (generated at runtime)
+briefings/*.json
+
 # Telegram inbox media
 inbox/

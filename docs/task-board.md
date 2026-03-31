@@ -86,6 +86,61 @@ Sends a message to another agent's tmux session without creating a task.
 
 **Mechanism:** `tmux send-keys -t claude-{agent} {message} Enter`
 
+## Memory Tools
+
+### save_memory
+
+Save a persistent memory for the current agent.
+
+```typescript
+{
+  content: string      // The memory content
+  category: string     // "learning" | "preference" | "fact" | "role"
+  importance?: number  // 1-5 (default: 3)
+  pinned?: boolean     // Prevent decay (default: false)
+}
+```
+
+### recall_memories
+
+Search personal + shared memories. Boosts importance of accessed memories.
+
+```typescript
+{
+  query?: string       // LIKE search on content
+  category?: string    // Filter by category
+  limit?: number       // Default: 10
+}
+```
+
+### get_boot_briefing
+
+Returns tiered boot summary: role, top 5 memories, shared knowledge, recent tasks. Does not update access tracking.
+
+```typescript
+{}  // No parameters
+```
+
+### promote_memory
+
+Promote a personal memory to shared (all agents see it).
+
+```typescript
+{
+  memory_id: number
+}
+```
+
+### pin_memory
+
+Toggle pin status. Pinned memories never decay.
+
+```typescript
+{
+  memory_id: number
+}
+```
+
 ## Database Schema
 
 ```sql
@@ -108,6 +163,33 @@ CREATE TABLE notes (
   from_agent TEXT NOT NULL,
   message TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE memories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent TEXT NOT NULL,                              -- owner or 'shared'
+  content TEXT NOT NULL,
+  category TEXT NOT NULL,                           -- learning, preference, fact, task_summary, role
+  importance INTEGER NOT NULL DEFAULT 3,            -- 1-5
+  pinned INTEGER NOT NULL DEFAULT 0,                -- 1 = never decays
+  source_task_id INTEGER REFERENCES tasks(id),      -- if auto-extracted
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_accessed TEXT NOT NULL DEFAULT (datetime('now')),
+  access_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE memory_archive (
+  id INTEGER PRIMARY KEY,
+  agent TEXT NOT NULL,
+  content TEXT NOT NULL,
+  category TEXT NOT NULL,
+  importance INTEGER NOT NULL,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  source_task_id INTEGER REFERENCES tasks(id),
+  created_at TEXT NOT NULL,
+  last_accessed TEXT NOT NULL,
+  access_count INTEGER NOT NULL DEFAULT 0,
+  archived_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 ```
 
@@ -162,8 +244,10 @@ cd mcp-servers/task-board
 bun test
 ```
 
-14 tests across 4 files:
-- `db.test.ts` — CRUD operations, atomic claims, filters
+29 tests across 6 files:
+- `db.test.ts` — task CRUD operations, atomic claims, filters
 - `nudge.test.ts` — session resolution, command building
 - `notify.test.ts` — message formatting
-- `integration.test.ts` — full lifecycle, concurrent multi-agent scenarios
+- `integration.test.ts` — full task lifecycle, concurrent multi-agent scenarios
+- `memory.test.ts` — memory CRUD, search, access tracking, boot briefing
+- `consolidate.test.ts` — decay, archive, prune, briefing generation
