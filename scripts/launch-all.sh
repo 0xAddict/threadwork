@@ -37,8 +37,13 @@ for session in "${SESSION_NAMES[@]}"; do
   tmux new-session -d -s "$session"
   tmux send-keys -t "$session" "source $POOL_SCRIPT" Enter
 
-  # Auto-accept the workspace trust prompt after delay
-  (sleep $TRUST_DELAY && tmux send-keys -t "$session" Enter 2>/dev/null) &
+  # Auto-accept the workspace trust prompt, then load boot briefing
+  (
+    sleep $TRUST_DELAY
+    tmux send-keys -t "$session" Enter 2>/dev/null
+    sleep 12
+    tmux send-keys -t "$session" "Call get_boot_briefing to load your memory and context." Enter 2>/dev/null
+  ) &
 
   launched=$((launched + 1))
 

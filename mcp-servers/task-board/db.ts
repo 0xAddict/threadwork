@@ -70,6 +70,38 @@ export class TaskDB {
         message TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+
+      CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT NOT NULL,
+        content TEXT NOT NULL,
+        category TEXT NOT NULL,
+        importance INTEGER NOT NULL DEFAULT 3,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        source_task_id INTEGER REFERENCES tasks(id),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_accessed TEXT NOT NULL DEFAULT (datetime('now')),
+        access_count INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_archive (
+        id INTEGER PRIMARY KEY,
+        agent TEXT NOT NULL,
+        content TEXT NOT NULL,
+        category TEXT NOT NULL,
+        importance INTEGER NOT NULL,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        source_task_id INTEGER REFERENCES tasks(id),
+        created_at TEXT NOT NULL,
+        last_accessed TEXT NOT NULL,
+        access_count INTEGER NOT NULL DEFAULT 0,
+        archived_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(agent);
+      CREATE INDEX IF NOT EXISTS idx_memories_agent_importance ON memories(agent, importance DESC);
+      CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+      CREATE INDEX IF NOT EXISTS idx_archive_archived_at ON memory_archive(archived_at);
     `)
   }
 

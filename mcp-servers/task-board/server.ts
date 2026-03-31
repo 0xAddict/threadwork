@@ -15,21 +15,22 @@ import {
   formatNote,
 } from './notify'
 import { DB_PATH, SELF_LABEL } from './config'
+import { MemoryDB } from './memory'
 
 const db = new TaskDB(DB_PATH)
+const mem = new MemoryDB(db)
 
 const mcp = new Server(
   { name: 'task-board', version: '0.1.0' },
   {
     capabilities: { tools: {} },
     instructions: [
-      `You are agent "${SELF_LABEL}". You have a shared task board with other agents (boss, steve, sadie, kiera).`,
-      'Use create_task to assign work to another agent. It auto-nudges them and posts to the team group.',
-      'Use list_tasks to check your inbox (filter: "mine") or see all work.',
-      'Use claim_task when you start working on a task assigned to you.',
-      'Use complete_task when done — include a result summary.',
-      'Use send_note to add context to any task.',
-      'Use nudge_agent to wake an agent without creating a task.',
+      `You are agent "${SELF_LABEL}". You have a shared task board and personal memory with other agents (boss, steve, sadie, kiera).`,
+      'TASK TOOLS: create_task, claim_task, complete_task, list_tasks, send_note, nudge_agent',
+      'MEMORY TOOLS: save_memory (store learnings), recall_memories (search your knowledge), get_boot_briefing (load context on startup)',
+      'MEMORY MANAGEMENT: promote_memory (share with all agents), pin_memory (prevent decay)',
+      'On startup, call get_boot_briefing to load your role, top memories, and recent task history.',
+      'After completing tasks, save important learnings with save_memory.',
       'Always delegate complex work to subagents (Agent tool) to keep your context clean.',
     ].join('\n'),
   },
@@ -112,6 +113,59 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['agent', 'message'],
       },
     },
+    {
+      name: 'save_memory',
+      description: 'Save a memory/learning for yourself. Persists across sessions.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', description: 'The memory content' },
+          category: { type: 'string', enum: ['learning', 'preference', 'fact', 'role'], description: 'Memory category' },
+          importance: { type: 'number', description: 'Importance 1-5 (default: 3). Higher = persists longer.' },
+          pinned: { type: 'boolean', description: 'Pin to prevent decay (default: false). Use for role definitions.' },
+        },
+        required: ['content', 'category'],
+      },
+    },
+    {
+      name: 'recall_memories',
+      description: 'Search your memories and shared team knowledge. Updates access tracking (boosts importance of accessed memories).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search term (matches content)' },
+          category: { type: 'string', enum: ['learning', 'preference', 'fact', 'task_summary', 'role'], description: 'Filter by category' },
+          limit: { type: 'number', description: 'Max results (default: 10)' },
+        },
+      },
+    },
+    {
+      name: 'get_boot_briefing',
+      description: 'Load your boot briefing: role, top memories, shared knowledge, and recent tasks. Call this on startup.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'promote_memory',
+      description: 'Promote a personal memory to shared — all agents will see it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          memory_id: { type: 'number', description: 'The memory ID to promote' },
+        },
+        required: ['memory_id'],
+      },
+    },
+    {
+      name: 'pin_memory',
+      description: 'Toggle pin on a memory. Pinned memories never decay.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          memory_id: { type: 'number', description: 'The memory ID to pin/unpin' },
+        },
+        required: ['memory_id'],
+      },
+    },
   ],
 }))
 
@@ -159,6 +213,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const nudgeMsg = `Task #${task.id} completed by ${SELF_LABEL}: ${result}`
         await nudgeAgent(task.from_agent, nudgeMsg)
         await postToGroup(formatTaskCompleted(task))
+
+        // Auto-extract task summary as memory
+        const priorityToImportance: Record<string, number> = { low: 1, normal: 2, high: 3, urgent: 4 }
+        mem.saveMemory({
+          agent: SELF_LABEL,
+          content: `Task #${task.id}: ${task.description} → Result: ${result}`,
+          category: 'task_summary',
+          importance: priorityToImportance[task.priority] ?? 2,
+          source_task_id: task.id,
+        })
 
         return { content: [{ type: 'text', text: `Task #${task.id} completed. Result: ${result}` }] }
       }
@@ -210,6 +274,87 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         return { content: [{ type: 'text', text: `Nudged ${agent}: ${message}` }] }
+      }
+
+      case 'save_memory': {
+        const content = args.content as string
+        const category = args.category as string
+        const importance = (args.importance as number) ?? 3
+        const pinned = (args.pinned as boolean) ?? false
+
+        const memory = mem.saveMemory({
+          agent: SELF_LABEL,
+          content,
+          category,
+          importance,
+          pinned,
+        })
+
+        return { content: [{ type: 'text', text: `Memory #${memory.id} saved (importance: ${memory.importance}${memory.pinned ? ', pinned' : ''})` }] }
+      }
+
+      case 'recall_memories': {
+        const query = args.query as string | undefined
+        const category = args.category as string | undefined
+        const limit = args.limit as number | undefined
+
+        const memories = mem.recallMemories(SELF_LABEL, { query, category, limit })
+
+        if (memories.length === 0) {
+          return { content: [{ type: 'text', text: 'No memories found.' }] }
+        }
+
+        const lines = memories.map(
+          (m) => `#${m.id} [${m.category}] imp:${m.importance} ${m.pinned ? '📌' : ''} ${m.content}`,
+        )
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      case 'get_boot_briefing': {
+        const briefing = mem.getBootBriefing(SELF_LABEL, db)
+        const sections: string[] = []
+
+        if (briefing.role.length > 0) {
+          sections.push('== ROLE ==\n' + briefing.role.map(m => m.content).join('\n'))
+        }
+        if (briefing.topMemories.length > 0) {
+          sections.push('== TOP MEMORIES ==\n' + briefing.topMemories.map(m => `[${m.category}] ${m.content}`).join('\n'))
+        }
+        if (briefing.sharedMemories.length > 0) {
+          sections.push('== SHARED KNOWLEDGE ==\n' + briefing.sharedMemories.map(m => `[${m.category}] ${m.content}`).join('\n'))
+        }
+        if (briefing.recentTasks.length > 0) {
+          sections.push('== RECENT TASKS ==\n' + briefing.recentTasks.map(t => `#${t.id} ${t.description} → ${t.result}`).join('\n'))
+        }
+
+        if (sections.length === 0) {
+          return { content: [{ type: 'text', text: 'No memories or history yet. You are a fresh agent.' }] }
+        }
+
+        return { content: [{ type: 'text', text: sections.join('\n\n') }] }
+      }
+
+      case 'promote_memory': {
+        const memoryId = args.memory_id as number
+        const promoted = mem.promoteMemory(memoryId)
+
+        if (!promoted) {
+          return { content: [{ type: 'text', text: `Memory #${memoryId} not found.`, isError: true }] }
+        }
+
+        return { content: [{ type: 'text', text: `Memory #${memoryId} promoted to shared. All agents can now see it.` }] }
+      }
+
+      case 'pin_memory': {
+        const memoryId = args.memory_id as number
+        const toggled = mem.pinMemory(memoryId)
+
+        if (!toggled) {
+          return { content: [{ type: 'text', text: `Memory #${memoryId} not found.`, isError: true }] }
+        }
+
+        const state = toggled.pinned ? 'pinned (will not decay)' : 'unpinned (will decay normally)'
+        return { content: [{ type: 'text', text: `Memory #${memoryId} ${state}.` }] }
       }
 
       default:
