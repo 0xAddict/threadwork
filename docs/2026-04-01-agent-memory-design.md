@@ -111,6 +111,8 @@ Output: formatted briefing containing:
 
 Reads from pre-generated briefing JSON file if available (written by nightly consolidation). Falls back to live DB query if stale or missing.
 
+**Important:** get_boot_briefing does NOT update access tracking (last_accessed, access_count, importance). Only recall_memories counts as an access. This prevents a feedback loop where boot-loaded memories always stay at max importance.
+
 ## Auto-Extraction on Task Completion
 
 When `complete_task` is called, automatically insert a memory:
