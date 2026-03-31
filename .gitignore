@@ -1,0 +1,25 @@
+# Secrets
+.env
+*.token
+access.json
+
+# SQLite runtime files
+*.db
+*.db-shm
+*.db-wal
+
+# Lock files
+locks/
+
+# Dependencies
+node_modules/
+bun.lockb
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Telegram inbox media
+inbox/

@@ -1,0 +1,97 @@
+# threadwork
+
+Multi-agent orchestration harness for Claude Code. Runs persistent Claude Code sessions as named agents, coordinated through a shared task board and Telegram.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│  macOS LaunchAgent (com.threadwork.agents)           │
+│  Runs launch-all.sh on boot + every 5 min           │
+└──────────────┬──────────────────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────────────────┐
+│  launch-all.sh                                        │
+│  - Waits for network                                  │
+│  - Clears stale locks                                 │
+│  - Creates 4 tmux sessions (staggered 3s apart)       │
+│  - Each runs: source telegram-pool.sh                 │
+└──────────────┬──────────────────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────────────────┐
+│  telegram-pool.sh (per session)                       │
+│  - Acquires SHA256-locked Telegram bot from pool      │
+│  - Parses per-agent .conf for custom flags            │
+│  - Sets AGENT_LABEL + TELEGRAM_BOT_TOKEN env vars     │
+│  - exec claude --channels + --mcp-config task-board   │
+└──────────────┬──────────────────────────────────────┘
+               │
+    ┌──────────┼──────────┬──────────┐
+    ▼          ▼          ▼          ▼
+ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+ │ Boss │ │Steve │ │Sadie │ │Kiera │  ← Claude Code sessions in tmux
+ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘
+    │        │        │        │
+    └────────┴────┬───┴────────┘
+                  │
+    ┌─────────────┴─────────────┐
+    │  task-board MCP server     │
+    │  SQLite (WAL) shared DB    │
+    │  6 tools: create, claim,   │
+    │  complete, list, note,     │
+    │  nudge                     │
+    ├────────────────────────────┤
+    │  Nudge: tmux send-keys     │
+    │  Notify: Telegram Bot API  │
+    └────────────────────────────┘
+```
+
+## Components
+
+| Component | Location | Docs |
+|-----------|----------|------|
+| Boot orchestrator | `scripts/launch-all.sh` | [boot-sequence.md](docs/boot-sequence.md) |
+| Bot pool allocator | `scripts/telegram-pool.sh` | [telegram-pool.md](docs/telegram-pool.md) |
+| Task board MCP | `mcp-servers/task-board/` | [task-board.md](docs/task-board.md) |
+| Agent configs | `bots/*.conf` | [telegram-pool.md](docs/telegram-pool.md#per-agent-config) |
+| LaunchAgent template | `templates/com.threadwork.agents.plist` | [boot-sequence.md](docs/boot-sequence.md#launchagent) |
+
+## Prerequisites
+
+- macOS (LaunchAgent-based boot)
+- [Bun](https://bun.sh) runtime
+- [Claude Code](https://claude.ai/code) CLI
+- [tmux](https://github.com/tmux/tmux)
+- 1-4 Telegram bots (via [@BotFather](https://t.me/BotFather))
+
+## Quick Start
+
+```bash
+git clone git@github.com:YOUR_USER/threadwork.git ~/threadwork
+cd ~/threadwork
+
+# Install task board dependencies
+cd mcp-servers/task-board && bun install && cd ../..
+
+# Edit telegram-pool.sh with your bot tokens
+$EDITOR scripts/telegram-pool.sh
+
+# Run the install script (creates symlinks into ~/.claude/)
+./scripts/install.sh
+
+# Load the LaunchAgent
+launchctl load ~/Library/LaunchAgents/com.threadwork.agents.plist
+```
+
+## Tests
+
+```bash
+cd mcp-servers/task-board
+bun test
+```
+
+## License
+
+MIT

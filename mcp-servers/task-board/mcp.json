@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "task-board": {
+      "command": "bun",
+      "args": ["run", "THREADWORK_ROOT/mcp-servers/task-board/server.ts"]
+    }
+  }
+}

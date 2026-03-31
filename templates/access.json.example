@@ -1,0 +1,13 @@
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": [
+    "YOUR_TELEGRAM_USER_ID"
+  ],
+  "groups": {
+    "-100YOUR_GROUP_ID": {
+      "requireMention": true,
+      "allowFrom": ["YOUR_TELEGRAM_USER_ID", "BOT_ID_1", "BOT_ID_2"]
+    }
+  },
+  "pending": {}
+}
