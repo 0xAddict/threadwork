@@ -29,6 +29,11 @@ export interface CreateTaskInput {
   priority: string
 }
 
+export interface ListFilter {
+  assignee?: string
+  status?: string
+}
+
 export interface UpdateTaskInput {
   status?: string
 }
@@ -85,17 +90,21 @@ export class TaskDB {
     return stmt.get(id) as Task | null
   }
 
-  listTasks(filter?: string, agent?: string): Task[] {
-    if (filter === 'mine' && agent) {
-      return this.db.prepare('SELECT * FROM tasks WHERE to_agent = ? ORDER BY created_at DESC').all(agent) as Task[]
+  listTasks(filter: ListFilter = {}): Task[] {
+    const conditions: string[] = []
+    const params: unknown[] = []
+
+    if (filter.assignee) {
+      conditions.push('to_agent = ?')
+      params.push(filter.assignee)
     }
-    if (filter === 'pending') {
-      return this.db.prepare("SELECT * FROM tasks WHERE status = 'pending' ORDER BY created_at DESC").all() as Task[]
+    if (filter.status) {
+      conditions.push('status = ?')
+      params.push(filter.status)
     }
-    if (filter === 'completed') {
-      return this.db.prepare("SELECT * FROM tasks WHERE status = 'completed' ORDER BY created_at DESC").all() as Task[]
-    }
-    return this.db.prepare('SELECT * FROM tasks ORDER BY created_at DESC').all() as Task[]
+
+    const where = conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : ''
+    return this.db.prepare(`SELECT * FROM tasks${where} ORDER BY created_at DESC`).all(...params) as Task[]
   }
 
   claimTask(id: number, agent: string): Task | null {
@@ -107,13 +116,13 @@ export class TaskDB {
     return stmt.get(id, agent) as Task | null
   }
 
-  completeTask(id: number, agent: string, result: string): Task | null {
+  completeTask(id: number, result: string): Task | null {
     const stmt = this.db.prepare(`
       UPDATE tasks SET status = 'completed', result = ?, completed_at = datetime('now')
-      WHERE id = ? AND to_agent = ? AND status = 'in_progress'
+      WHERE id = ? AND status = 'in_progress'
       RETURNING *
     `)
-    return stmt.get(result, id, agent) as Task | null
+    return stmt.get(result, id) as Task | null
   }
 
   addNote(taskId: number, fromAgent: string, message: string): Note {
