@@ -6,8 +6,9 @@ Multi-agent orchestration harness for Claude Code. Runs persistent Claude Code s
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  macOS LaunchAgent (com.threadwork.agents)           │
-│  Runs launch-all.sh on boot + every 5 min           │
+│  macOS LaunchAgents                                  │
+│  com.threadwork.agents — boot + heal every 5 min     │
+│  com.threadwork.consolidate — 3am nightly cleanup    │
 └──────────────┬──────────────────────────────────────┘
                │
                ▼
@@ -16,6 +17,7 @@ Multi-agent orchestration harness for Claude Code. Runs persistent Claude Code s
 │  - Waits for network                                  │
 │  - Clears stale locks                                 │
 │  - Creates 4 tmux sessions (staggered 3s apart)       │
+│  - Auto-accepts trust prompt + loads boot briefing    │
 │  - Each runs: source telegram-pool.sh                 │
 └──────────────┬──────────────────────────────────────┘
                │
@@ -39,12 +41,17 @@ Multi-agent orchestration harness for Claude Code. Runs persistent Claude Code s
     ┌─────────────┴─────────────┐
     │  task-board MCP server     │
     │  SQLite (WAL) shared DB    │
-    │  6 tools: create, claim,   │
-    │  complete, list, note,     │
-    │  nudge                     │
+    │  11 tools:                 │
+    │    Tasks: create, claim,   │
+    │    complete, list, note,   │
+    │    nudge                   │
+    │    Memory: save, recall,   │
+    │    briefing, promote, pin  │
     ├────────────────────────────┤
     │  Nudge: tmux send-keys     │
     │  Notify: Telegram Bot API  │
+    │  Memory: per-agent +       │
+    │  shared, importance decay  │
     └────────────────────────────┘
 ```
 
@@ -57,6 +64,9 @@ Multi-agent orchestration harness for Claude Code. Runs persistent Claude Code s
 | Task board MCP | `mcp-servers/task-board/` | [task-board.md](docs/task-board.md) |
 | Agent configs | `bots/*.conf` | [telegram-pool.md](docs/telegram-pool.md#per-agent-config) |
 | LaunchAgent template | `templates/com.threadwork.agents.plist` | [boot-sequence.md](docs/boot-sequence.md#launchagent) |
+| Memory system | `mcp-servers/task-board/memory.ts` | [memory-system.md](docs/memory-system.md) |
+| Nightly consolidation | `mcp-servers/task-board/consolidate.ts` | [memory-system.md](docs/memory-system.md#nightly-consolidation) |
+| Consolidation LaunchAgent | `templates/com.threadwork.consolidate.plist` | [boot-sequence.md](docs/boot-sequence.md#consolidation-launchagent) |
 
 ## Prerequisites
 
@@ -91,6 +101,8 @@ launchctl load ~/Library/LaunchAgents/com.threadwork.agents.plist
 cd mcp-servers/task-board
 bun test
 ```
+
+29 tests across 6 files.
 
 ## License
 

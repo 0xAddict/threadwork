@@ -23,6 +23,25 @@ launchctl unload ~/Library/LaunchAgents/com.threadwork.agents.plist
 ~/.claude/launch-all.sh
 ```
 
+## Consolidation LaunchAgent
+
+**File:** `templates/com.threadwork.consolidate.plist`
+
+Registered at `~/Library/LaunchAgents/com.threadwork.consolidate.plist`. Triggers at:
+- `StartCalendarInterval: Hour=3, Minute=0` — runs at 3:00 AM daily
+
+Runs `bun run consolidate.ts` which handles memory decay, archiving, pruning, and boot briefing generation.
+
+### Manual control
+
+```bash
+# Load
+launchctl load ~/Library/LaunchAgents/com.threadwork.consolidate.plist
+
+# Run manually
+cd ~/.claude/mcp-servers/task-board && bun run consolidate.ts
+```
+
 ## launch-all.sh
 
 **File:** `scripts/launch-all.sh`
@@ -38,6 +57,7 @@ launchctl unload ~/Library/LaunchAgents/com.threadwork.agents.plist
    - `tmux new-session -d -s $session` — create detached session
    - `tmux send-keys` — source the pool script
    - Background subshell sends Enter after 6 seconds (auto-accepts Claude's workspace trust prompt)
+   - 12 seconds after trust prompt: sends `"Call get_boot_briefing to load your memory and context."` to load the agent's persistent memory
    - 3-second sleep between sessions to prevent lock contention
 
 ### Configuration
@@ -68,6 +88,8 @@ LaunchAgent (every 5 min)
               └─→ source telegram-pool.sh
                     └─→ exec claude [flags]    ← replaces shell
                           │
+                          ├─ Trust prompt auto-accepted (6s)
+                          ├─ Boot briefing loaded (18s)
                           ├─ Agent runs...
                           │
                           └─ Exit (crash or /exit)
