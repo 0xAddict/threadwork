@@ -15,7 +15,7 @@ import {
   formatNote,
   formatNudge,
 } from './notify'
-import { DB_PATH, SELF_LABEL, STATUS_DIR, AGENT_SESSIONS, TEAM_AGENTS, WORKER_AGENTS, AGENT_OWNERSHIP } from './config'
+import { DB_PATH, SELF_LABEL, STATUS_DIR, AGENT_SESSIONS, TEAM_AGENTS, WORKER_AGENTS, BOSS_AGENT, AGENT_OWNERSHIP, AGENT_REPORTS_TO } from './config'
 import { join } from 'path'
 import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs'
 import { MemoryDB } from './memory'
@@ -30,6 +30,9 @@ const TEAM_AGENT_LIST = TEAM_AGENTS.join(', ')
 const WORKER_AGENT_LIST = WORKER_AGENTS.join(', ')
 const OWNERSHIP_LINES = WORKER_AGENTS
   .map((agent) => `${agent}: ${AGENT_OWNERSHIP[agent].join(', ')}`)
+  .join(' | ')
+const REPORTING_LINES = WORKER_AGENTS
+  .map((agent) => `${agent} -> ${AGENT_REPORTS_TO[agent]}`)
   .join(' | ')
 
 const isKnownAgent = (agent: string): boolean =>
@@ -105,6 +108,7 @@ const mcp = new Server(
     instructions: [
       `You are agent "${SELF_LABEL}" inside an autonomous DTC ecommerce execution team. You have a shared task board and personal memory with other agents (${TEAM_AGENT_LIST}).`,
       `Sector ownership: ${OWNERSHIP_LINES}.`,
+      `Reporting lines: ${REPORTING_LINES}. Boss is the only final decision-maker for formal escalations.`,
       'TASK TOOLS: create_task, claim_task, complete_task, list_tasks, send_note, nudge_agent, interrupt_agent',
       'STATUS TOOLS: write_status (sub-agents report progress), read_status (monitor loops check progress), clear_status (cleanup after task)',
       'DECISION TOOLS: open_decision, submit_position, critique_position, list_decisions, get_decision_brief, finalize_decision',
@@ -113,6 +117,8 @@ const mcp = new Server(
       'On startup, call get_boot_briefing to load your role, top memories, and recent task history.',
       'After completing tasks, save important learnings with save_memory.',
       'Default operating model: each worker owns a sector and has local authority for reversible choices inside that sector.',
+      'Delegation model: Boss delegates top-level work to the relevant sector owner. Sector owners delegate bounded execution to runners, one-time agents, or narrower specialists instead of doing everything themselves.',
+      'Push back when the human or another owner is wrong. Bring the strongest counter-narrative from your sector before escalating.',
       'Use open_decision only for meaningful choices: high-risk, ambiguous, irreversible, or strategic decisions. Do not turn simple execution work into a debate.',
       `Default review pool for decisions is the worker bench: ${WORKER_AGENT_LIST}.`,
       'Always delegate complex work to subagents (Agent tool) to keep your context clean.',
@@ -199,7 +205,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'open_decision',
-      description: 'Create a decision record for a non-trivial choice. Optionally assigns review tasks to peers.',
+      description: 'Create a decision record for a non-trivial escalated choice. Workers use this to escalate to Boss after gathering counter-narratives; Boss uses it to structure cross-sector review.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -268,7 +274,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'finalize_decision',
-      description: 'Close a decision with a final verdict and rationale. This also writes learning memories so future decisions improve.',
+      description: 'Close a decision with a final verdict and rationale. Boss only. This also writes learning memories so future decisions improve.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -594,6 +600,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           }
         }
 
+        let bossTaskId: number | null = null
+        if (SELF_LABEL !== BOSS_AGENT) {
+          const bossTask = db.createTask({
+            from: SELF_LABEL,
+            to: BOSS_AGENT,
+            description: `Decision #${decision.id}: ${title}. Sector escalation opened by ${SELF_LABEL}; review positions and make the final call with finalize_decision once the record is complete.`,
+            priority,
+          })
+          bossTaskId = bossTask.id
+          await nudgeAgent(
+            BOSS_AGENT,
+            `Decision #${decision.id} has been escalated by ${SELF_LABEL}: ${title}. You are the final decision-maker after review.`,
+          )
+          await postToGroup(formatTaskCreated(bossTask))
+          audit.log(SELF_LABEL, 'decision_escalated_to_boss', { decision_id: decision.id }, bossTask.id)
+        }
+
         await postToGroup(`🧠 Decision #${decision.id} opened by ${SELF_LABEL}: ${title}`)
         audit.log(
           SELF_LABEL,
@@ -603,11 +626,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         const assignmentText =
           reviewTasks.length > 0 ? ` Review tasks created for: ${reviewers.join(', ')}.` : ''
+        const bossText =
+          bossTaskId !== null ? ` Boss escalation task: #${bossTaskId}.` : ''
         return {
           content: [
             {
               type: 'text',
-              text: `Decision #${decision.id} opened [${decision.status}/${decision.priority}] ${decision.title}.${assignmentText}`,
+              text: `Decision #${decision.id} opened [${decision.status}/${decision.priority}] ${decision.title}.${assignmentText}${bossText}`,
             },
           ],
         }
@@ -712,6 +737,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case 'finalize_decision': {
+        if (SELF_LABEL !== BOSS_AGENT) {
+          audit.log(SELF_LABEL, 'decision_finalize_denied', {
+            decision_id: args.decision_id as number,
+            reason: 'boss_only',
+          })
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Only Boss can finalize a formal escalated decision. Submit your position or critique, then escalate to Boss for the final call.',
+                isError: true,
+              },
+            ],
+          }
+        }
+
         const decisionId = args.decision_id as number
         const finalConfidence = normalizeScore(args.final_confidence, 0.7)
         const chosenPositionId = args.chosen_position_id as number | undefined
