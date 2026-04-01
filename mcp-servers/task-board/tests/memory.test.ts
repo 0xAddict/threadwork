@@ -39,6 +39,32 @@ describe('MemoryDB', () => {
     expect(m.importance).toBe(3)
   })
 
+  test('saveMemory dedupes repeated learnings and strengthens support', () => {
+    const first = mem.saveMemory({
+      agent: 'steve',
+      content: 'SMS works better when the offer expires tonight',
+      category: 'learning',
+      importance: 3,
+      quality: 0.6,
+      evidence: 'Campaign 41',
+    })
+    const second = mem.saveMemory({
+      agent: 'steve',
+      content: ' sms works better when the offer expires tonight ',
+      category: 'learning',
+      importance: 4,
+      quality: 0.8,
+      evidence: 'Campaign 44',
+    })
+
+    expect(second.id).toBe(first.id)
+    expect(second.support_count).toBe(2)
+    expect(second.importance).toBe(4)
+    expect(second.quality).toBe(0.8)
+    expect(second.evidence).toContain('Campaign 41')
+    expect(second.evidence).toContain('Campaign 44')
+  })
+
   test('recallMemories returns own + shared memories', () => {
     mem.saveMemory({ agent: 'steve', content: 'Steve specific', category: 'learning' })
     mem.saveMemory({ agent: 'shared', content: 'Shared knowledge', category: 'fact' })
@@ -110,5 +136,46 @@ describe('MemoryDB', () => {
 
     const role = mem.getMemory(briefing.role[0].id)
     expect(role!.access_count).toBe(0)
+  })
+
+  test('challengeMemory downgrades weak learnings into disputed state', () => {
+    const m = mem.saveMemory({
+      agent: 'steve',
+      content: 'Meta broad targeting always wins',
+      category: 'learning',
+      quality: 0.5,
+      evidence: 'Anecdotal',
+    })
+
+    const challenged = mem.challengeMemory(m.id, 'Recent spend lost money on this setup', 0.9)
+    expect(challenged).not.toBeNull()
+    expect(challenged!.challenge_count).toBe(1)
+    expect(challenged!.state).toBe('disputed')
+    expect(challenged!.quality).toBeLessThan(m.quality)
+    expect(challenged!.evidence).toContain('CHALLENGE:')
+  })
+
+  test('supersedeMemory replaces stale guidance with a new active memory', () => {
+    const stale = mem.saveMemory({
+      agent: 'steve',
+      content: 'Discount the hero product every weekend',
+      category: 'learning',
+      quality: 0.55,
+    })
+
+    const replacement = mem.supersedeMemory(stale.id, {
+      content: 'Discount the hero product only when inventory is high and blended margin can absorb it',
+      evidence: 'Margin analysis from Q1',
+      quality: 0.9,
+      classification: 'strategic',
+    })
+
+    expect(replacement).not.toBeNull()
+    expect(replacement!.supersedes_memory_id).toBe(stale.id)
+    expect(replacement!.state).toBe('active')
+    expect(replacement!.classification).toBe('strategic')
+
+    const old = mem.getMemory(stale.id)
+    expect(old!.state).toBe('superseded')
   })
 })

@@ -14,6 +14,23 @@ const BRIEFING_DIR = join(
   'briefings',
 )
 
+const getDecayWindowDays = (memory: { classification: string; state: string; quality: number }): number => {
+  const baseWindow = {
+    foundational: Number.POSITIVE_INFINITY,
+    strategic: 14,
+    operational: 7,
+    observational: 3,
+    ephemeral: 1,
+  }[memory.classification] ?? 7
+
+  if (!Number.isFinite(baseWindow)) return baseWindow
+
+  let adjusted = baseWindow
+  if (memory.state === 'disputed') adjusted = Math.max(1, Math.floor(adjusted / 2))
+  if (memory.quality < 0.45) adjusted = Math.max(1, Math.floor(adjusted / 2))
+  return adjusted
+}
+
 export function runDecay(mem: MemoryDB): number {
   const candidates = mem.getDecayCandidate()
   let count = 0
@@ -22,7 +39,15 @@ export function runDecay(mem: MemoryDB): number {
     const lastAccessed = new Date(m.last_accessed + 'Z')
     const now = new Date()
     const daysSinceAccess = Math.floor((now.getTime() - lastAccessed.getTime()) / (1000 * 60 * 60 * 24))
-    const decayPeriods = Math.floor(daysSinceAccess / 7)
+    const decayWindow = getDecayWindowDays(m)
+    if (!Number.isFinite(decayWindow) || daysSinceAccess < decayWindow) {
+      continue
+    }
+
+    let decayPeriods = Math.floor(daysSinceAccess / decayWindow)
+    if (m.challenge_count > m.support_count) {
+      decayPeriods += 1
+    }
     const newImportance = Math.max(m.importance - decayPeriods, 0)
 
     if (newImportance !== m.importance) {
@@ -36,7 +61,10 @@ export function runDecay(mem: MemoryDB): number {
 
 export function runArchive(mem: MemoryDB): number {
   const db = (mem as any).db
-  const candidates = db.prepare('SELECT id FROM memories WHERE importance <= 0 AND pinned = 0').all() as { id: number }[]
+  const candidates = db.prepare(`
+    SELECT id FROM memories
+    WHERE (importance <= 0 AND pinned = 0) OR state = 'superseded'
+  `).all() as { id: number }[]
 
   for (const c of candidates) {
     mem.archiveMemory(c.id)

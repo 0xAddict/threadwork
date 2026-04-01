@@ -5,6 +5,7 @@ describe('nudge', () => {
   test('resolveSession maps agent label to tmux session name', () => {
     expect(resolveSession('steve')).toBe('claude-steve')
     expect(resolveSession('boss')).toBe('claude-boss')
+    expect(resolveSession('snoopy')).toBe('claude-snoopy')
     expect(resolveSession('unknown-agent')).toBeNull()
   })
 

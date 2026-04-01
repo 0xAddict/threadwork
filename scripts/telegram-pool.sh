@@ -14,6 +14,7 @@ BOTS=(
   "YOUR_BOT_TOKEN_2|Steve|$HOME/.claude/bots/steve.conf"
   "YOUR_BOT_TOKEN_3|Sadie|$HOME/.claude/bots/sadie.conf"
   "YOUR_BOT_TOKEN_4|Kiera|$HOME/.claude/bots/kiera.conf"
+  "YOUR_BOT_TOKEN_5|Snoopy|$HOME/.claude/bots/snoopy.conf"
 )
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -118,12 +119,12 @@ CHOSEN_ID=""
 CHOSEN_CONF=""
 
 for entry in "${BOTS[@]}"; do
-  local token="${entry%%|*}"
-  local rest="${entry#*|}"
-  local label="${rest%%|*}"
-  local conf="${rest#*|}"
+  token="${entry%%|*}"
+  rest="${entry#*|}"
+  label="${rest%%|*}"
+  conf="${rest#*|}"
   # Use a hash of the token as the lock ID (avoids special chars in filenames)
-  local lock_id
+  lock_id=""
   lock_id=$(echo -n "$token" | shasum -a 256 | cut -c1-12)
 
   if ! is_locked "$lock_id"; then
@@ -149,7 +150,7 @@ else
   echo "✓  Using Telegram bot: $CHOSEN_LABEL"
 
   # Build per-bot flags from config file
-  local -a bot_flags=()
+  bot_flags=()
   if [[ -n "$CHOSEN_CONF" && -f "$CHOSEN_CONF" ]]; then
     bot_flags=($(parse_bot_flags "$CHOSEN_CONF"))
     echo "  Config: $CHOSEN_CONF"

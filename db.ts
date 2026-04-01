@@ -79,6 +79,15 @@ export class TaskDB {
         importance INTEGER NOT NULL DEFAULT 3,
         pinned INTEGER NOT NULL DEFAULT 0,
         source_task_id INTEGER REFERENCES tasks(id),
+        classification TEXT NOT NULL DEFAULT 'operational',
+        quality REAL NOT NULL DEFAULT 0.6,
+        state TEXT NOT NULL DEFAULT 'active',
+        source_type TEXT NOT NULL DEFAULT 'manual',
+        evidence TEXT,
+        support_count INTEGER NOT NULL DEFAULT 1,
+        challenge_count INTEGER NOT NULL DEFAULT 0,
+        supersedes_memory_id INTEGER REFERENCES memories(id),
+        last_validated TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         last_accessed TEXT NOT NULL DEFAULT (datetime('now')),
         access_count INTEGER NOT NULL DEFAULT 0
@@ -92,6 +101,15 @@ export class TaskDB {
         importance INTEGER NOT NULL,
         pinned INTEGER NOT NULL DEFAULT 0,
         source_task_id INTEGER REFERENCES tasks(id),
+        classification TEXT NOT NULL DEFAULT 'operational',
+        quality REAL NOT NULL DEFAULT 0.6,
+        state TEXT NOT NULL DEFAULT 'archived',
+        source_type TEXT NOT NULL DEFAULT 'manual',
+        evidence TEXT,
+        support_count INTEGER NOT NULL DEFAULT 1,
+        challenge_count INTEGER NOT NULL DEFAULT 0,
+        supersedes_memory_id INTEGER,
+        last_validated TEXT,
         created_at TEXT NOT NULL,
         last_accessed TEXT NOT NULL,
         access_count INTEGER NOT NULL DEFAULT 0,
@@ -101,6 +119,8 @@ export class TaskDB {
       CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(agent);
       CREATE INDEX IF NOT EXISTS idx_memories_agent_importance ON memories(agent, importance DESC);
       CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+      CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state);
+      CREATE INDEX IF NOT EXISTS idx_memories_classification ON memories(classification);
       CREATE INDEX IF NOT EXISTS idx_archive_archived_at ON memory_archive(archived_at);
 
       CREATE TABLE IF NOT EXISTS audit_log (
@@ -117,6 +137,54 @@ export class TaskDB {
       CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
       CREATE INDEX IF NOT EXISTS idx_audit_task ON audit_log(task_id);
       CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
+
+      CREATE TABLE IF NOT EXISTS decisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        priority TEXT NOT NULL DEFAULT 'normal',
+        status TEXT NOT NULL DEFAULT 'open',
+        final_summary TEXT,
+        final_rationale TEXT,
+        final_confidence REAL,
+        chosen_position_id INTEGER,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        closed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS decision_positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        decision_id INTEGER NOT NULL REFERENCES decisions(id),
+        agent TEXT NOT NULL,
+        stance TEXT NOT NULL DEFAULT 'proposal',
+        summary TEXT NOT NULL,
+        rationale TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        evidence TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS decision_critiques (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        decision_id INTEGER NOT NULL REFERENCES decisions(id),
+        position_id INTEGER NOT NULL REFERENCES decision_positions(id),
+        agent TEXT NOT NULL,
+        dimension TEXT NOT NULL DEFAULT 'contrarian',
+        summary TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'medium',
+        confidence REAL NOT NULL DEFAULT 0.5,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
+      CREATE INDEX IF NOT EXISTS idx_decisions_created_by ON decisions(created_by);
+      CREATE INDEX IF NOT EXISTS idx_positions_decision ON decision_positions(decision_id);
+      CREATE INDEX IF NOT EXISTS idx_positions_agent ON decision_positions(agent);
+      CREATE INDEX IF NOT EXISTS idx_critiques_decision ON decision_critiques(decision_id);
+      CREATE INDEX IF NOT EXISTS idx_critiques_position ON decision_critiques(position_id);
     `)
 
     // Add nudge_count column if missing (safe migration for existing DBs)
@@ -125,6 +193,49 @@ export class TaskDB {
     } catch {
       // Column already exists
     }
+
+    const safeAlterStatements = [
+      "ALTER TABLE memories ADD COLUMN classification TEXT NOT NULL DEFAULT 'operational'",
+      "ALTER TABLE memories ADD COLUMN quality REAL NOT NULL DEFAULT 0.6",
+      "ALTER TABLE memories ADD COLUMN state TEXT NOT NULL DEFAULT 'active'",
+      "ALTER TABLE memories ADD COLUMN source_type TEXT NOT NULL DEFAULT 'manual'",
+      "ALTER TABLE memories ADD COLUMN evidence TEXT",
+      "ALTER TABLE memories ADD COLUMN support_count INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE memories ADD COLUMN challenge_count INTEGER NOT NULL DEFAULT 0",
+      'ALTER TABLE memories ADD COLUMN supersedes_memory_id INTEGER',
+      'ALTER TABLE memories ADD COLUMN last_validated TEXT',
+      "ALTER TABLE memory_archive ADD COLUMN classification TEXT NOT NULL DEFAULT 'operational'",
+      "ALTER TABLE memory_archive ADD COLUMN quality REAL NOT NULL DEFAULT 0.6",
+      "ALTER TABLE memory_archive ADD COLUMN state TEXT NOT NULL DEFAULT 'archived'",
+      "ALTER TABLE memory_archive ADD COLUMN source_type TEXT NOT NULL DEFAULT 'manual'",
+      'ALTER TABLE memory_archive ADD COLUMN evidence TEXT',
+      "ALTER TABLE memory_archive ADD COLUMN support_count INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE memory_archive ADD COLUMN challenge_count INTEGER NOT NULL DEFAULT 0",
+      'ALTER TABLE memory_archive ADD COLUMN supersedes_memory_id INTEGER',
+      'ALTER TABLE memory_archive ADD COLUMN last_validated TEXT',
+    ]
+
+    for (const statement of safeAlterStatements) {
+      try {
+        this.db.exec(statement)
+      } catch {
+        // Column already exists.
+      }
+    }
+
+    this.db.exec(`
+      UPDATE memories
+      SET last_validated = COALESCE(last_validated, created_at),
+          state = COALESCE(state, 'active'),
+          source_type = COALESCE(source_type, 'manual'),
+          classification = COALESCE(classification, 'operational');
+
+      UPDATE memory_archive
+      SET last_validated = COALESCE(last_validated, created_at),
+          state = COALESCE(state, 'archived'),
+          source_type = COALESCE(source_type, 'manual'),
+          classification = COALESCE(classification, 'operational');
+    `)
   }
 
   createTask(input: CreateTaskInput): Task {

@@ -15,28 +15,101 @@ import {
   formatNote,
   formatNudge,
 } from './notify'
-import { DB_PATH, SELF_LABEL, STATUS_DIR, AGENT_SESSIONS } from './config'
+import { DB_PATH, SELF_LABEL, STATUS_DIR, AGENT_SESSIONS, TEAM_AGENTS, WORKER_AGENTS } from './config'
 import { join } from 'path'
 import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs'
 import { MemoryDB } from './memory'
 import { AuditLog } from './audit'
+import { DecisionDB } from './decision'
 
 const db = new TaskDB(DB_PATH)
 const mem = new MemoryDB(db)
 const audit = new AuditLog(db)
+const decisions = new DecisionDB(db)
+const TEAM_AGENT_LIST = TEAM_AGENTS.join(', ')
+const WORKER_AGENT_LIST = WORKER_AGENTS.join(', ')
+
+const isKnownAgent = (agent: string): boolean =>
+  Object.prototype.hasOwnProperty.call(AGENT_SESSIONS, agent)
+
+const normalizeScore = (raw: unknown, fallback: number = 0.6): number => {
+  const parsed = typeof raw === 'number' ? raw : Number(raw)
+  if (!Number.isFinite(parsed)) return fallback
+  if (parsed <= 1) return Math.max(0.05, Math.min(1, parsed))
+  if (parsed <= 10) return Math.max(0.05, Math.min(1, parsed / 10))
+  return Math.max(0.05, Math.min(1, parsed / 100))
+}
+
+const parseAgentList = (input: unknown): string[] => {
+  if (!Array.isArray(input)) return []
+  return input
+    .map((value) => String(value).toLowerCase())
+    .filter((value, index, all) => value in AGENT_SESSIONS && all.indexOf(value) === index)
+}
+
+const formatDecisionBrief = (brief: ReturnType<DecisionDB['getDecisionBrief']>): string => {
+  if (!brief) return 'Decision not found.'
+
+  const critiqueMap = new Map<number, string[]>()
+  for (const critique of brief.critiques) {
+    const bucket = critiqueMap.get(critique.position_id) ?? []
+    bucket.push(
+      `  - ${critique.agent} [${critique.dimension}/${critique.severity}] conf:${critique.confidence.toFixed(2)} ${critique.summary}`,
+    )
+    critiqueMap.set(critique.position_id, bucket)
+  }
+
+  const lines = [
+    `Decision #${brief.decision.id} [${brief.decision.status}/${brief.decision.priority}] ${brief.decision.title}`,
+    `Question: ${brief.decision.description}`,
+  ]
+
+  if (brief.decision.final_summary) {
+    lines.push(`Final: ${brief.decision.final_summary}`)
+  }
+  if (brief.decision.final_rationale) {
+    lines.push(`Rationale: ${brief.decision.final_rationale}`)
+  }
+
+  if (brief.positions.length === 0) {
+    lines.push('Positions: none yet.')
+    return lines.join('\n')
+  }
+
+  lines.push('Positions:')
+  for (const position of brief.positions) {
+    lines.push(
+      `- #${position.id} ${position.agent} [${position.stance}/${position.status}] conf:${position.confidence.toFixed(2)} ${position.summary}`,
+    )
+    lines.push(`  rationale: ${position.rationale}`)
+    if (position.evidence) {
+      lines.push(`  evidence: ${position.evidence}`)
+    }
+
+    const critiques = critiqueMap.get(position.id) ?? []
+    if (critiques.length > 0) {
+      lines.push(...critiques)
+    }
+  }
+
+  return lines.join('\n')
+}
 
 const mcp = new Server(
   { name: 'task-board', version: '0.1.0' },
   {
     capabilities: { tools: {} },
     instructions: [
-      `You are agent "${SELF_LABEL}". You have a shared task board and personal memory with other agents (boss, steve, sadie, kiera).`,
+      `You are agent "${SELF_LABEL}" inside an autonomous DTC ecommerce execution team. You have a shared task board and personal memory with other agents (${TEAM_AGENT_LIST}).`,
       'TASK TOOLS: create_task, claim_task, complete_task, list_tasks, send_note, nudge_agent, interrupt_agent',
       'STATUS TOOLS: write_status (sub-agents report progress), read_status (monitor loops check progress), clear_status (cleanup after task)',
+      'DECISION TOOLS: open_decision, submit_position, critique_position, list_decisions, get_decision_brief, finalize_decision',
       'MEMORY TOOLS: save_memory (store learnings), recall_memories (search your knowledge), get_boot_briefing (load context on startup)',
-      'MEMORY MANAGEMENT: promote_memory (share with all agents), pin_memory (prevent decay)',
+      'MEMORY MANAGEMENT: promote_memory (share with all agents), pin_memory (prevent decay), challenge_memory (mark a learning disputed), supersede_memory (replace stale learning)',
       'On startup, call get_boot_briefing to load your role, top memories, and recent task history.',
       'After completing tasks, save important learnings with save_memory.',
+      'Use open_decision only for meaningful choices: high-risk, ambiguous, irreversible, or strategic decisions. Do not turn simple execution work into a debate.',
+      `Default review pool for decisions is the worker bench: ${WORKER_AGENT_LIST}.`,
       'Always delegate complex work to subagents (Agent tool) to keep your context clean.',
     ].join('\n'),
   },
@@ -51,7 +124,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          to: { type: 'string', description: 'Target agent: boss, steve, sadie, or kiera' },
+          to: { type: 'string', description: `Target agent: ${TEAM_AGENT_LIST}` },
           description: { type: 'string', description: 'What needs to be done' },
           priority: { type: 'string', enum: ['low', 'normal', 'high', 'urgent'], description: 'Task priority (default: normal)' },
         },
@@ -113,10 +186,94 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          agent: { type: 'string', description: 'Target agent: boss, steve, sadie, or kiera' },
+          agent: { type: 'string', description: `Target agent: ${TEAM_AGENT_LIST}` },
           message: { type: 'string', description: 'The message to send' },
         },
         required: ['agent', 'message'],
+      },
+    },
+    {
+      name: 'open_decision',
+      description: 'Create a decision record for a non-trivial choice. Optionally assigns review tasks to peers.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Short name for the decision' },
+          description: { type: 'string', description: 'What needs to be decided and what constraint matters' },
+          priority: { type: 'string', enum: ['low', 'normal', 'high', 'urgent'], description: 'Decision urgency (default: normal)' },
+          assign_agents: { type: 'array', items: { type: 'string' }, description: 'Optional agent list to request positions from' },
+          auto_assign: { type: 'boolean', description: 'If true, create review tasks for the selected/default agents (default: true)' },
+        },
+        required: ['title', 'description'],
+      },
+    },
+    {
+      name: 'submit_position',
+      description: 'Submit your current position on a decision. Replaces your previous active position for that decision.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          decision_id: { type: 'number', description: 'Decision ID' },
+          stance: { type: 'string', enum: ['proposal', 'oppose', 'counterproposal', 'risk', 'evidence'], description: 'What kind of position this is' },
+          summary: { type: 'string', description: 'Short recommendation or claim' },
+          rationale: { type: 'string', description: 'Why you believe this position holds up' },
+          confidence: { type: 'number', description: 'Confidence as 0-1, 1-10, or percent' },
+          evidence: { type: 'string', description: 'Optional supporting evidence, code references, or data' },
+        },
+        required: ['decision_id', 'stance', 'summary', 'rationale', 'confidence'],
+      },
+    },
+    {
+      name: 'critique_position',
+      description: 'Challenge another agent position with a concrete critique. Use for risk, evidence, operational, or contrarian review.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          decision_id: { type: 'number', description: 'Decision ID' },
+          position_id: { type: 'number', description: 'Position ID being challenged' },
+          dimension: { type: 'string', enum: ['risk', 'evidence', 'operations', 'strategy', 'contrarian'], description: 'What kind of critique this is' },
+          summary: { type: 'string', description: 'What is weak, missing, or dangerous in the position' },
+          severity: { type: 'string', enum: ['low', 'medium', 'high'], description: 'How serious the critique is' },
+          confidence: { type: 'number', description: 'Confidence as 0-1, 1-10, or percent' },
+        },
+        required: ['decision_id', 'position_id', 'summary', 'confidence'],
+      },
+    },
+    {
+      name: 'list_decisions',
+      description: 'List recent decisions by status.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['open', 'in_review', 'decided', 'cancelled'], description: 'Optional status filter' },
+          limit: { type: 'number', description: 'Max results (default: 20)' },
+        },
+      },
+    },
+    {
+      name: 'get_decision_brief',
+      description: 'Show the current state of a decision, including positions and critiques.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          decision_id: { type: 'number', description: 'Decision ID' },
+        },
+        required: ['decision_id'],
+      },
+    },
+    {
+      name: 'finalize_decision',
+      description: 'Close a decision with a final verdict and rationale. This also writes learning memories so future decisions improve.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          decision_id: { type: 'number', description: 'Decision ID' },
+          final_summary: { type: 'string', description: 'The final call in one sentence' },
+          final_rationale: { type: 'string', description: 'Why this verdict was chosen over alternatives' },
+          final_confidence: { type: 'number', description: 'Confidence as 0-1, 1-10, or percent' },
+          chosen_position_id: { type: 'number', description: 'Optional winning position ID' },
+        },
+        required: ['decision_id', 'final_summary', 'final_rationale', 'final_confidence'],
       },
     },
     {
@@ -126,9 +283,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           content: { type: 'string', description: 'The memory content' },
-          category: { type: 'string', enum: ['learning', 'preference', 'fact', 'role'], description: 'Memory category' },
+          category: { type: 'string', enum: ['learning', 'preference', 'fact', 'role', 'task_summary', 'decision', 'calibration'], description: 'Memory category' },
           importance: { type: 'number', description: 'Importance 1-5 (default: 3). Higher = persists longer.' },
           pinned: { type: 'boolean', description: 'Pin to prevent decay (default: false). Use for role definitions.' },
+          classification: { type: 'string', enum: ['foundational', 'strategic', 'operational', 'observational', 'ephemeral'], description: 'Decay class. Omit to infer automatically.' },
+          quality: { type: 'number', description: 'Learning quality as 0-1, 1-10, or percent' },
+          evidence: { type: 'string', description: 'Optional proof, example, or rationale for why this memory should be trusted' },
         },
         required: ['content', 'category'],
       },
@@ -140,7 +300,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           query: { type: 'string', description: 'Search term (matches content)' },
-          category: { type: 'string', enum: ['learning', 'preference', 'fact', 'task_summary', 'role'], description: 'Filter by category' },
+          category: { type: 'string', enum: ['learning', 'preference', 'fact', 'task_summary', 'role', 'decision', 'calibration'], description: 'Filter by category' },
           limit: { type: 'number', description: 'Max results (default: 10)' },
         },
       },
@@ -173,12 +333,41 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'challenge_memory',
+      description: 'Mark a learning as challenged when it is outdated, contradicted, or weakly supported.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          memory_id: { type: 'number', description: 'The memory ID to challenge' },
+          reason: { type: 'string', description: 'Why this memory should be treated with skepticism' },
+          confidence: { type: 'number', description: 'Confidence as 0-1, 1-10, or percent' },
+        },
+        required: ['memory_id', 'reason'],
+      },
+    },
+    {
+      name: 'supersede_memory',
+      description: 'Replace a stale learning with a better one. The old memory is marked superseded and archived on the next consolidation pass.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          memory_id: { type: 'number', description: 'The memory ID being replaced' },
+          content: { type: 'string', description: 'The new replacement learning' },
+          evidence: { type: 'string', description: 'Why the old memory is no longer the best guidance' },
+          importance: { type: 'number', description: 'Importance 1-5 for the replacement memory' },
+          quality: { type: 'number', description: 'Quality as 0-1, 1-10, or percent' },
+          classification: { type: 'string', enum: ['foundational', 'strategic', 'operational', 'observational', 'ephemeral'], description: 'Optional decay class override' },
+        },
+        required: ['memory_id', 'content'],
+      },
+    },
+    {
       name: 'interrupt_agent',
       description: 'Send Ctrl+C to an agent\'s tmux session. Use when a sub-agent or runner is stuck, hung, or needs to be force-stopped.',
       inputSchema: {
         type: 'object',
         properties: {
-          agent: { type: 'string', description: 'Target agent: boss, steve, sadie, or kiera' },
+          agent: { type: 'string', description: `Target agent: ${TEAM_AGENT_LIST}` },
           reason: { type: 'string', description: 'Why the interrupt is needed' },
         },
         required: ['agent', 'reason'],
@@ -190,7 +379,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          agent: { type: 'string', description: 'The parent agent name (steve, sadie, kiera, boss)' },
+          agent: { type: 'string', description: `The parent agent name (${TEAM_AGENT_LIST})` },
           task_id: { type: 'number', description: 'The task ID being worked on' },
           status: { type: 'string', enum: ['working', 'blocked', 'complete', 'idle'], description: 'Current status' },
           detail: { type: 'string', description: 'What is happening right now' },
@@ -204,7 +393,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          agent: { type: 'string', description: 'The agent whose status to read (steve, sadie, kiera, boss)' },
+          agent: { type: 'string', description: `The agent whose status to read (${TEAM_AGENT_LIST})` },
           task_id: { type: 'number', description: 'Optional: filter to a specific task ID' },
           last_n: { type: 'number', description: 'Number of recent entries to return (default: 20)' },
         },
@@ -249,6 +438,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const to = (args.to as string).toLowerCase()
         const description = args.description as string
         const priority = (args.priority as string) ?? 'normal'
+
+        if (!isKnownAgent(to)) {
+          return { content: [{ type: 'text', text: `Unknown agent: ${to}`, isError: true }] }
+        }
 
         const task = db.createTask({ from: SELF_LABEL, to, description, priority })
 
@@ -343,6 +536,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'nudge_agent': {
         const agent = (args.agent as string).toLowerCase()
         const message = args.message as string
+
+        if (!isKnownAgent(agent)) {
+          return { content: [{ type: 'text', text: `Unknown agent: ${agent}`, isError: true }] }
+        }
+
         const result = await nudgeAgent(agent, message)
 
         if (!result.ok) {
@@ -352,6 +550,226 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         await postToGroup(formatNudge(SELF_LABEL, agent, message))
         audit.log(SELF_LABEL, 'agent_nudged', { target: agent, message })
         return { content: [{ type: 'text', text: `Nudged ${agent}: ${message}` }] }
+      }
+
+      case 'open_decision': {
+        const title = args.title as string
+        const description = args.description as string
+        const priority = (args.priority as string) ?? 'normal'
+        const autoAssign = args.auto_assign === undefined ? true : Boolean(args.auto_assign)
+
+        const decision = decisions.createDecision({
+          title,
+          description,
+          createdBy: SELF_LABEL,
+          priority,
+        })
+
+        let reviewers = parseAgentList(args.assign_agents)
+        if (autoAssign && reviewers.length === 0) {
+          reviewers = WORKER_AGENTS.filter((agent) => agent !== SELF_LABEL)
+        }
+
+        const reviewTasks: number[] = []
+        if (autoAssign) {
+          for (const reviewer of reviewers) {
+            const reviewTask = db.createTask({
+              from: SELF_LABEL,
+              to: reviewer,
+              description: `Decision #${decision.id}: ${title}. Review it and submit your own position with submit_position.`,
+              priority,
+            })
+            reviewTasks.push(reviewTask.id)
+            await nudgeAgent(
+              reviewer,
+              `Decision #${decision.id} needs your judgment: ${title}. Submit a position when ready.`,
+            )
+            await postToGroup(formatTaskCreated(reviewTask))
+            audit.log(SELF_LABEL, 'decision_review_requested', { decision_id: decision.id, reviewer }, reviewTask.id)
+          }
+        }
+
+        await postToGroup(`🧠 Decision #${decision.id} opened by ${SELF_LABEL}: ${title}`)
+        audit.log(
+          SELF_LABEL,
+          'decision_opened',
+          { decision_id: decision.id, title, priority, reviewers, auto_assign: autoAssign },
+        )
+
+        const assignmentText =
+          reviewTasks.length > 0 ? ` Review tasks created for: ${reviewers.join(', ')}.` : ''
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Decision #${decision.id} opened [${decision.status}/${decision.priority}] ${decision.title}.${assignmentText}`,
+            },
+          ],
+        }
+      }
+
+      case 'submit_position': {
+        const position = decisions.submitPosition({
+          decisionId: args.decision_id as number,
+          agent: SELF_LABEL,
+          stance: args.stance as string,
+          summary: args.summary as string,
+          rationale: args.rationale as string,
+          confidence: normalizeScore(args.confidence, 0.6),
+          evidence: args.evidence as string | undefined,
+        })
+
+        if (!position) {
+          return { content: [{ type: 'text', text: 'Could not submit position. The decision may be closed or missing.', isError: true }] }
+        }
+
+        audit.log(SELF_LABEL, 'decision_position_submitted', {
+          decision_id: position.decision_id,
+          position_id: position.id,
+          stance: position.stance,
+          confidence: position.confidence,
+        })
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Position #${position.id} submitted for decision #${position.decision_id} [${position.stance}] conf:${position.confidence.toFixed(2)} ${position.summary}`,
+            },
+          ],
+        }
+      }
+
+      case 'critique_position': {
+        const critique = decisions.critiquePosition({
+          decisionId: args.decision_id as number,
+          positionId: args.position_id as number,
+          agent: SELF_LABEL,
+          dimension: args.dimension as string | undefined,
+          summary: args.summary as string,
+          severity: args.severity as string | undefined,
+          confidence: normalizeScore(args.confidence, 0.7),
+        })
+
+        if (!critique) {
+          return { content: [{ type: 'text', text: 'Could not submit critique. Check that the position exists, belongs to the decision, and is not your own.', isError: true }] }
+        }
+
+        audit.log(SELF_LABEL, 'decision_position_critiqued', {
+          decision_id: critique.decision_id,
+          position_id: critique.position_id,
+          critique_id: critique.id,
+          dimension: critique.dimension,
+          severity: critique.severity,
+          confidence: critique.confidence,
+        })
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Critique #${critique.id} added to position #${critique.position_id} [${critique.dimension}/${critique.severity}] conf:${critique.confidence.toFixed(2)}`,
+            },
+          ],
+        }
+      }
+
+      case 'list_decisions': {
+        const results = decisions.listDecisions({
+          status: args.status as string | undefined,
+          limit: args.limit as number | undefined,
+        })
+
+        if (results.length === 0) {
+          return { content: [{ type: 'text', text: 'No decisions found.' }] }
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: results
+                .map((decision) => `#${decision.id} [${decision.status}/${decision.priority}] ${decision.title} | by ${decision.created_by}`)
+                .join('\n'),
+            },
+          ],
+        }
+      }
+
+      case 'get_decision_brief': {
+        const brief = decisions.getDecisionBrief(args.decision_id as number)
+        if (!brief) {
+          return { content: [{ type: 'text', text: `Decision #${args.decision_id as number} not found.`, isError: true }] }
+        }
+
+        audit.log(SELF_LABEL, 'decision_brief_viewed', { decision_id: brief.decision.id })
+        return { content: [{ type: 'text', text: formatDecisionBrief(brief) }] }
+      }
+
+      case 'finalize_decision': {
+        const decisionId = args.decision_id as number
+        const finalConfidence = normalizeScore(args.final_confidence, 0.7)
+        const chosenPositionId = args.chosen_position_id as number | undefined
+
+        const decision = decisions.finalizeDecision({
+          decisionId,
+          finalSummary: args.final_summary as string,
+          finalRationale: args.final_rationale as string,
+          finalConfidence,
+          chosenPositionId,
+        })
+
+        if (!decision) {
+          return { content: [{ type: 'text', text: 'Could not finalize decision. It may already be closed, missing, or have no active positions.', isError: true }] }
+        }
+
+        const brief = decisions.getDecisionBrief(decision.id)
+        const sharedImportance = decision.priority === 'urgent' ? 5 : decision.priority === 'high' ? 4 : 3
+
+        mem.saveMemory({
+          agent: 'shared',
+          content: `Decision #${decision.id} (${decision.title}) → ${decision.final_summary}`,
+          category: 'decision',
+          classification: 'strategic',
+          importance: sharedImportance,
+          quality: finalConfidence,
+          source_type: 'decision',
+          evidence: decision.final_rationale ?? undefined,
+        })
+
+        if (brief) {
+          for (const position of brief.positions.filter((entry) => entry.status === 'active')) {
+            const adopted = decision.chosen_position_id === position.id
+            mem.saveMemory({
+              agent: position.agent,
+              content: adopted
+                ? `Decision calibration #${decision.id} (${decision.title}): your ${position.stance} position held up. Pattern: ${position.summary}`
+                : `Decision calibration #${decision.id} (${decision.title}): your ${position.stance} position was not selected. Compare your reasoning against the final rationale before reusing it.`,
+              category: 'calibration',
+              classification: adopted ? 'strategic' : 'observational',
+              importance: adopted ? 4 : 2,
+              quality: adopted ? finalConfidence : 0.55,
+              source_type: 'decision',
+              evidence: decision.final_rationale ?? position.rationale,
+            })
+          }
+        }
+
+        await postToGroup(`✅ Decision #${decision.id} finalized by ${SELF_LABEL}: ${decision.final_summary}`)
+        audit.log(SELF_LABEL, 'decision_finalized', {
+          decision_id: decision.id,
+          chosen_position_id: decision.chosen_position_id,
+          final_confidence: decision.final_confidence,
+        })
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Decision #${decision.id} finalized: ${decision.final_summary}`,
+            },
+          ],
+        }
       }
 
       case 'save_memory': {
@@ -366,10 +784,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           category,
           importance,
           pinned,
+          classification: args.classification as string | undefined,
+          quality: args.quality === undefined ? undefined : normalizeScore(args.quality, 0.6),
+          evidence: args.evidence as string | undefined,
         })
-        audit.log(SELF_LABEL, 'memory_saved', { category, importance: memory.importance }, undefined, memory.id)
+        audit.log(SELF_LABEL, 'memory_saved', {
+          category,
+          importance: memory.importance,
+          classification: memory.classification,
+          quality: memory.quality,
+          state: memory.state,
+        }, undefined, memory.id)
 
-        return { content: [{ type: 'text', text: `Memory #${memory.id} saved (importance: ${memory.importance}${memory.pinned ? ', pinned' : ''})` }] }
+        return { content: [{ type: 'text', text: `Memory #${memory.id} stored [${memory.classification}/${memory.state}] importance:${memory.importance} quality:${memory.quality.toFixed(2)}${memory.pinned ? ' pinned' : ''}` }] }
       }
 
       case 'recall_memories': {
@@ -385,7 +812,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         const lines = memories.map(
-          (m) => `#${m.id} [${m.category}] imp:${m.importance} ${m.pinned ? '📌' : ''} ${m.content}`,
+          (m) => `#${m.id} [${m.category}/${m.classification}/${m.state}] imp:${m.importance} q:${m.quality.toFixed(2)} ${m.pinned ? '📌' : ''} ${m.content}`,
         )
         return { content: [{ type: 'text', text: lines.join('\n') }] }
       }
@@ -446,14 +873,74 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return { content: [{ type: 'text', text: `Memory #${memoryId} ${state}.` }] }
       }
 
+      case 'challenge_memory': {
+        const memoryId = args.memory_id as number
+        const challenged = mem.challengeMemory(
+          memoryId,
+          args.reason as string,
+          normalizeScore(args.confidence, 0.7),
+        )
+
+        if (!challenged) {
+          return { content: [{ type: 'text', text: `Memory #${memoryId} not found.`, isError: true }] }
+        }
+
+        audit.log(SELF_LABEL, 'memory_challenged', {
+          memory_id: memoryId,
+          state: challenged.state,
+          quality: challenged.quality,
+          challenge_count: challenged.challenge_count,
+        }, undefined, memoryId)
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Memory #${memoryId} challenged. State: ${challenged.state}. Quality: ${challenged.quality.toFixed(2)}.`,
+            },
+          ],
+        }
+      }
+
+      case 'supersede_memory': {
+        const memoryId = args.memory_id as number
+        const replacement = mem.supersedeMemory(memoryId, {
+          content: args.content as string,
+          evidence: args.evidence as string | undefined,
+          importance: args.importance as number | undefined,
+          quality: args.quality === undefined ? undefined : normalizeScore(args.quality, 0.7),
+          classification: args.classification as string | undefined,
+        })
+
+        if (!replacement) {
+          return { content: [{ type: 'text', text: `Memory #${memoryId} not found.`, isError: true }] }
+        }
+
+        audit.log(SELF_LABEL, 'memory_superseded', {
+          old_memory_id: memoryId,
+          new_memory_id: replacement.id,
+          classification: replacement.classification,
+        }, undefined, replacement.id)
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Memory #${memoryId} superseded by memory #${replacement.id}.`,
+            },
+          ],
+        }
+      }
+
       case 'interrupt_agent': {
         const agent = (args.agent as string).toLowerCase()
         const reason = args.reason as string
-        const session = AGENT_SESSIONS[agent]
 
-        if (!session) {
+        if (!isKnownAgent(agent)) {
           return { content: [{ type: 'text', text: `Unknown agent: ${agent}`, isError: true }] }
         }
+
+        const session = AGENT_SESSIONS[agent]
 
         const proc = Bun.spawn(['tmux', 'send-keys', '-t', session, 'C-c'], { stdout: 'pipe', stderr: 'pipe' })
         const exitCode = await proc.exited
@@ -474,6 +961,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const status = args.status as string
         const detail = args.detail as string
 
+        if (!isKnownAgent(agent)) {
+          return { content: [{ type: 'text', text: `Unknown agent: ${agent}`, isError: true }] }
+        }
+
         mkdirSync(STATUS_DIR, { recursive: true })
         const filePath = join(STATUS_DIR, `${agent}-tasks.jsonl`)
         const entry = JSON.stringify({ task_id: taskId, ts: new Date().toISOString(), status, detail })
@@ -487,6 +978,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const agent = (args.agent as string).toLowerCase()
         const taskId = args.task_id as number | undefined
         const lastN = (args.last_n as number) ?? 20
+
+        if (!isKnownAgent(agent)) {
+          return { content: [{ type: 'text', text: `Unknown agent: ${agent}`, isError: true }] }
+        }
 
         const filePath = join(STATUS_DIR, `${agent}-tasks.jsonl`)
         if (!existsSync(filePath)) {
@@ -513,6 +1008,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'clear_status': {
         const agent = (args.agent as string).toLowerCase()
         const taskId = args.task_id as number
+
+        if (!isKnownAgent(agent)) {
+          return { content: [{ type: 'text', text: `Unknown agent: ${agent}`, isError: true }] }
+        }
 
         const filePath = join(STATUS_DIR, `${agent}-tasks.jsonl`)
         if (!existsSync(filePath)) {

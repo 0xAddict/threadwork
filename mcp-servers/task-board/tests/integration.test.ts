@@ -57,7 +57,8 @@ describe('integration: full task lifecycle', () => {
 
     // Verify completion notification
     const completeMsg = formatTaskCompleted(completed!)
-    expect(completeMsg).toContain('$289.80')
+    expect(completeMsg).toContain('5 orders')
+    expect(completeMsg).toContain('$289\\.80')
 
     // Verify listing
     const steveTasks = db.listTasks({ assignee: 'steve' })
@@ -69,19 +70,21 @@ describe('integration: full task lifecycle', () => {
     db.createTask({ from: 'boss', to: 'steve', description: 'Task A', priority: 'normal' })
     db.createTask({ from: 'boss', to: 'sadie', description: 'Task B', priority: 'high' })
     db.createTask({ from: 'boss', to: 'kiera', description: 'Task C', priority: 'normal' })
+    db.createTask({ from: 'boss', to: 'snoopy', description: 'Task D', priority: 'normal' })
 
     const all = db.listTasks({})
-    expect(all).toHaveLength(3)
+    expect(all).toHaveLength(4)
 
     const pending = db.listTasks({ status: 'pending' })
-    expect(pending).toHaveLength(3)
+    expect(pending).toHaveLength(4)
 
     // Each agent claims their own
     db.claimTask(1, 'steve')
     db.claimTask(2, 'sadie')
+    db.claimTask(4, 'snoopy')
 
     const inProgress = db.listTasks({ status: 'in_progress' })
-    expect(inProgress).toHaveLength(2)
+    expect(inProgress).toHaveLength(3)
 
     const stillPending = db.listTasks({ status: 'pending' })
     expect(stillPending).toHaveLength(1)
