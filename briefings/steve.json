@@ -1,0 +1,31 @@
+{
+  "role": [],
+  "topMemories": [
+    {
+      "id": 1,
+      "agent": "steve",
+      "content": "Shopify API returns UTC timestamps, always convert to PDT for daily reports",
+      "category": "learning",
+      "importance": 5,
+      "pinned": 0,
+      "source_task_id": null,
+      "created_at": "2026-03-31 22:14:06",
+      "last_accessed": "2026-03-31 22:31:09",
+      "access_count": 2
+    },
+    {
+      "id": 2,
+      "agent": "steve",
+      "content": "Shopify API returns UTC timestamps, always convert to PDT for daily reports",
+      "category": "learning",
+      "importance": 5,
+      "pinned": 0,
+      "source_task_id": null,
+      "created_at": "2026-03-31 22:31:06",
+      "last_accessed": "2026-03-31 22:31:09",
+      "access_count": 1
+    }
+  ],
+  "sharedMemories": [],
+  "recentTasks": []
+}
