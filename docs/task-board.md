@@ -141,6 +141,37 @@ Toggle pin status. Pinned memories never decay.
 }
 ```
 
+## Observability
+
+### query_audit_log
+
+Query the audit trail to review agent activity.
+
+```typescript
+{
+  agent?: string     // Filter by agent name
+  action?: string    // Filter by action type
+  task_id?: number   // Filter by task ID
+  limit?: number     // Max results (default: 50)
+}
+```
+
+**Actions logged:** `task_created`, `task_claimed`, `task_completed`, `task_failed`, `note_added`, `agent_nudged`, `memory_saved`, `memory_recalled`, `memory_promoted`, `memory_pinned`, `boot_briefing`, `watchdog_nudge`, `watchdog_escalation`
+
+### Audit Log Schema
+
+```sql
+CREATE TABLE audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent TEXT NOT NULL,
+  action TEXT NOT NULL,
+  detail TEXT,              -- JSON with context
+  task_id INTEGER,
+  memory_id INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
 ## Database Schema
 
 ```sql
@@ -244,10 +275,12 @@ cd mcp-servers/task-board
 bun test
 ```
 
-29 tests across 6 files:
+41 tests across 8 files:
 - `db.test.ts` — task CRUD operations, atomic claims, filters
 - `nudge.test.ts` — session resolution, command building
 - `notify.test.ts` — message formatting
 - `integration.test.ts` — full task lifecycle, concurrent multi-agent scenarios
 - `memory.test.ts` — memory CRUD, search, access tracking, boot briefing
 - `consolidate.test.ts` — decay, archive, prune, briefing generation
+- `audit.test.ts` — audit log CRUD, filtering, agent activity queries
+- `watchdog.test.ts` — stale task detection, escalation backoff, unclaimed tasks

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# launch-all.sh — Ensure all Claude Code + Telegram tmux sessions are running
+# launch-all.sh — Ensure all 4 Claude Code + Telegram tmux sessions are running
 # Called on login via LaunchAgent, or manually: ~/.claude/launch-all.sh
 
 SESSION_NAMES=(claude-boss claude-steve claude-sadie claude-kiera claude-snoopy)
@@ -42,7 +42,7 @@ for session in "${SESSION_NAMES[@]}"; do
     sleep $TRUST_DELAY
     tmux send-keys -t "$session" Enter 2>/dev/null
     sleep 12
-    tmux send-keys -t "$session" "Call get_boot_briefing to load your memory and context." Enter 2>/dev/null
+    tmux send-keys -t "$session" "Call get_boot_briefing to load your memory and context. Then call list_tasks with filter='mine' to check for pending work. State your name, role, and current task status." Enter 2>/dev/null
   ) &
 
   launched=$((launched + 1))

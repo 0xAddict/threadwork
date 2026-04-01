@@ -42,6 +42,37 @@ launchctl load ~/Library/LaunchAgents/com.threadwork.consolidate.plist
 cd ~/.claude/mcp-servers/task-board && bun run consolidate.ts
 ```
 
+## Watchdog LaunchAgent
+
+**File:** `templates/com.threadwork.watchdog.plist`
+
+Registered at `~/Library/LaunchAgents/com.threadwork.watchdog.plist`. Triggers every:
+- `StartInterval: 300` — runs every 5 minutes
+
+Monitors all agents for stuck tasks and dead sessions. Logs to `mcp-servers/task-board/watchdog.log`.
+
+### Escalation timeline
+
+| Time | Action |
+|------|--------|
+| 0 min | Task created, agent nudged (by `create_task`) |
+| 10 min | Watchdog: first nudge (no audit activity detected) |
+| 20 min | Watchdog: warning nudge |
+| 30 min | Watchdog: auto-escalate to Boss, cancel stuck task |
+
+### Manual control
+
+```bash
+# Load
+launchctl load ~/Library/LaunchAgents/com.threadwork.watchdog.plist
+
+# Run manually
+cd ~/.claude/mcp-servers/task-board && bun run watchdog.ts
+
+# Check logs
+tail -20 ~/.claude/mcp-servers/task-board/watchdog.log
+```
+
 ## launch-all.sh
 
 **File:** `scripts/launch-all.sh`
@@ -82,6 +113,12 @@ To add or remove agents, edit `SESSION_NAMES`. Each name must have a correspondi
 ## Session Lifecycle
 
 ```
+LaunchAgent (every 5 min)
+  └─→ launch-all.sh (session health)
+  └─→ watchdog.ts (task health)
+        └─→ Stale tasks? → nudge → escalate
+        └─→ Dead sessions? → alert
+
 LaunchAgent (every 5 min)
   └─→ launch-all.sh
         └─→ tmux new-session -d -s claude-boss
