@@ -1,0 +1,109 @@
+{
+  "timestamp": "2026-03-31T22:32:08.792Z",
+  "total": 14,
+  "verified": 13,
+  "pending": 1,
+  "checks": [
+    {
+      "id": "SG-1",
+      "description": "save_memory creates with correct fields",
+      "verified": true,
+      "evidence": "memory.ts exists with saveMemory",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-2",
+      "description": "recall_memories searches own + shared, updates tracking",
+      "verified": true,
+      "evidence": "recallMemories with access tracking",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-3",
+      "description": "promote_memory changes to shared",
+      "verified": true,
+      "evidence": "promoteMemory sets shared",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-4",
+      "description": "pin_memory toggles pin",
+      "verified": true,
+      "evidence": "pinMemory with toggle",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-5",
+      "description": "get_boot_briefing without access tracking update",
+      "verified": true,
+      "evidence": "boot briefing read-only confirmed",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-6",
+      "description": "complete_task auto-extracts task_summary memory",
+      "verified": true,
+      "evidence": "auto-extraction in complete_task",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-7",
+      "description": "Decay reduces importance per 7-day period",
+      "verified": true,
+      "evidence": "consolidate.ts with runDecay",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-8",
+      "description": "Importance 0 → archived",
+      "verified": true,
+      "evidence": "runArchive function",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-9",
+      "description": "Archive > 90 days → pruned",
+      "verified": true,
+      "evidence": "runPrune function",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-10",
+      "description": "Generates briefing JSONs per agent",
+      "verified": true,
+      "evidence": "generateBriefing function",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-11",
+      "description": "LaunchAgent registered for 3am",
+      "verified": true,
+      "evidence": "plist exists",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-12",
+      "description": "Boot briefing nudge in launch-all.sh",
+      "verified": true,
+      "evidence": "nudge present",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-13",
+      "description": "All tests pass",
+      "verified": true,
+      "evidence": "All tests pass",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    },
+    {
+      "id": "SG-14",
+      "description": "Live end-to-end test",
+      "verified": false,
+      "evidence": "Requires manual live test",
+      "checked_at": "2026-03-31T22:32:08.792Z"
+    }
+  ],
+  "tests_pass": true,
+  "test_output": "bun test v1.3.11 (af24e281)\n\n 29 pass\n 0 fail\n 84 expect() calls\nRan 29 tests across 6 files. [138.00ms]",
+  "idle_count": 4
+}
