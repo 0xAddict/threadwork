@@ -26,3 +26,5 @@ briefings/*.json
 
 # Telegram inbox media
 inbox/
+logs/
+.claude/scheduled_tasks.lock
