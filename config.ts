@@ -24,3 +24,10 @@ export const AGENT_SESSIONS: Record<string, string> = {
 
 // The agent label for this session (set by pool script via env var)
 export const SELF_LABEL = process.env.AGENT_LABEL ?? 'unknown'
+
+// Status file directory for sub-agent JSONL status updates
+export const STATUS_DIR = join(
+  process.env.HOME ?? '/tmp',
+  '.claude',
+  'status',
+)

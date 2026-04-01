@@ -13,8 +13,11 @@ import {
   formatTaskClaimed,
   formatTaskCompleted,
   formatNote,
+  formatNudge,
 } from './notify'
-import { DB_PATH, SELF_LABEL } from './config'
+import { DB_PATH, SELF_LABEL, STATUS_DIR, AGENT_SESSIONS } from './config'
+import { join } from 'path'
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs'
 import { MemoryDB } from './memory'
 import { AuditLog } from './audit'
 
@@ -28,7 +31,8 @@ const mcp = new Server(
     capabilities: { tools: {} },
     instructions: [
       `You are agent "${SELF_LABEL}". You have a shared task board and personal memory with other agents (boss, steve, sadie, kiera).`,
-      'TASK TOOLS: create_task, claim_task, complete_task, list_tasks, send_note, nudge_agent',
+      'TASK TOOLS: create_task, claim_task, complete_task, list_tasks, send_note, nudge_agent, interrupt_agent',
+      'STATUS TOOLS: write_status (sub-agents report progress), read_status (monitor loops check progress), clear_status (cleanup after task)',
       'MEMORY TOOLS: save_memory (store learnings), recall_memories (search your knowledge), get_boot_briefing (load context on startup)',
       'MEMORY MANAGEMENT: promote_memory (share with all agents), pin_memory (prevent decay)',
       'On startup, call get_boot_briefing to load your role, top memories, and recent task history.',
@@ -169,6 +173,57 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'interrupt_agent',
+      description: 'Send Ctrl+C to an agent\'s tmux session. Use when a sub-agent or runner is stuck, hung, or needs to be force-stopped.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agent: { type: 'string', description: 'Target agent: boss, steve, sadie, or kiera' },
+          reason: { type: 'string', description: 'Why the interrupt is needed' },
+        },
+        required: ['agent', 'reason'],
+      },
+    },
+    {
+      name: 'write_status',
+      description: 'Write a JSONL status entry for a delegated task. Sub-agents call this to report progress.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agent: { type: 'string', description: 'The parent agent name (steve, sadie, kiera, boss)' },
+          task_id: { type: 'number', description: 'The task ID being worked on' },
+          status: { type: 'string', enum: ['working', 'blocked', 'complete', 'idle'], description: 'Current status' },
+          detail: { type: 'string', description: 'What is happening right now' },
+        },
+        required: ['agent', 'task_id', 'status', 'detail'],
+      },
+    },
+    {
+      name: 'read_status',
+      description: 'Read recent JSONL status entries for an agent\'s delegated tasks. Used by monitor loops.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agent: { type: 'string', description: 'The agent whose status to read (steve, sadie, kiera, boss)' },
+          task_id: { type: 'number', description: 'Optional: filter to a specific task ID' },
+          last_n: { type: 'number', description: 'Number of recent entries to return (default: 20)' },
+        },
+        required: ['agent'],
+      },
+    },
+    {
+      name: 'clear_status',
+      description: 'Clear status entries for a completed task. Called when a task finishes to clean up.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agent: { type: 'string', description: 'The agent whose status file to clean' },
+          task_id: { type: 'number', description: 'The task ID to remove entries for' },
+        },
+        required: ['agent', 'task_id'],
+      },
+    },
+    {
       name: 'query_audit_log',
       description: 'Query the audit log to see what agents have been doing. Useful for reviewing team activity and debugging.',
       inputSchema: {
@@ -294,6 +349,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: `Nudge failed: ${result.error}`, isError: true }] }
         }
 
+        await postToGroup(formatNudge(SELF_LABEL, agent, message))
         audit.log(SELF_LABEL, 'agent_nudged', { target: agent, message })
         return { content: [{ type: 'text', text: `Nudged ${agent}: ${message}` }] }
       }
@@ -388,6 +444,95 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         audit.log(SELF_LABEL, 'memory_pinned', { memory_id: memoryId, pinned: !!toggled.pinned }, undefined, memoryId)
         const state = toggled.pinned ? 'pinned (will not decay)' : 'unpinned (will decay normally)'
         return { content: [{ type: 'text', text: `Memory #${memoryId} ${state}.` }] }
+      }
+
+      case 'interrupt_agent': {
+        const agent = (args.agent as string).toLowerCase()
+        const reason = args.reason as string
+        const session = AGENT_SESSIONS[agent]
+
+        if (!session) {
+          return { content: [{ type: 'text', text: `Unknown agent: ${agent}`, isError: true }] }
+        }
+
+        const proc = Bun.spawn(['tmux', 'send-keys', '-t', session, 'C-c'], { stdout: 'pipe', stderr: 'pipe' })
+        const exitCode = await proc.exited
+
+        if (exitCode !== 0) {
+          const stderr = await new Response(proc.stderr).text()
+          return { content: [{ type: 'text', text: `Interrupt failed: ${stderr.trim()}`, isError: true }] }
+        }
+
+        audit.log(SELF_LABEL, 'agent_interrupted', { target: agent, reason })
+        await postToGroup(`🛑 ${SELF_LABEL} interrupted ${agent}: ${reason}`)
+        return { content: [{ type: 'text', text: `Sent Ctrl+C to ${agent} (${session}). Reason: ${reason}` }] }
+      }
+
+      case 'write_status': {
+        const agent = (args.agent as string).toLowerCase()
+        const taskId = args.task_id as number
+        const status = args.status as string
+        const detail = args.detail as string
+
+        mkdirSync(STATUS_DIR, { recursive: true })
+        const filePath = join(STATUS_DIR, `${agent}-tasks.jsonl`)
+        const entry = JSON.stringify({ task_id: taskId, ts: new Date().toISOString(), status, detail })
+        appendFileSync(filePath, entry + '\n')
+
+        audit.log(SELF_LABEL, 'status_written', { agent, task_id: taskId, status, detail }, taskId)
+        return { content: [{ type: 'text', text: `Status written for ${agent} task #${taskId}: [${status}] ${detail}` }] }
+      }
+
+      case 'read_status': {
+        const agent = (args.agent as string).toLowerCase()
+        const taskId = args.task_id as number | undefined
+        const lastN = (args.last_n as number) ?? 20
+
+        const filePath = join(STATUS_DIR, `${agent}-tasks.jsonl`)
+        if (!existsSync(filePath)) {
+          return { content: [{ type: 'text', text: `No status file for ${agent}. No delegated tasks have reported yet.` }] }
+        }
+
+        const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean)
+        let entries = lines.map(l => JSON.parse(l))
+
+        if (taskId !== undefined) {
+          entries = entries.filter((e: any) => e.task_id === taskId)
+        }
+
+        entries = entries.slice(-lastN)
+
+        if (entries.length === 0) {
+          return { content: [{ type: 'text', text: taskId ? `No status entries for task #${taskId}.` : `No status entries for ${agent}.` }] }
+        }
+
+        const output = entries.map((e: any) => `[${e.ts}] task#${e.task_id} ${e.status}: ${e.detail}`).join('\n')
+        return { content: [{ type: 'text', text: output }] }
+      }
+
+      case 'clear_status': {
+        const agent = (args.agent as string).toLowerCase()
+        const taskId = args.task_id as number
+
+        const filePath = join(STATUS_DIR, `${agent}-tasks.jsonl`)
+        if (!existsSync(filePath)) {
+          return { content: [{ type: 'text', text: `No status file for ${agent}.` }] }
+        }
+
+        const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean)
+        const remaining = lines.filter(l => {
+          const entry = JSON.parse(l)
+          return entry.task_id !== taskId
+        })
+
+        if (remaining.length === 0) {
+          unlinkSync(filePath)
+        } else {
+          writeFileSync(filePath, remaining.join('\n') + '\n')
+        }
+
+        audit.log(SELF_LABEL, 'status_cleared', { agent, task_id: taskId }, taskId)
+        return { content: [{ type: 'text', text: `Cleared status entries for ${agent} task #${taskId}.` }] }
       }
 
       case 'query_audit_log': {
