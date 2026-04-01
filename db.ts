@@ -102,7 +102,29 @@ export class TaskDB {
       CREATE INDEX IF NOT EXISTS idx_memories_agent_importance ON memories(agent, importance DESC);
       CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
       CREATE INDEX IF NOT EXISTS idx_archive_archived_at ON memory_archive(archived_at);
+
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT NOT NULL,
+        action TEXT NOT NULL,
+        detail TEXT,
+        task_id INTEGER,
+        memory_id INTEGER,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_log(agent);
+      CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+      CREATE INDEX IF NOT EXISTS idx_audit_task ON audit_log(task_id);
+      CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
     `)
+
+    // Add nudge_count column if missing (safe migration for existing DBs)
+    try {
+      this.db.exec('ALTER TABLE tasks ADD COLUMN nudge_count INTEGER NOT NULL DEFAULT 0')
+    } catch {
+      // Column already exists
+    }
   }
 
   createTask(input: CreateTaskInput): Task {
