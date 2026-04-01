@@ -15,7 +15,7 @@ import {
   formatNote,
   formatNudge,
 } from './notify'
-import { DB_PATH, SELF_LABEL, STATUS_DIR, AGENT_SESSIONS, TEAM_AGENTS, WORKER_AGENTS } from './config'
+import { DB_PATH, SELF_LABEL, STATUS_DIR, AGENT_SESSIONS, TEAM_AGENTS, WORKER_AGENTS, AGENT_OWNERSHIP } from './config'
 import { join } from 'path'
 import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs'
 import { MemoryDB } from './memory'
@@ -28,6 +28,9 @@ const audit = new AuditLog(db)
 const decisions = new DecisionDB(db)
 const TEAM_AGENT_LIST = TEAM_AGENTS.join(', ')
 const WORKER_AGENT_LIST = WORKER_AGENTS.join(', ')
+const OWNERSHIP_LINES = WORKER_AGENTS
+  .map((agent) => `${agent}: ${AGENT_OWNERSHIP[agent].join(', ')}`)
+  .join(' | ')
 
 const isKnownAgent = (agent: string): boolean =>
   Object.prototype.hasOwnProperty.call(AGENT_SESSIONS, agent)
@@ -101,6 +104,7 @@ const mcp = new Server(
     capabilities: { tools: {} },
     instructions: [
       `You are agent "${SELF_LABEL}" inside an autonomous DTC ecommerce execution team. You have a shared task board and personal memory with other agents (${TEAM_AGENT_LIST}).`,
+      `Sector ownership: ${OWNERSHIP_LINES}.`,
       'TASK TOOLS: create_task, claim_task, complete_task, list_tasks, send_note, nudge_agent, interrupt_agent',
       'STATUS TOOLS: write_status (sub-agents report progress), read_status (monitor loops check progress), clear_status (cleanup after task)',
       'DECISION TOOLS: open_decision, submit_position, critique_position, list_decisions, get_decision_brief, finalize_decision',
@@ -108,6 +112,7 @@ const mcp = new Server(
       'MEMORY MANAGEMENT: promote_memory (share with all agents), pin_memory (prevent decay), challenge_memory (mark a learning disputed), supersede_memory (replace stale learning)',
       'On startup, call get_boot_briefing to load your role, top memories, and recent task history.',
       'After completing tasks, save important learnings with save_memory.',
+      'Default operating model: each worker owns a sector and has local authority for reversible choices inside that sector.',
       'Use open_decision only for meaningful choices: high-risk, ambiguous, irreversible, or strategic decisions. Do not turn simple execution work into a debate.',
       `Default review pool for decisions is the worker bench: ${WORKER_AGENT_LIST}.`,
       'Always delegate complex work to subagents (Agent tool) to keep your context clean.',

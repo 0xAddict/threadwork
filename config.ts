@@ -16,6 +16,13 @@ export const getTelegramToken = (): string | undefined =>
 
 export const TEAM_AGENTS = ['boss', 'steve', 'sadie', 'kiera', 'snoopy'] as const
 export const WORKER_AGENTS = ['steve', 'sadie', 'kiera', 'snoopy'] as const
+export const AGENT_OWNERSHIP: Record<string, string[]> = {
+  boss: ['company priorities', 'cross-sector resource allocation', 'final escalation'],
+  steve: ['paid acquisition', 'creative testing', 'landing pages', 'growth experiments'],
+  sadie: ['finance', 'inventory', 'fulfillment', 'risk and compliance'],
+  kiera: ['storefront', 'merchandising', 'cro', 'assortment and pricing'],
+  snoopy: ['lifecycle crm', 'customer insight', 'support signal', 'market intelligence'],
+}
 
 // Map of agent labels to tmux session names
 export const AGENT_SESSIONS: Record<string, string> = {
