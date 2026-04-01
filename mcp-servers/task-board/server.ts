@@ -16,9 +16,11 @@ import {
 } from './notify'
 import { DB_PATH, SELF_LABEL } from './config'
 import { MemoryDB } from './memory'
+import { AuditLog } from './audit'
 
 const db = new TaskDB(DB_PATH)
 const mem = new MemoryDB(db)
+const audit = new AuditLog(db)
 
 const mcp = new Server(
   { name: 'task-board', version: '0.1.0' },
@@ -166,6 +168,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['memory_id'],
       },
     },
+    {
+      name: 'query_audit_log',
+      description: 'Query the audit log to see what agents have been doing. Useful for reviewing team activity and debugging.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agent: { type: 'string', description: 'Filter by agent name' },
+          action: { type: 'string', description: 'Filter by action type (task_created, task_claimed, task_completed, memory_saved, etc.)' },
+          task_id: { type: 'number', description: 'Filter by task ID' },
+          limit: { type: 'number', description: 'Max results (default: 50)' },
+        },
+      },
+    },
   ],
 }))
 
@@ -185,6 +200,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const nudgeMsg = `You have a new task (#${task.id}) from ${SELF_LABEL}: ${description}`
         await nudgeAgent(to, nudgeMsg)
         await postToGroup(formatTaskCreated(task))
+        audit.log(SELF_LABEL, 'task_created', { to, description, priority }, task.id)
 
         return { content: [{ type: 'text', text: `Task #${task.id} created and assigned to ${to}. Agent nudged.` }] }
       }
@@ -194,10 +210,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const task = db.claimTask(taskId, SELF_LABEL)
 
         if (!task) {
+          audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: 'not found or already claimed' }, taskId)
           return { content: [{ type: 'text', text: `Cannot claim task #${taskId} — either it doesn't exist or is already claimed.`, isError: true }] }
         }
 
         await postToGroup(formatTaskClaimed(task))
+        audit.log(SELF_LABEL, 'task_claimed', { task_id: taskId }, taskId)
         return { content: [{ type: 'text', text: `Claimed task #${task.id}: ${task.description}` }] }
       }
 
@@ -207,6 +225,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const task = db.completeTask(taskId, result)
 
         if (!task) {
+          audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: 'not found or not in progress' }, taskId)
           return { content: [{ type: 'text', text: `Cannot complete task #${taskId} — either it doesn't exist or isn't in progress.`, isError: true }] }
         }
 
@@ -223,6 +242,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           importance: priorityToImportance[task.priority] ?? 2,
           source_task_id: task.id,
         })
+        audit.log(SELF_LABEL, 'task_completed', { task_id: taskId, result }, taskId)
 
         return { content: [{ type: 'text', text: `Task #${task.id} completed. Result: ${result}` }] }
       }
@@ -260,6 +280,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         db.addNote(taskId, SELF_LABEL, message)
         await postToGroup(formatNote(taskId, SELF_LABEL, message))
+        audit.log(SELF_LABEL, 'note_added', { task_id: taskId, message }, taskId)
 
         return { content: [{ type: 'text', text: `Note added to task #${taskId}.` }] }
       }
@@ -273,6 +294,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: `Nudge failed: ${result.error}`, isError: true }] }
         }
 
+        audit.log(SELF_LABEL, 'agent_nudged', { target: agent, message })
         return { content: [{ type: 'text', text: `Nudged ${agent}: ${message}` }] }
       }
 
@@ -289,6 +311,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           importance,
           pinned,
         })
+        audit.log(SELF_LABEL, 'memory_saved', { category, importance: memory.importance }, undefined, memory.id)
 
         return { content: [{ type: 'text', text: `Memory #${memory.id} saved (importance: ${memory.importance}${memory.pinned ? ', pinned' : ''})` }] }
       }
@@ -299,6 +322,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const limit = args.limit as number | undefined
 
         const memories = mem.recallMemories(SELF_LABEL, { query, category, limit })
+        audit.log(SELF_LABEL, 'memory_recalled', { query: query ?? null, results_count: memories.length })
 
         if (memories.length === 0) {
           return { content: [{ type: 'text', text: 'No memories found.' }] }
@@ -327,6 +351,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           sections.push('== RECENT TASKS ==\n' + briefing.recentTasks.map(t => `#${t.id} ${t.description} → ${t.result}`).join('\n'))
         }
 
+        audit.log(SELF_LABEL, 'boot_briefing', {
+          role_count: briefing.role.length,
+          memory_count: briefing.topMemories.length,
+          shared_count: briefing.sharedMemories.length,
+          task_count: briefing.recentTasks.length,
+        })
+
         if (sections.length === 0) {
           return { content: [{ type: 'text', text: 'No memories or history yet. You are a fresh agent.' }] }
         }
@@ -342,6 +373,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: `Memory #${memoryId} not found.`, isError: true }] }
         }
 
+        audit.log(SELF_LABEL, 'memory_promoted', { memory_id: memoryId }, undefined, memoryId)
         return { content: [{ type: 'text', text: `Memory #${memoryId} promoted to shared. All agents can now see it.` }] }
       }
 
@@ -353,8 +385,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: `Memory #${memoryId} not found.`, isError: true }] }
         }
 
+        audit.log(SELF_LABEL, 'memory_pinned', { memory_id: memoryId, pinned: !!toggled.pinned }, undefined, memoryId)
         const state = toggled.pinned ? 'pinned (will not decay)' : 'unpinned (will decay normally)'
         return { content: [{ type: 'text', text: `Memory #${memoryId} ${state}.` }] }
+      }
+
+      case 'query_audit_log': {
+        const entries = audit.query({
+          agent: args.agent as string | undefined,
+          action: args.action as string | undefined,
+          taskId: args.task_id as number | undefined,
+          limit: args.limit as number | undefined,
+        })
+
+        if (entries.length === 0) {
+          return { content: [{ type: 'text', text: 'No audit entries found.' }] }
+        }
+
+        const lines = entries.map(e => {
+          const detail = e.detail ? ` ${e.detail}` : ''
+          const taskRef = e.task_id ? ` [task:#${e.task_id}]` : ''
+          return `${e.created_at} | ${e.agent} | ${e.action}${taskRef}${detail}`
+        })
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
       }
 
       default:
