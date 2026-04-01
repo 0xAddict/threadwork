@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "task-board": {
+      "command": "bun",
+      "args": ["run", "/Users/coachstokes/.claude/mcp-servers/task-board/server.ts"]
+    }
+  }
+}
