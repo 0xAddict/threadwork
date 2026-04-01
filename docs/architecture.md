@@ -49,11 +49,12 @@ Each agent has personal memories stored in the same SQLite database. Memories ha
 
 | Tool | Effect |
 |------|--------|
-| `save_memory` | Store a learning, preference, fact, or role definition |
-| `recall_memories` | Search own + shared memories (boosts importance on access) |
-| `get_boot_briefing` | Load role + top memories + shared knowledge + recent tasks |
-| `promote_memory` | Share a personal memory with all agents |
-| `pin_memory` | Prevent a memory from decaying |
+| `save_memory` | Store a personal memory |
+| `recall_memories` | Search own + shared memories, boost importance |
+| `get_boot_briefing` | Load role + memories + tasks on startup |
+| `promote_memory` | Share a memory with all agents |
+| `pin_memory` | Toggle pin (pinned = never decays) |
+| `query_audit_log` | Query the audit trail |
 
 Auto-extraction: `complete_task` automatically creates a `task_summary` memory.
 
@@ -68,6 +69,32 @@ A LaunchAgent runs `consolidate.ts` at 3:00 AM daily:
 ### 4. Communication Layer (Telegram)
 
 Each agent has a dedicated Telegram bot. The Telegram plugin (`plugin:telegram@claude-plugins-official`) handles inbound/outbound messaging. Access is controlled by `access.json` (allowlist-based DM policy, group mention requirements).
+
+### 5. Watchdog Layer (stuck detection + escalation)
+
+A LaunchAgent runs `watchdog.ts` every 5 minutes:
+
+1. **Stale tasks** — checks `in_progress` tasks with no audit activity for 10+ minutes
+2. **Escalation backoff:**
+   - 10 min: first nudge via tmux
+   - 20 min: warning nudge
+   - 30 min: auto-escalate to Boss (creates urgent task, cancels stuck task)
+3. **Unclaimed tasks** — re-nudges assigned agent for `pending` tasks older than 15 minutes
+4. **Dead sessions** — checks `tmux has-session` for each agent, alerts if dead
+
+### 6. Onboarding Layer (agent initialization)
+
+Each agent loads context from three sources on boot:
+
+| Source | Content | Mechanism |
+|--------|---------|-----------|
+| `CLAUDE.md` | Universal operating manual (team structure, workflows, DO/DO NOT rules) | Auto-loaded by Claude Code |
+| Pinned role memories | Agent identity, mandate, team capabilities | Loaded via `get_boot_briefing` |
+| Boot self-check | Agent states name, role, and checks task inbox | tmux nudge from `launch-all.sh` |
+
+### 7. Observability Layer (audit trail)
+
+Every tool call is logged to the `audit_log` table with agent, action, detail (JSON), and timestamps. Agents can query the log via `query_audit_log` to review team activity. The watchdog uses audit data to determine whether an agent is actively working or truly stuck.
 
 ## Data Flow: Task Creation
 
@@ -108,7 +135,10 @@ Agent A calls create_task(to="steve", description="...")
 │   ├── server.ts          → threadwork/mcp-servers/task-board/server.ts
 │   ├── db.ts              → ...
 │   ├── memory.ts          → ...  (NEW)
+│   ├── audit.ts           → ...  (NEW)
 │   ├── consolidate.ts     → ...  (NEW)
+│   ├── watchdog.ts        → ...  (NEW)
+│   ├── seed-roles.ts      → ...  (NEW)
 │   ├── config.ts          → ...
 │   ├── notify.ts          → ...
 │   ├── nudge.ts           → ...

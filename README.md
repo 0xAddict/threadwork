@@ -41,12 +41,13 @@ Multi-agent orchestration harness for Claude Code. Runs persistent Claude Code s
     ┌─────────────┴─────────────┐
     │  task-board MCP server     │
     │  SQLite (WAL) shared DB    │
-    │  11 tools:                 │
+    │  12 tools:                 │
     │    Tasks: create, claim,   │
     │    complete, list, note,   │
     │    nudge                   │
     │    Memory: save, recall,   │
     │    briefing, promote, pin  │
+    │    Audit: query log         │
     ├────────────────────────────┤
     │  Nudge: tmux send-keys     │
     │  Notify: Telegram Bot API  │
@@ -67,6 +68,11 @@ Multi-agent orchestration harness for Claude Code. Runs persistent Claude Code s
 | Memory system | `mcp-servers/task-board/memory.ts` | [memory-system.md](docs/memory-system.md) |
 | Nightly consolidation | `mcp-servers/task-board/consolidate.ts` | [memory-system.md](docs/memory-system.md#nightly-consolidation) |
 | Consolidation LaunchAgent | `templates/com.threadwork.consolidate.plist` | [boot-sequence.md](docs/boot-sequence.md#consolidation-launchagent) |
+| Audit log | `mcp-servers/task-board/audit.ts` | [task-board.md](docs/task-board.md#audit-log) |
+| Watchdog | `mcp-servers/task-board/watchdog.ts` | [architecture.md](docs/architecture.md#5-watchdog-layer) |
+| Watchdog LaunchAgent | `templates/com.threadwork.watchdog.plist` | [boot-sequence.md](docs/boot-sequence.md#watchdog-launchagent) |
+| Agent operating manual | `CLAUDE.md` (deployed to `~/.claude/`) | [architecture.md](docs/architecture.md#6-onboarding-layer) |
+| Role seeder | `mcp-servers/task-board/seed-roles.ts` | [memory-system.md](docs/memory-system.md#seeded-role-memories) |
 
 ## Prerequisites
 
@@ -85,6 +91,9 @@ cd ~/threadwork
 # Install task board dependencies
 cd mcp-servers/task-board && bun install && cd ../..
 
+# Seed agent role memories (one-time)
+cd mcp-servers/task-board && bun run seed-roles.ts && cd ../..
+
 # Edit telegram-pool.sh with your bot tokens
 $EDITOR scripts/telegram-pool.sh
 
@@ -102,7 +111,7 @@ cd mcp-servers/task-board
 bun test
 ```
 
-29 tests across 6 files.
+41 tests across 8 files.
 
 ## License
 

@@ -174,6 +174,23 @@ Two mechanisms ensure agents load their briefing on startup:
 
 Shared memories use `agent = 'shared'` in the same table. All agents load shared memories in their boot briefing alongside personal ones. Use `promote_memory` to share a personal learning with all agents.
 
+## Seeded Role Memories
+
+On first install, run `seed-roles.ts` to create pinned role memories for all agents:
+
+```bash
+cd mcp-servers/task-board
+bun run seed-roles.ts
+```
+
+This creates 2 pinned role memories per agent (8 total):
+- **Boss:** CEO identity + team capabilities overview
+- **Steve/Sadie/Kiera:** Worker identity + teammate awareness
+
+These are pinned (never decay) and loaded first in every boot briefing. Re-running the script is safe — it skips existing memories.
+
+To update a role, edit `seed-roles.ts` and re-run, or have the agent use `save_memory` with `category="role"` and `pinned=true`.
+
 ## Phase 2 (Future): Weekly Intelligent Review
 
 Not yet implemented. Planned:
