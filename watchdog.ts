@@ -44,7 +44,7 @@ function incrementNudgeCount(taskDb: TaskDB, taskId: number): void {
 
 async function checkDeadSessions(audit: AuditLog): Promise<void> {
   for (const [agent, session] of Object.entries(AGENT_SESSIONS)) {
-    const proc = Bun.spawnSync(['tmux', 'has-session', '-t', session], { stdout: 'pipe', stderr: 'pipe' })
+    const proc = Bun.spawnSync(['/Users/coachstokes/.local/bin/tmux', 'has-session', '-t', session], { stdout: 'pipe', stderr: 'pipe' })
     if (proc.exitCode !== 0) {
       audit.log('watchdog', 'session_dead', { agent, session })
       await postToGroup(`⚠️ ${agent} session (${session}) is dead.`)

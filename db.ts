@@ -40,12 +40,43 @@ export interface UpdateTaskInput {
 
 export class TaskDB {
   private db: Database
+  private dbPath: string
 
   constructor(dbPath: string = DB_PATH) {
-    this.db = new Database(dbPath, { create: true })
-    this.db.prepare('PRAGMA journal_mode=WAL').run()
-    this.db.prepare('PRAGMA busy_timeout=5000').run()
+    this.dbPath = dbPath
+    this.db = this.openDb()
     this.migrate()
+  }
+
+  private openDb(): Database {
+    const db = new Database(this.dbPath, { create: true })
+    db.prepare('PRAGMA journal_mode=WAL').run()
+    db.prepare('PRAGMA busy_timeout=5000').run()
+    return db
+  }
+
+  /** Get the current database handle (used by MemoryDB/AuditLog) */
+  getHandle(): Database {
+    return this.db
+  }
+
+  /** Reconnect if the current handle is broken */
+  private reconnect(): void {
+    try { this.db.close() } catch {}
+    this.db = this.openDb()
+  }
+
+  /** Run a callback, retrying once with a fresh connection on disk I/O error */
+  run<T>(fn: (db: Database) => T): T {
+    try {
+      return fn(this.db)
+    } catch (err: any) {
+      if (err?.message?.includes('disk I/O error')) {
+        this.reconnect()
+        return fn(this.db)
+      }
+      throw err
+    }
   }
 
   private migrate(): void {
@@ -128,70 +159,79 @@ export class TaskDB {
   }
 
   createTask(input: CreateTaskInput): Task {
-    const stmt = this.db.prepare(`
-      INSERT INTO tasks (from_agent, to_agent, description, priority)
-      VALUES ($from, $to, $description, $priority)
-      RETURNING *
-    `)
-    return stmt.get({
-      $from: input.from,
-      $to: input.to,
-      $description: input.description,
-      $priority: input.priority,
-    }) as Task
+    return this.run(db => {
+      const stmt = db.prepare(`
+        INSERT INTO tasks (from_agent, to_agent, description, priority)
+        VALUES ($from, $to, $description, $priority)
+        RETURNING *
+      `)
+      return stmt.get({
+        $from: input.from,
+        $to: input.to,
+        $description: input.description,
+        $priority: input.priority,
+      }) as Task
+    })
   }
 
   getTask(id: number): Task | null {
-    const stmt = this.db.prepare('SELECT * FROM tasks WHERE id = ?')
-    return stmt.get(id) as Task | null
+    return this.run(db => db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task | null)
   }
 
   listTasks(filter: ListFilter = {}): Task[] {
-    const conditions: string[] = []
-    const params: unknown[] = []
+    return this.run(db => {
+      const conditions: string[] = []
+      const params: unknown[] = []
 
-    if (filter.assignee) {
-      conditions.push('to_agent = ?')
-      params.push(filter.assignee)
-    }
-    if (filter.status) {
-      conditions.push('status = ?')
-      params.push(filter.status)
-    }
+      if (filter.assignee) {
+        conditions.push('to_agent = ?')
+        params.push(filter.assignee)
+      }
+      if (filter.status) {
+        conditions.push('status = ?')
+        params.push(filter.status)
+      }
 
-    const where = conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : ''
-    return this.db.prepare(`SELECT * FROM tasks${where} ORDER BY created_at DESC`).all(...params) as Task[]
+      const where = conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : ''
+      return db.prepare(`SELECT * FROM tasks${where} ORDER BY created_at DESC`).all(...params) as Task[]
+    })
   }
 
   claimTask(id: number, agent: string): Task | null {
-    const stmt = this.db.prepare(`
-      UPDATE tasks SET status = 'in_progress', claimed_at = datetime('now')
-      WHERE id = ? AND to_agent = ? AND status = 'pending'
-      RETURNING *
-    `)
-    return stmt.get(id, agent) as Task | null
+    return this.run(db => {
+      const stmt = db.prepare(`
+        UPDATE tasks SET status = 'in_progress', claimed_at = datetime('now')
+        WHERE id = ? AND to_agent = ? AND status = 'pending'
+        RETURNING *
+      `)
+      return stmt.get(id, agent) as Task | null
+    })
   }
 
   completeTask(id: number, result: string): Task | null {
-    const stmt = this.db.prepare(`
-      UPDATE tasks SET status = 'completed', result = ?, completed_at = datetime('now')
-      WHERE id = ? AND status = 'in_progress'
-      RETURNING *
-    `)
-    return stmt.get(result, id) as Task | null
+    return this.run(db => {
+      const stmt = db.prepare(`
+        UPDATE tasks SET status = 'completed', result = ?, completed_at = datetime('now')
+        WHERE id = ? AND status = 'in_progress'
+        RETURNING *
+      `)
+      return stmt.get(result, id) as Task | null
+    })
   }
 
   addNote(taskId: number, fromAgent: string, message: string): Note {
-    const stmt = this.db.prepare(`
-      INSERT INTO notes (task_id, from_agent, message)
-      VALUES (?, ?, ?)
-      RETURNING *
-    `)
-    return stmt.get(taskId, fromAgent, message) as Note
+    return this.run(db => {
+      const stmt = db.prepare(`
+        INSERT INTO notes (task_id, from_agent, message)
+        VALUES (?, ?, ?)
+        RETURNING *
+      `)
+      return stmt.get(taskId, fromAgent, message) as Note
+    })
   }
 
   getNotes(taskId: number): Note[] {
-    return this.db.prepare('SELECT * FROM notes WHERE task_id = ? ORDER BY created_at ASC').all(taskId) as Note[]
+    return this.run(db => db.prepare('SELECT * FROM notes WHERE task_id = ? ORDER BY created_at ASC').all(taskId) as Note[])
   }
 
   close(): void {

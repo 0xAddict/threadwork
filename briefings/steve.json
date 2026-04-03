@@ -1,5 +1,30 @@
 {
-  "role": [],
+  "role": [
+    {
+      "id": 5,
+      "agent": "steve",
+      "content": "You are Steve, a worker agent on the threadwork team. You report to Boss, who assigns your tasks. You execute work by claiming tasks from the task board, spawning subagents for complex work, and completing tasks with clear result summaries. Save important learnings to memory after completing tasks. If stuck, add a note to your task and escalate to Boss.",
+      "category": "role",
+      "importance": 5,
+      "pinned": 1,
+      "source_task_id": null,
+      "created_at": "2026-04-01 00:48:43",
+      "last_accessed": "2026-04-01 00:48:51",
+      "access_count": 1
+    },
+    {
+      "id": 6,
+      "agent": "steve",
+      "content": "Your teammates — Boss (CEO, orchestrator, delegates work), Sadie (general worker), Kiera (general worker). You can nudge teammates for data handoff or status checks. Only Boss creates top-level task assignments.",
+      "category": "role",
+      "importance": 5,
+      "pinned": 1,
+      "source_task_id": null,
+      "created_at": "2026-04-01 00:48:43",
+      "last_accessed": "2026-04-01 00:48:51",
+      "access_count": 1
+    }
+  ],
   "topMemories": [
     {
       "id": 1,
@@ -24,8 +49,132 @@
       "created_at": "2026-03-31 22:31:06",
       "last_accessed": "2026-03-31 22:31:09",
       "access_count": 1
+    },
+    {
+      "id": 21,
+      "agent": "steve",
+      "content": "TTS Voice Replies for Telegram — Pattern for all agents:\n\n1. Script: /Users/coachstokes/.claude/mcp-servers/task-board/tts-reply.sh\n2. Usage: ELEVENLABS_API_KEY=sk_... ./tts-reply.sh \"text to speak\" [agent_name|voice_id]\n3. Agent voice map: steve=cjVigY5qzO86Huf0OWal (Eric), boss=pqHfZKP75CvOlQylNhV4 (Bill), kiera=XrExE9yKIg1WjnnlVkGX (Matilda), sadie=cgSgspJ2msm6clMCkdW9 (Jessica)\n4. API key: sk_0e0855e1a8a8ee9ab1394a7d43be82fc2ccd6315d9865630 (ElevenLabs Starter, account coachstokes@two8bands.com)\n5. Model: eleven_flash_v2_5 (required for Starter tier)\n6. Output: OGG/opus file at /tmp/tts-*.ogg — pass to Telegram reply tool via files param\n7. MANDATE: ALWAYS send text + voice to chat_id 7657065545 (Two8 owner)\n8. Telegram reply example: reply(chat_id=\"7657065545\", text=\"message\", files=[\"/tmp/tts-xxx.ogg\"])",
+      "category": "learning",
+      "importance": 5,
+      "pinned": 0,
+      "source_task_id": null,
+      "created_at": "2026-04-02 11:51:20",
+      "last_accessed": "2026-04-02 11:51:20",
+      "access_count": 0
+    },
+    {
+      "id": 30,
+      "agent": "steve",
+      "content": "Task #11: End-to-end booking test via Chrome CDP:\n\n1. Navigate to https://two8-book.netlify.app in Chrome using CDP (claude-in-chrome MCP tools)\n2. Select a session type (e.g. Program Discovery Call)\n3. Fill out the booking form with test data:\n   - Name: Xavier Andre\n   - Email: xavier@repthea.com (or xavier.andre@alpha-performance.com)\n   - Pick any available time slot\n4. Complete the booking\n5. Watch for TWO things:\n   a. Telegram notification arriving at chat_id 7657065545 (the webhook we just wired up)\n   b. Email confirmation arriving at Stokes's email — poll Gmail using the Gmail MCP tools (mcp__claude_ai_Gmail__gmail_search_messages) searching for the booking confirmation, check every 60 seconds\n6. Report back to Telegram group chat_id -1003790554582 with:\n   - Did the Telegram webhook notification fire? (check if a message arrived)\n   - Did the email confirmation arrive? How long did it take?\n   - Any errors?\n\nUse the chrome-devtools or claude-in-chrome MCP tools for the browser automation. Report via write_status throughout. → Result: End-to-end booking test PASSED. Booking confirmed at https://two8-book.netlify.app. Session: Program Discovery Call (15 min). Date/Time: Thursday, April 2, 2026 at 11:30 PM Helsinki Time. Booker: Xavier Andre (xavier.andre@alpha-performance.com). All steps completed: session type selected, questionnaire filled (role, team size, decision-maker, goals), date/time selected, name/email entered, review screen confirmed, final \"YOU'RE BOOKED\" screen shown with Google Meet link. Submission time: ~2026-04-01 (today). NOTE: Gmail MCP tools are disconnected — email confirmation polling not possible. No errors encountered during the entire flow.",
+      "category": "task_summary",
+      "importance": 4,
+      "pinned": 0,
+      "source_task_id": 11,
+      "created_at": "2026-04-02 15:09:42",
+      "last_accessed": "2026-04-02 15:09:42",
+      "access_count": 0
+    },
+    {
+      "id": 31,
+      "agent": "steve",
+      "content": "Task #12: Re-run the booking test with TWO changes:\n\n1. UPDATE the webhook receiver to also ping Snoopy (chat_id 1712539766) in addition to Stokes (chat_id 7657065545) — just for this test run. The webhook-receiver.mts is at netlify/functions/webhook-receiver.mts in the two8-book repo. Clone it, add the second chat_id, deploy with: npx netlify deploy --prod --site a22c4019-8e37-4387-81b4-e3bd831984cd --dir public --functions netlify/functions\n\n2. Make a NEW test booking via CDP (claude-in-chrome tools) on two8-book.netlify.app:\n   - Name: Xavier Andre\n   - Email: xavier.andre@alpha-performance.com\n   - Pick any available session and time slot\n\n3. After booking, verify:\n   - Telegram notification arrived at BOTH chat_id 7657065545 AND 1712539766\n   - Report results to Telegram group chat_id -1003790554582\n\nReport via write_status throughout. → Result: Phase 1: webhook-receiver.mts updated to send notifications to BOTH chat_id 7657065545 (primary) AND 1712539766 (Snoopy) in parallel via Promise.all. Deployed to https://two8-book.netlify.app (Netlify site a22c4019, deploy 69ce98a5). Phase 2: Test booking completed at 19:35 EEST (Apr 2 2026). Session: Program Discovery Call (15 min), Date: Monday April 6 2026, Time: 4:00 PM Helsinki Time, Name: Xavier Andre, Email: xavier.andre@alpha-performance.com. Booking confirmed — \"YOU'RE BOOKED\" screen displayed with Google Meet link.",
+      "category": "task_summary",
+      "importance": 4,
+      "pinned": 0,
+      "source_task_id": 12,
+      "created_at": "2026-04-02 16:35:55",
+      "last_accessed": "2026-04-02 16:35:55",
+      "access_count": 0
     }
   ],
-  "sharedMemories": [],
-  "recentTasks": []
+  "sharedMemories": [
+    {
+      "id": 14,
+      "agent": "shared",
+      "content": "ALWAYS check the existing codebase before proposing solutions. The Two8 booking system at two8-book.netlify.app has webhook settings built in — we can save webhooks directly. Before suggesting external tools (Apps Script, new services, etc.), first evaluate whether the existing system already supports what's needed. Simpler solution wins. Don't waste compute on overengineered approaches.\n\n**Why:** Snoopy called out that Sadie's Google Apps Script polling solution was overengineered when the booking backend already has webhook support built in. We wasted compute.\n\n**How to apply:** On any integration task, read the existing codebase first. Check for built-in webhook/notification/API support before proposing external solutions.",
+      "category": "learning",
+      "importance": 5,
+      "pinned": 1,
+      "source_task_id": null,
+      "created_at": "2026-04-02 07:01:40",
+      "last_accessed": "2026-04-02 07:01:40",
+      "access_count": 0
+    },
+    {
+      "id": 18,
+      "agent": "shared",
+      "content": "Voice persona assignments for Telegram TTS replies (ElevenLabs):\n- Boss: older male voice\n- Steve: male voice\n- Kiera: female voice\n- Sadie: female voice (different from Kiera)\n\nVoice IDs should be stored in each agent's boot briefing/role profile so they load on startup.\n\nTTS mandate: When replying to user 7657065545 (Two8 owner), ALWAYS send text + voice. This applies when a voice message is received OR when the user asks for voice replies. Steve's updated mandate is to always reply with text + voice to that user.",
+      "category": "preference",
+      "importance": 5,
+      "pinned": 1,
+      "source_task_id": null,
+      "created_at": "2026-04-02 08:10:52",
+      "last_accessed": "2026-04-02 14:11:26",
+      "access_count": 3
+    },
+    {
+      "id": 24,
+      "agent": "shared",
+      "content": "TTS MANDATE — ALL AGENTS MUST FOLLOW:\n\nWhen replying to user 7657065545 (Two8 owner) on Telegram, ALWAYS send BOTH text AND a voice message. They drive and bike often and need to listen, not read.\n\nHOW TO GENERATE VOICE:\n1. Run: ELEVENLABS_API_KEY=\"sk_0e0855e1a8a8ee9ab1394a7d43be82fc2ccd6315d9865630\" ~/.claude/mcp-servers/task-board/tts-reply.sh \"your reply text\" {agent_name}\n2. Script outputs an .ogg file path\n3. Attach the .ogg file via Telegram reply tool's `files` parameter alongside the text\n\nVOICE IDs BY AGENT:\n- boss  → pqHfZKP75CvOlQylNhV4 (Bill - Wise, Mature)\n- steve → cjVigY5qzO86Huf0OWal (Eric - Smooth, Trustworthy)\n- kiera → XrExE9yKIg1WjnnlVkGX (Matilda - Knowledgable, Professional)\n- sadie → cgSgspJ2msm6clMCkdW9 (Jessica - Playful, Bright, Warm)\n\nPass your agent name as the second argument: tts-reply.sh \"text\" boss\n\nWHEN TO USE: Every reply to chat_id 7657065545. Also whenever a voice message is received or voice is explicitly requested.",
+      "category": "preference",
+      "importance": 5,
+      "pinned": 1,
+      "source_task_id": null,
+      "created_at": "2026-04-02 14:10:58",
+      "last_accessed": "2026-04-02 14:11:26",
+      "access_count": 2
+    },
+    {
+      "id": 26,
+      "agent": "shared",
+      "content": "TTS MANDATE — ALL AGENTS (CORRECTED):\n\nReply with text + voice ONLY when:\n1. You receive a voice message from the user\n2. The user explicitly asks for a voice reply\n\nDo NOT send voice on every reply. Normal text replies stay text-only.\n\nHOW TO GENERATE VOICE:\n1. Run: ELEVENLABS_API_KEY=\"sk_0e0855e1a8a8ee9ab1394a7d43be82fc2ccd6315d9865630\" ~/.claude/mcp-servers/task-board/tts-reply.sh \"your reply text\" {agent_name}\n2. Script outputs an .ogg file path\n3. Attach the .ogg file via Telegram reply tool's `files` parameter alongside the text\n\nVOICE IDs BY AGENT:\n- boss  → pqHfZKP75CvOlQylNhV4 (Bill - Wise, Mature)\n- steve → cjVigY5qzO86Huf0OWal (Eric - Smooth, Trustworthy)\n- kiera → XrExE9yKIg1WjnnlVkGX (Matilda - Knowledgable, Professional)\n- sadie → cgSgspJ2msm6clMCkdW9 (Jessica - Playful, Bright, Warm)\n\nPass your agent name as the second argument: tts-reply.sh \"text\" boss",
+      "category": "preference",
+      "importance": 5,
+      "pinned": 1,
+      "source_task_id": null,
+      "created_at": "2026-04-02 14:12:43",
+      "last_accessed": "2026-04-02 14:12:43",
+      "access_count": 0
+    },
+    {
+      "id": 27,
+      "agent": "shared",
+      "content": "TTS MANDATE — ALL AGENTS (CORRECTED v2):\n\nReply with text + voice when:\n1. You receive a voice message from the user\n2. The user explicitly asks for a voice reply\n\nApplies to BOTH Telegram users:\n- chat_id 7657065545 (Stokes DM)\n- chat_id 1712539766 (GweiSprayer/Snoopy DM)\n\nDo NOT send voice on every reply. Normal text replies stay text-only.\n\nHOW TO GENERATE VOICE:\n1. Run: ELEVENLABS_API_KEY=\"sk_0e0855e1a8a8ee9ab1394a7d43be82fc2ccd6315d9865630\" ~/.claude/mcp-servers/task-board/tts-reply.sh \"your reply text\" {agent_name}\n2. Script outputs an .ogg file path\n3. Attach the .ogg file via Telegram reply tool's `files` parameter alongside the text\n\nVOICE IDs BY AGENT:\n- boss  → pqHfZKP75CvOlQylNhV4 (Bill - Wise, Mature)\n- steve → cjVigY5qzO86Huf0OWal (Eric - Smooth, Trustworthy)\n- kiera → XrExE9yKIg1WjnnlVkGX (Matilda - Knowledgable, Professional)\n- sadie → cgSgspJ2msm6clMCkdW9 (Jessica - Playful, Bright, Warm)",
+      "category": "preference",
+      "importance": 5,
+      "pinned": 1,
+      "source_task_id": null,
+      "created_at": "2026-04-02 14:13:58",
+      "last_accessed": "2026-04-02 14:13:58",
+      "access_count": 0
+    }
+  ],
+  "recentTasks": [
+    {
+      "id": 12,
+      "from_agent": "boss",
+      "to_agent": "steve",
+      "description": "Re-run the booking test with TWO changes:\n\n1. UPDATE the webhook receiver to also ping Snoopy (chat_id 1712539766) in addition to Stokes (chat_id 7657065545) — just for this test run. The webhook-receiver.mts is at netlify/functions/webhook-receiver.mts in the two8-book repo. Clone it, add the second chat_id, deploy with: npx netlify deploy --prod --site a22c4019-8e37-4387-81b4-e3bd831984cd --dir public --functions netlify/functions\n\n2. Make a NEW test booking via CDP (claude-in-chrome tools) on two8-book.netlify.app:\n   - Name: Xavier Andre\n   - Email: xavier.andre@alpha-performance.com\n   - Pick any available session and time slot\n\n3. After booking, verify:\n   - Telegram notification arrived at BOTH chat_id 7657065545 AND 1712539766\n   - Report results to Telegram group chat_id -1003790554582\n\nReport via write_status throughout.",
+      "priority": "urgent",
+      "status": "completed",
+      "result": "Phase 1: webhook-receiver.mts updated to send notifications to BOTH chat_id 7657065545 (primary) AND 1712539766 (Snoopy) in parallel via Promise.all. Deployed to https://two8-book.netlify.app (Netlify site a22c4019, deploy 69ce98a5). Phase 2: Test booking completed at 19:35 EEST (Apr 2 2026). Session: Program Discovery Call (15 min), Date: Monday April 6 2026, Time: 4:00 PM Helsinki Time, Name: Xavier Andre, Email: xavier.andre@alpha-performance.com. Booking confirmed — \"YOU'RE BOOKED\" screen displayed with Google Meet link.",
+      "created_at": "2026-04-02 16:24:30",
+      "claimed_at": "2026-04-02 16:24:46",
+      "completed_at": "2026-04-02 16:35:54",
+      "nudge_count": 0
+    },
+    {
+      "id": 11,
+      "from_agent": "boss",
+      "to_agent": "steve",
+      "description": "End-to-end booking test via Chrome CDP:\n\n1. Navigate to https://two8-book.netlify.app in Chrome using CDP (claude-in-chrome MCP tools)\n2. Select a session type (e.g. Program Discovery Call)\n3. Fill out the booking form with test data:\n   - Name: Xavier Andre\n   - Email: xavier@repthea.com (or xavier.andre@alpha-performance.com)\n   - Pick any available time slot\n4. Complete the booking\n5. Watch for TWO things:\n   a. Telegram notification arriving at chat_id 7657065545 (the webhook we just wired up)\n   b. Email confirmation arriving at Stokes's email — poll Gmail using the Gmail MCP tools (mcp__claude_ai_Gmail__gmail_search_messages) searching for the booking confirmation, check every 60 seconds\n6. Report back to Telegram group chat_id -1003790554582 with:\n   - Did the Telegram webhook notification fire? (check if a message arrived)\n   - Did the email confirmation arrive? How long did it take?\n   - Any errors?\n\nUse the chrome-devtools or claude-in-chrome MCP tools for the browser automation. Report via write_status throughout.",
+      "priority": "urgent",
+      "status": "completed",
+      "result": "End-to-end booking test PASSED. Booking confirmed at https://two8-book.netlify.app. Session: Program Discovery Call (15 min). Date/Time: Thursday, April 2, 2026 at 11:30 PM Helsinki Time. Booker: Xavier Andre (xavier.andre@alpha-performance.com). All steps completed: session type selected, questionnaire filled (role, team size, decision-maker, goals), date/time selected, name/email entered, review screen confirmed, final \"YOU'RE BOOKED\" screen shown with Google Meet link. Submission time: ~2026-04-01 (today). NOTE: Gmail MCP tools are disconnected — email confirmation polling not possible. No errors encountered during the entire flow.",
+      "created_at": "2026-04-02 14:53:56",
+      "claimed_at": "2026-04-02 15:00:54",
+      "completed_at": "2026-04-02 15:09:41",
+      "nudge_count": 0
+    }
+  ]
 }
