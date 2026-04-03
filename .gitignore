@@ -7,6 +7,10 @@ access.json
 *.db
 *.db-shm
 *.db-wal
+*.db.bak
+*.db.bak-shm
+*.db.bak-wal
+*.db.fresh
 
 # Lock files
 locks/
@@ -17,6 +21,9 @@ bun.lockb
 
 # OS
 .DS_Store
+
+# Image assets / mockups
+*.png
 
 # Logs
 *.log

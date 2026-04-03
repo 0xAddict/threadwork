@@ -35,11 +35,10 @@ export function runDecay(mem: MemoryDB): number {
 }
 
 export function runArchive(mem: MemoryDB): number {
-  const db = (mem as any).db
-  const candidates = db.prepare('SELECT id FROM memories WHERE importance <= 0 AND pinned = 0').all() as { id: number }[]
+  const candidates = mem.getZeroImportanceIds()
 
-  for (const c of candidates) {
-    mem.archiveMemory(c.id)
+  for (const id of candidates) {
+    mem.archiveMemory(id)
   }
 
   return candidates.length

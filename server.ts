@@ -455,7 +455,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: `Unknown agent: ${agent}`, isError: true }] }
         }
 
-        const proc = Bun.spawn(['tmux', 'send-keys', '-t', session, 'C-c'], { stdout: 'pipe', stderr: 'pipe' })
+        const proc = Bun.spawn(['/Users/coachstokes/.local/bin/tmux', 'send-keys', '-t', session, 'C-c'], { stdout: 'pipe', stderr: 'pipe' })
         const exitCode = await proc.exited
 
         if (exitCode !== 0) {

@@ -1,4 +1,3 @@
-import type { Database } from 'bun:sqlite'
 import type { TaskDB } from './db'
 
 export interface AuditEntry {
@@ -20,49 +19,55 @@ export interface AuditFilter {
 }
 
 export class AuditLog {
-  private db: Database
+  private taskDb: TaskDB
 
   constructor(taskDb: TaskDB) {
-    this.db = (taskDb as any).db
+    this.taskDb = taskDb
   }
 
   log(agent: string, action: string, detail?: object, taskId?: number, memoryId?: number): void {
-    this.db.prepare(
-      'INSERT INTO audit_log (agent, action, detail, task_id, memory_id) VALUES (?, ?, ?, ?, ?)'
-    ).run(agent, action, detail ? JSON.stringify(detail) : null, taskId ?? null, memoryId ?? null)
+    this.taskDb.run(db =>
+      db.prepare(
+        'INSERT INTO audit_log (agent, action, detail, task_id, memory_id) VALUES (?, ?, ?, ?, ?)'
+      ).run(agent, action, detail ? JSON.stringify(detail) : null, taskId ?? null, memoryId ?? null)
+    )
   }
 
   query(filter: AuditFilter): AuditEntry[] {
-    const conditions: string[] = []
-    const params: unknown[] = []
+    return this.taskDb.run(db => {
+      const conditions: string[] = []
+      const params: unknown[] = []
 
-    if (filter.agent) {
-      conditions.push('agent = ?')
-      params.push(filter.agent)
-    }
-    if (filter.action) {
-      conditions.push('action = ?')
-      params.push(filter.action)
-    }
-    if (filter.taskId) {
-      conditions.push('task_id = ?')
-      params.push(filter.taskId)
-    }
-    if (filter.since) {
-      conditions.push('created_at >= ?')
-      params.push(filter.since)
-    }
+      if (filter.agent) {
+        conditions.push('agent = ?')
+        params.push(filter.agent)
+      }
+      if (filter.action) {
+        conditions.push('action = ?')
+        params.push(filter.action)
+      }
+      if (filter.taskId) {
+        conditions.push('task_id = ?')
+        params.push(filter.taskId)
+      }
+      if (filter.since) {
+        conditions.push('created_at >= ?')
+        params.push(filter.since)
+      }
 
-    const where = conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : ''
-    const limit = filter.limit ?? 50
-    return this.db.prepare(
-      `SELECT * FROM audit_log${where} ORDER BY created_at DESC LIMIT ?`
-    ).all(...params, limit) as AuditEntry[]
+      const where = conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : ''
+      const limit = filter.limit ?? 50
+      return db.prepare(
+        `SELECT * FROM audit_log${where} ORDER BY created_at DESC LIMIT ?`
+      ).all(...params, limit) as AuditEntry[]
+    })
   }
 
   getAgentActivity(agent: string, minutes: number): AuditEntry[] {
-    return this.db.prepare(
-      "SELECT * FROM audit_log WHERE agent = ? AND created_at >= datetime('now', '-' || ? || ' minutes') ORDER BY created_at DESC"
-    ).all(agent, minutes) as AuditEntry[]
+    return this.taskDb.run(db =>
+      db.prepare(
+        "SELECT * FROM audit_log WHERE agent = ? AND created_at >= datetime('now', '-' || ? || ' minutes') ORDER BY created_at DESC"
+      ).all(agent, minutes) as AuditEntry[]
+    )
   }
 }

@@ -2,7 +2,7 @@
 # launch-all.sh — Ensure all Claude Code + Telegram tmux sessions are running
 # Called on login via LaunchAgent, or manually: ~/.claude/launch-all.sh
 
-SESSION_NAMES=(claude-boss claude-steve claude-sadie claude-kiera)
+SESSION_NAMES=(claude-boss claude-steve claude-sadie claude-kiera claude-snoopy)
 POOL_SCRIPT="$HOME/.claude/telegram-pool.sh"
 TRUST_DELAY=6  # seconds to wait for trust prompt to appear
 

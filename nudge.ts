@@ -6,7 +6,7 @@ export function resolveSession(agent: string): string | null {
 }
 
 export function buildNudgeCommand(session: string, message: string): string[] {
-  return ['tmux', 'send-keys', '-t', session, message, 'Enter']
+  return ['/Users/coachstokes/.local/bin/tmux', 'send-keys', '-t', session, message, 'Enter']
 }
 
 export async function nudgeAgent(

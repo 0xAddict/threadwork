@@ -17,9 +17,10 @@ export const getTelegramToken = (): string | undefined =>
 // Map of agent labels to tmux session names
 export const AGENT_SESSIONS: Record<string, string> = {
   boss: 'claude-boss',
-  steve: 'claude-steve',
+  steve: 'claude-steve-fresh',
   sadie: 'claude-sadie',
   kiera: 'claude-kiera',
+  snoopy: 'claude-snoopy',
 }
 
 // The agent label for this session (set by pool script via env var)

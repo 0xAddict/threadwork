@@ -14,6 +14,7 @@ BOTS=(
   "YOUR_BOT_TOKEN_2|Steve|$HOME/.claude/bots/steve.conf"
   "YOUR_BOT_TOKEN_3|Sadie|$HOME/.claude/bots/sadie.conf"
   "YOUR_BOT_TOKEN_4|Kiera|$HOME/.claude/bots/kiera.conf"
+  "YOUR_BOT_TOKEN_5|Snoopy|$HOME/.claude/bots/snoopy.conf"
 )
 
 # ─── Config ──────────────────────────────────────────────────────────────────
