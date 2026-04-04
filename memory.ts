@@ -55,11 +55,50 @@ export class MemoryDB {
     this.taskDb = taskDb
   }
 
+  normalizeContent(text: string): string {
+    return text.replace(/\s+/g, ' ').trim().toLowerCase()
+  }
+
+  inferClassification(content: string, category: string): Classification {
+    const CATEGORY_MAP: Record<string, Classification> = {
+      role: 'foundational',
+      preference: 'strategic',
+      fact: 'operational',
+      task_summary: 'observational',
+      learning: 'operational',
+    }
+    return CATEGORY_MAP[category] ?? 'operational'
+  }
+
+  inferSourceType(agent: string): SourceType {
+    if (agent === 'shared') return 'system'
+    return 'agent'
+  }
+
   saveMemory(input: SaveMemoryInput): Memory {
     return this.taskDb.run(db => {
+      // Dedup check: normalize content and look for existing active memory
+      const normalized = this.normalizeContent(input.content)
+      const existing = db.prepare(`
+        SELECT * FROM memories
+        WHERE agent = ? AND state = 'active'
+        AND LOWER(TRIM(REPLACE(content, '  ', ' '))) = ?
+      `).get(input.agent, normalized) as Memory | null
+
+      if (existing) {
+        return db.prepare(`
+          UPDATE memories SET support_count = support_count + 1, last_accessed = datetime('now')
+          WHERE id = ?
+          RETURNING *
+        `).get(existing.id) as Memory
+      }
+
+      const classification = this.inferClassification(input.content, input.category)
+      const sourceType = this.inferSourceType(input.agent)
+
       const stmt = db.prepare(`
-        INSERT INTO memories (agent, content, category, importance, pinned, source_task_id)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO memories (agent, content, category, importance, pinned, source_task_id, classification, source_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING *
       `)
       return stmt.get(
@@ -69,6 +108,8 @@ export class MemoryDB {
         input.importance ?? 3,
         input.pinned ? 1 : 0,
         input.source_task_id ?? null,
+        classification,
+        sourceType,
       ) as Memory
     })
   }
@@ -77,9 +118,61 @@ export class MemoryDB {
     return this.taskDb.run(db => db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as Memory | null)
   }
 
+  challengeMemory(id: number, reason: string): Memory | null {
+    return this.taskDb.run(db => {
+      const existing = db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as Memory | null
+      if (!existing) return null
+
+      const newChallengeCount = existing.challenge_count + 1
+      const shouldDispute = newChallengeCount > existing.support_count
+      const newQuality = shouldDispute ? Math.max(existing.quality - 0.2, 0) : existing.quality
+      const newState = shouldDispute ? 'disputed' : existing.state
+
+      const updated = db.prepare(`
+        UPDATE memories
+        SET challenge_count = ?, quality = ?, state = ?, last_validated = datetime('now')
+        WHERE id = ?
+        RETURNING *
+      `).get(newChallengeCount, newQuality, newState, id) as Memory
+
+      db.prepare(`
+        INSERT INTO audit_log (agent, action, detail, memory_id)
+        VALUES ('system', 'memory_challenged', ?, ?)
+      `).run(reason, id)
+
+      return updated
+    })
+  }
+
+  supersedeMemory(oldId: number, newContent: string, reason: string): { old: Memory, new: Memory } | null {
+    return this.taskDb.run(db => {
+      const existing = db.prepare('SELECT * FROM memories WHERE id = ?').get(oldId) as Memory | null
+      if (!existing) return null
+
+      const old = db.prepare(`
+        UPDATE memories SET state = 'superseded', last_validated = datetime('now')
+        WHERE id = ?
+        RETURNING *
+      `).get(oldId) as Memory
+
+      const replacement = db.prepare(`
+        INSERT INTO memories (agent, content, category, classification, quality, state, source_type, support_count, supersedes_memory_id)
+        VALUES (?, ?, ?, ?, 0.5, 'active', 'agent', 0, ?)
+        RETURNING *
+      `).get(existing.agent, newContent, existing.category, existing.classification, oldId) as Memory
+
+      db.prepare(`
+        INSERT INTO audit_log (agent, action, detail, memory_id)
+        VALUES ('system', 'memory_superseded', ?, ?)
+      `).run(`${reason} | old=${oldId} new=${replacement.id}`, replacement.id)
+
+      return { old, new: replacement }
+    })
+  }
+
   recallMemories(agent: string, filter: RecallFilter): Memory[] {
     return this.taskDb.run(db => {
-      const conditions = ['(agent = ? OR agent = ?)']
+      const conditions = ['(agent = ? OR agent = ?)', "state != 'superseded'"]
       const params: unknown[] = [agent, 'shared']
 
       if (filter.query) {
@@ -92,12 +185,11 @@ export class MemoryDB {
       }
 
       const limit = filter.limit ?? 10
-      const sql = `SELECT * FROM memories WHERE ${conditions.join(' AND ')} ORDER BY importance DESC, last_accessed DESC LIMIT ?`
+      const sql = `SELECT * FROM memories WHERE ${conditions.join(' AND ')} ORDER BY quality DESC, importance DESC, last_accessed DESC LIMIT ?`
       params.push(limit)
 
       const results = db.prepare(sql).all(...params) as Memory[]
 
-      // Update access tracking for returned memories
       if (results.length > 0) {
         const ids = results.map(r => r.id)
         db.prepare(`
@@ -128,15 +220,15 @@ export class MemoryDB {
   getBootBriefing(agent: string, taskDb: TaskDB): BootBriefing {
     return this.taskDb.run(db => {
       const role = db.prepare(
-        `SELECT * FROM memories WHERE agent = ? AND category = 'role' AND pinned = 1 ORDER BY importance DESC`
+        `SELECT * FROM memories WHERE agent = ? AND category = 'role' AND pinned = 1 AND state = 'active' ORDER BY quality DESC, importance DESC`
       ).all(agent) as Memory[]
 
       const topMemories = db.prepare(
-        `SELECT * FROM memories WHERE agent = ? AND category != 'role' ORDER BY importance DESC LIMIT 5`
+        `SELECT * FROM memories WHERE agent = ? AND category != 'role' AND state = 'active' ORDER BY quality DESC, importance DESC LIMIT 5`
       ).all(agent) as Memory[]
 
       const sharedMemories = db.prepare(
-        `SELECT * FROM memories WHERE agent = 'shared' ORDER BY importance DESC LIMIT 5`
+        `SELECT * FROM memories WHERE agent = 'shared' AND state = 'active' ORDER BY quality DESC, importance DESC LIMIT 5`
       ).all() as Memory[]
 
       const recentTasks = db.prepare(
@@ -157,8 +249,10 @@ export class MemoryDB {
     return this.taskDb.run(db => db.prepare(`
       SELECT * FROM memories
       WHERE pinned = 0
-        AND last_accessed < datetime('now', '-7 days')
+        AND last_accessed < datetime('now', '-1 days')
         AND importance > 0
+        AND classification != 'foundational'
+        AND state != 'superseded'
     `).all() as Memory[])
   }
 
@@ -169,11 +263,21 @@ export class MemoryDB {
   archiveMemory(id: number): void {
     this.taskDb.run(db => {
       db.prepare(`
-        INSERT INTO memory_archive (id, agent, content, category, importance, pinned, source_task_id, created_at, last_accessed, access_count)
-        SELECT id, agent, content, category, importance, pinned, source_task_id, created_at, last_accessed, access_count FROM memories WHERE id = ?
+        INSERT INTO memory_archive (id, agent, content, category, importance, pinned, source_task_id, created_at, last_accessed, access_count, classification, quality, state, source_type, evidence, support_count, challenge_count, supersedes_memory_id, last_validated)
+        SELECT id, agent, content, category, importance, pinned, source_task_id, created_at, last_accessed, access_count, classification, quality, state, source_type, evidence, support_count, challenge_count, supersedes_memory_id, last_validated FROM memories WHERE id = ?
       `).run(id)
       db.prepare('DELETE FROM memories WHERE id = ?').run(id)
     })
+  }
+
+  getSupersededOlderThan(days: number): number[] {
+    return this.taskDb.run(db =>
+      (db.prepare(`
+        SELECT id FROM memories
+        WHERE state = 'superseded'
+        AND last_accessed < datetime('now', '-' || ? || ' days')
+      `).all(days) as { id: number }[]).map(r => r.id)
+    )
   }
 
   pruneArchive(daysOld: number): number {

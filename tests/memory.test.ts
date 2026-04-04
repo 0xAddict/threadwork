@@ -155,3 +155,160 @@ describe('schema migration — DTC columns', () => {
     expect(result).toBeTruthy()
   })
 })
+
+// --- AutoDream: Task 2 tests ---
+
+describe('normalizeContent', () => {
+  let taskDb3: TaskDB
+  let mem3: MemoryDB
+
+  beforeEach(() => {
+    try { unlinkSync(TEST_DB_AUTODREAM) } catch {}
+    for (const suffix of ['-shm', '-wal']) {
+      try { unlinkSync(TEST_DB_AUTODREAM + suffix) } catch {}
+    }
+    taskDb3 = new TaskDB(TEST_DB_AUTODREAM)
+    mem3 = new MemoryDB(taskDb3)
+  })
+
+  test('collapses whitespace and trims', () => {
+    expect(mem3.normalizeContent('  hello   world  ')).toBe('hello world')
+  })
+
+  test('lowercases', () => {
+    expect(mem3.normalizeContent('Hello World')).toBe('hello world')
+  })
+})
+
+describe('inferClassification', () => {
+  let taskDb4: TaskDB
+  let mem4: MemoryDB
+
+  beforeEach(() => {
+    try { unlinkSync(TEST_DB_AUTODREAM) } catch {}
+    for (const suffix of ['-shm', '-wal']) {
+      try { unlinkSync(TEST_DB_AUTODREAM + suffix) } catch {}
+    }
+    taskDb4 = new TaskDB(TEST_DB_AUTODREAM)
+    mem4 = new MemoryDB(taskDb4)
+  })
+
+  test('role category maps to foundational', () => {
+    expect(mem4.inferClassification('any content', 'role')).toBe('foundational')
+  })
+
+  test('preference category maps to strategic', () => {
+    expect(mem4.inferClassification('any content', 'preference')).toBe('strategic')
+  })
+
+  test('fact category maps to operational', () => {
+    expect(mem4.inferClassification('any content', 'fact')).toBe('operational')
+  })
+
+  test('task_summary category maps to observational', () => {
+    expect(mem4.inferClassification('any content', 'task_summary')).toBe('observational')
+  })
+
+  test('learning category maps to operational', () => {
+    expect(mem4.inferClassification('any content', 'learning')).toBe('operational')
+  })
+})
+
+describe('challengeMemory', () => {
+  let taskDb5: TaskDB
+  let mem5: MemoryDB
+
+  beforeEach(() => {
+    try { unlinkSync(TEST_DB_AUTODREAM) } catch {}
+    for (const suffix of ['-shm', '-wal']) {
+      try { unlinkSync(TEST_DB_AUTODREAM + suffix) } catch {}
+    }
+    taskDb5 = new TaskDB(TEST_DB_AUTODREAM)
+    mem5 = new MemoryDB(taskDb5)
+  })
+
+  test('increments challenge_count', () => {
+    const m = mem5.saveMemory({ agent: 'boss', content: 'test fact', category: 'fact' })
+    const challenged = mem5.challengeMemory(m.id, 'outdated info')
+    expect(challenged).not.toBeNull()
+    expect(challenged!.challenge_count).toBe(1)
+  })
+
+  test('flips to disputed when challenge_count > support_count', () => {
+    const m = mem5.saveMemory({ agent: 'boss', content: 'test fact', category: 'fact' })
+    const challenged = mem5.challengeMemory(m.id, 'outdated info')
+    expect(challenged!.state).toBe('disputed')
+    expect(challenged!.quality).toBeLessThan(0.5)
+  })
+
+  test('reduces quality by 0.2 when disputed, floored at 0', () => {
+    const m = mem5.saveMemory({ agent: 'boss', content: 'test fact', category: 'fact' })
+    const c1 = mem5.challengeMemory(m.id, 'reason 1')
+    expect(c1!.quality).toBeCloseTo(0.3, 1)
+    const c2 = mem5.challengeMemory(m.id, 'reason 2')
+    expect(c2!.quality).toBeCloseTo(0.1, 1)
+    const c3 = mem5.challengeMemory(m.id, 'reason 3')
+    expect(c3!.quality).toBeCloseTo(0.0, 1)
+  })
+
+  test('returns null for nonexistent memory', () => {
+    expect(mem5.challengeMemory(9999, 'reason')).toBeNull()
+  })
+})
+
+describe('supersedeMemory', () => {
+  let taskDb6: TaskDB
+  let mem6: MemoryDB
+
+  beforeEach(() => {
+    try { unlinkSync(TEST_DB_AUTODREAM) } catch {}
+    for (const suffix of ['-shm', '-wal']) {
+      try { unlinkSync(TEST_DB_AUTODREAM + suffix) } catch {}
+    }
+    taskDb6 = new TaskDB(TEST_DB_AUTODREAM)
+    mem6 = new MemoryDB(taskDb6)
+  })
+
+  test('marks old memory as superseded and creates replacement', () => {
+    const old = mem6.saveMemory({ agent: 'boss', content: 'old fact', category: 'fact' })
+    const result = mem6.supersedeMemory(old.id, 'new fact', 'updated info')
+    expect(result).not.toBeNull()
+    expect(result!.old.state).toBe('superseded')
+    expect(result!.new.content).toBe('new fact')
+    expect(result!.new.supersedes_memory_id).toBe(old.id)
+    expect(result!.new.agent).toBe('boss')
+    expect(result!.new.category).toBe('fact')
+    expect(result!.new.classification).toBe(old.classification)
+  })
+
+  test('returns null for nonexistent memory', () => {
+    expect(mem6.supersedeMemory(9999, 'new', 'reason')).toBeNull()
+  })
+})
+
+describe('saveMemory dedup', () => {
+  let taskDb7: TaskDB
+  let mem7: MemoryDB
+
+  beforeEach(() => {
+    try { unlinkSync(TEST_DB_AUTODREAM) } catch {}
+    for (const suffix of ['-shm', '-wal']) {
+      try { unlinkSync(TEST_DB_AUTODREAM + suffix) } catch {}
+    }
+    taskDb7 = new TaskDB(TEST_DB_AUTODREAM)
+    mem7 = new MemoryDB(taskDb7)
+  })
+
+  test('duplicate content bumps support_count instead of creating new', () => {
+    const m1 = mem7.saveMemory({ agent: 'boss', content: 'Same content here', category: 'fact' })
+    const m2 = mem7.saveMemory({ agent: 'boss', content: 'same  content  here', category: 'fact' })
+    expect(m2.id).toBe(m1.id)
+    expect(m2.support_count).toBe(1)
+  })
+
+  test('different agent same content creates new memory', () => {
+    const m1 = mem7.saveMemory({ agent: 'boss', content: 'Same content', category: 'fact' })
+    const m2 = mem7.saveMemory({ agent: 'steve', content: 'Same content', category: 'fact' })
+    expect(m2.id).not.toBe(m1.id)
+  })
+})
