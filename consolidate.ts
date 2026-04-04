@@ -2,6 +2,7 @@
 // consolidate.ts — Nightly memory consolidation script
 import { TaskDB } from './db'
 import { MemoryDB } from './memory'
+import type { Memory } from './memory'
 import { DB_PATH } from './config'
 import { mkdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
@@ -14,15 +15,37 @@ const BRIEFING_DIR = join(
   'briefings',
 )
 
+export function getDecayWindowDays(memory: Pick<Memory, 'classification' | 'state' | 'quality' | 'challenge_count' | 'support_count'>): number {
+  const BASE_WINDOWS: Record<string, number> = {
+    foundational: Infinity,
+    strategic: 14,
+    operational: 7,
+    observational: 3,
+    ephemeral: 1,
+  }
+  let window = BASE_WINDOWS[memory.classification] ?? 7
+  if (window === Infinity) return Infinity
+  if (memory.state === 'disputed') window = Math.ceil(window / 2)
+  if (memory.quality < 0.3) window = Math.ceil(window / 2)
+  if (memory.challenge_count > memory.support_count) window = Math.ceil(window / 2)
+  return Math.max(window, 1)
+}
+
 export function runDecay(mem: MemoryDB): number {
   const candidates = mem.getDecayCandidate()
   let count = 0
 
   for (const m of candidates) {
+    const decayWindow = getDecayWindowDays(m)
+    if (decayWindow === Infinity) continue
+
     const lastAccessed = new Date(m.last_accessed + 'Z')
     const now = new Date()
     const daysSinceAccess = Math.floor((now.getTime() - lastAccessed.getTime()) / (1000 * 60 * 60 * 24))
-    const decayPeriods = Math.floor(daysSinceAccess / 7)
+
+    if (daysSinceAccess <= decayWindow) continue
+
+    const decayPeriods = Math.floor(daysSinceAccess / decayWindow)
     const newImportance = Math.max(m.importance - decayPeriods, 0)
 
     if (newImportance !== m.importance) {
@@ -35,13 +58,18 @@ export function runDecay(mem: MemoryDB): number {
 }
 
 export function runArchive(mem: MemoryDB): number {
-  const candidates = mem.getZeroImportanceIds()
-
-  for (const id of candidates) {
+  const zeroIds = mem.getZeroImportanceIds()
+  for (const id of zeroIds) {
     mem.archiveMemory(id)
   }
 
-  return candidates.length
+  // Also sweep superseded memories older than 7 days
+  const superseded = mem.getSupersededOlderThan(7)
+  for (const id of superseded) {
+    mem.archiveMemory(id)
+  }
+
+  return zeroIds.length + superseded.length
 }
 
 export function runPrune(mem: MemoryDB, daysOld: number = 90): number {
@@ -59,6 +87,15 @@ export function generateBriefing(
   writeFileSync(join(briefingDir, `${agent}.json`), JSON.stringify(briefing, null, 2))
 }
 
+export function runStatusTtl(taskDb: TaskDB, maxAgeHours: number = 24): number {
+  return taskDb.run(db => {
+    const result = db.prepare(
+      "DELETE FROM task_status_events WHERE created_at < datetime('now', '-' || ? || ' hours')"
+    ).run(maxAgeHours)
+    return result.changes
+  })
+}
+
 // Run as standalone script when executed directly
 const isMainScript = process.argv[1]?.endsWith('consolidate.ts')
 if (isMainScript) {
@@ -66,6 +103,9 @@ if (isMainScript) {
 
   const taskDb = new TaskDB(DB_PATH)
   const mem = new MemoryDB(taskDb)
+
+  const statusCleaned = runStatusTtl(taskDb)
+  console.log(`Status TTL cleanup: ${statusCleaned} old entries removed`)
 
   const decayed = runDecay(mem)
   console.log(`Decayed: ${decayed} memories`)

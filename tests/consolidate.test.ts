@@ -80,3 +80,81 @@ describe('consolidation', () => {
     expect(data.topMemories.length).toBeGreaterThanOrEqual(1)
   })
 })
+
+// --- AutoDream: Task 3 tests ---
+import { getDecayWindowDays } from '../consolidate'
+
+const TEST_DB_CONSOL = '/tmp/test-autodream-consolidate.db'
+
+describe('getDecayWindowDays', () => {
+  test('foundational returns Infinity', () => {
+    const m = { classification: 'foundational', state: 'active', quality: 0.5, challenge_count: 0, support_count: 0 } as any
+    expect(getDecayWindowDays(m)).toBe(Infinity)
+  })
+
+  test('strategic returns 14', () => {
+    const m = { classification: 'strategic', state: 'active', quality: 0.5, challenge_count: 0, support_count: 0 } as any
+    expect(getDecayWindowDays(m)).toBe(14)
+  })
+
+  test('operational returns 7', () => {
+    const m = { classification: 'operational', state: 'active', quality: 0.5, challenge_count: 0, support_count: 0 } as any
+    expect(getDecayWindowDays(m)).toBe(7)
+  })
+
+  test('observational returns 3', () => {
+    const m = { classification: 'observational', state: 'active', quality: 0.5, challenge_count: 0, support_count: 0 } as any
+    expect(getDecayWindowDays(m)).toBe(3)
+  })
+
+  test('ephemeral returns 1', () => {
+    const m = { classification: 'ephemeral', state: 'active', quality: 0.5, challenge_count: 0, support_count: 0 } as any
+    expect(getDecayWindowDays(m)).toBe(1)
+  })
+
+  test('disputed halves window', () => {
+    const m = { classification: 'operational', state: 'disputed', quality: 0.5, challenge_count: 0, support_count: 0 } as any
+    expect(getDecayWindowDays(m)).toBe(4) // ceil(7/2)
+  })
+
+  test('low quality halves window', () => {
+    const m = { classification: 'operational', state: 'active', quality: 0.2, challenge_count: 0, support_count: 0 } as any
+    expect(getDecayWindowDays(m)).toBe(4) // ceil(7/2)
+  })
+
+  test('challenge > support halves window', () => {
+    const m = { classification: 'strategic', state: 'active', quality: 0.5, challenge_count: 3, support_count: 1 } as any
+    expect(getDecayWindowDays(m)).toBe(7) // ceil(14/2)
+  })
+
+  test('multiple modifiers stack', () => {
+    const m = { classification: 'operational', state: 'disputed', quality: 0.2, challenge_count: 3, support_count: 0 } as any
+    // 7 -> 4 (disputed) -> 2 (low quality) -> 1 (challenged)
+    expect(getDecayWindowDays(m)).toBe(1)
+  })
+})
+
+describe('runArchive sweeps superseded', () => {
+  let taskDb3: TaskDB
+  let mem3: MemoryDB
+
+  beforeEach(() => {
+    try { unlinkSync(TEST_DB_CONSOL) } catch {}
+    for (const suffix of ['-shm', '-wal']) {
+      try { unlinkSync(TEST_DB_CONSOL + suffix) } catch {}
+    }
+    taskDb3 = new TaskDB(TEST_DB_CONSOL)
+    mem3 = new MemoryDB(taskDb3)
+  })
+
+  test('archives superseded memories older than 7 days', () => {
+    const m = mem3.saveMemory({ agent: 'boss', content: 'old fact', category: 'fact' })
+    // Manually set state to superseded and backdate
+    taskDb3.run(db => {
+      db.prepare("UPDATE memories SET state = 'superseded', last_accessed = datetime('now', '-8 days') WHERE id = ?").run(m.id)
+    })
+    const archived = runArchive(mem3)
+    expect(archived).toBeGreaterThanOrEqual(1)
+    expect(mem3.getMemory(m.id)).toBeNull()
+  })
+})
