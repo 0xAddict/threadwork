@@ -156,6 +156,83 @@ export class TaskDB {
     } catch {
       // Column already exists
     }
+
+
+    // DTC memory columns (safe migration for existing DBs)
+    const dtcColumns = [
+      "ALTER TABLE memories ADD COLUMN classification TEXT DEFAULT 'operational'",
+      "ALTER TABLE memories ADD COLUMN quality REAL DEFAULT 0.5",
+      "ALTER TABLE memories ADD COLUMN state TEXT DEFAULT 'active'",
+      "ALTER TABLE memories ADD COLUMN source_type TEXT DEFAULT 'agent'",
+      "ALTER TABLE memories ADD COLUMN evidence TEXT",
+      "ALTER TABLE memories ADD COLUMN support_count INTEGER DEFAULT 0",
+      "ALTER TABLE memories ADD COLUMN challenge_count INTEGER DEFAULT 0",
+      "ALTER TABLE memories ADD COLUMN supersedes_memory_id INTEGER REFERENCES memories(id)",
+      "ALTER TABLE memories ADD COLUMN last_validated TEXT DEFAULT (datetime('now'))",
+    ]
+    for (const sql of dtcColumns) {
+      try { this.db.exec(sql) } catch { /* column already exists */ }
+    }
+
+    // Same columns on memory_archive
+    const archiveDtcColumns = [
+      'ALTER TABLE memory_archive ADD COLUMN classification TEXT',
+      'ALTER TABLE memory_archive ADD COLUMN quality REAL',
+      'ALTER TABLE memory_archive ADD COLUMN state TEXT',
+      'ALTER TABLE memory_archive ADD COLUMN source_type TEXT',
+      'ALTER TABLE memory_archive ADD COLUMN evidence TEXT',
+      'ALTER TABLE memory_archive ADD COLUMN support_count INTEGER DEFAULT 0',
+      'ALTER TABLE memory_archive ADD COLUMN challenge_count INTEGER DEFAULT 0',
+      'ALTER TABLE memory_archive ADD COLUMN supersedes_memory_id INTEGER',
+      'ALTER TABLE memory_archive ADD COLUMN last_validated TEXT',
+    ]
+    for (const sql of archiveDtcColumns) {
+      try { this.db.exec(sql) } catch { /* column already exists */ }
+    }
+
+    // Consolidation tables
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS consolidation_locks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT NOT NULL,
+        acquired_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL,
+        pid INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS consolidation_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trigger_reason TEXT NOT NULL,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT,
+        phases_completed TEXT,
+        mutations INTEGER DEFAULT 0,
+        dry_run INTEGER NOT NULL DEFAULT 1,
+        summary TEXT,
+        error TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_memories_classification ON memories(classification);
+      CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state);
+      CREATE INDEX IF NOT EXISTS idx_memories_classification_state ON memories(classification, state);
+      CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed);
+      CREATE INDEX IF NOT EXISTS idx_memories_supersedes ON memories(supersedes_memory_id);
+    `)
+
+    // Task status events table (replaces JSONL status files)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS task_status_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT NOT NULL,
+        task_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_status_agent_task ON task_status_events(agent, task_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_status_created ON task_status_events(created_at);
+    `)
   }
 
   createTask(input: CreateTaskInput): Task {
@@ -208,7 +285,19 @@ export class TaskDB {
     })
   }
 
-  completeTask(id: number, result: string): Task | null {
+  completeTask(id: number, result: string, agent: string): Task | null {
+    return this.run(db => {
+      const stmt = db.prepare(`
+        UPDATE tasks SET status = 'completed', result = ?, completed_at = datetime('now')
+        WHERE id = ? AND status = 'in_progress' AND to_agent = ?
+        RETURNING *
+      `)
+      return stmt.get(result, id, agent) as Task | null
+    })
+  }
+
+  /** Boss override: complete any in_progress task regardless of assignee */
+  forceCompleteTask(id: number, result: string): Task | null {
     return this.run(db => {
       const stmt = db.prepare(`
         UPDATE tasks SET status = 'completed', result = ?, completed_at = datetime('now')

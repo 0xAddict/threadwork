@@ -1,5 +1,9 @@
 import type { TaskDB, Task } from './db'
 
+export type Classification = 'foundational' | 'strategic' | 'operational' | 'observational' | 'ephemeral'
+export type MemoryState = 'active' | 'disputed' | 'superseded' | 'archived'
+export type SourceType = 'human' | 'agent' | 'consolidation' | 'system'
+
 export interface Memory {
   id: number
   agent: string
@@ -11,6 +15,15 @@ export interface Memory {
   created_at: string
   last_accessed: string
   access_count: number
+  classification: Classification
+  quality: number
+  state: MemoryState
+  source_type: SourceType
+  evidence: string | null
+  support_count: number
+  challenge_count: number
+  supersedes_memory_id: number | null
+  last_validated: string
 }
 
 export interface SaveMemoryInput {

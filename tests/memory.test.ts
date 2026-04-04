@@ -112,3 +112,46 @@ describe('MemoryDB', () => {
     expect(role!.access_count).toBe(0)
   })
 })
+
+// --- AutoDream: Schema migration tests ---
+const TEST_DB_AUTODREAM = '/tmp/test-autodream-schema.db'
+
+describe('schema migration — DTC columns', () => {
+  let taskDb2: TaskDB
+  let mem2: MemoryDB
+
+  beforeEach(() => {
+    try { unlinkSync(TEST_DB_AUTODREAM) } catch {}
+    for (const suffix of ['-shm', '-wal']) {
+      try { unlinkSync(TEST_DB_AUTODREAM + suffix) } catch {}
+    }
+    taskDb2 = new TaskDB(TEST_DB_AUTODREAM)
+    mem2 = new MemoryDB(taskDb2)
+  })
+
+  test('memories table has DTC columns with defaults', () => {
+    const m = mem2.saveMemory({ agent: 'boss', content: 'test', category: 'fact' })
+    expect(m.classification).toBe('operational')
+    expect(m.quality).toBe(0.5)
+    expect(m.state).toBe('active')
+    expect(m.source_type).toBe('agent')
+    expect(m.support_count).toBe(0)
+    expect(m.challenge_count).toBe(0)
+    expect(m.supersedes_memory_id).toBeNull()
+    expect(m.last_validated).toBeTruthy()
+  })
+
+  test('consolidation_locks table exists', () => {
+    const result = taskDb2.run(db =>
+      db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='consolidation_locks'").get()
+    )
+    expect(result).toBeTruthy()
+  })
+
+  test('consolidation_runs table exists', () => {
+    const result = taskDb2.run(db =>
+      db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='consolidation_runs'").get()
+    )
+    expect(result).toBeTruthy()
+  })
+})
