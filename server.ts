@@ -15,11 +15,11 @@ import {
   formatNote,
   formatNudge,
 } from './notify'
-import { DB_PATH, SELF_LABEL, STATUS_DIR, AGENT_SESSIONS } from './config'
-import { join } from 'path'
-import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs'
+import { DB_PATH, SELF_LABEL, AGENT_SESSIONS, TMUX_PATH } from './config'
+
 import { MemoryDB } from './memory'
 import { AuditLog } from './audit'
+import { MemoryConsolidator } from './consolidator'
 
 const db = new TaskDB(DB_PATH)
 const mem = new MemoryDB(db)
@@ -236,6 +236,51 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: 'challenge_memory',
+      description: 'Challenge a memory — increments challenge_count, may flip to disputed state. Use when a memory is outdated or contradicted.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          memory_id: { type: 'number', description: 'The memory ID to challenge' },
+          reason: { type: 'string', description: 'Why this memory is being challenged' },
+        },
+        required: ['memory_id', 'reason'],
+      },
+    },
+    {
+      name: 'supersede_memory',
+      description: 'Replace an outdated memory with new content. Marks old as superseded, creates replacement with lineage link.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          old_memory_id: { type: 'number', description: 'The memory ID to supersede' },
+          new_content: { type: 'string', description: 'The replacement content' },
+          reason: { type: 'string', description: 'Why this memory is being superseded' },
+        },
+        required: ['old_memory_id', 'new_content', 'reason'],
+      },
+    },
+    {
+      name: 'consolidate_memories',
+      description: 'Trigger a memory consolidation run. Runs the 5-phase daemon cycle (Orient, Gather, Validate, Consolidate, Prune).',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          scope: { type: 'string', description: 'Scope: all, operational, or agent:NAME', default: 'all' },
+          dry_run: { type: 'boolean', description: 'If true, log proposed changes without executing', default: true },
+          max_changes: { type: 'number', description: 'Maximum mutations per run', default: 50 },
+        },
+      },
+    },
+    {
+      name: 'get_memory_health_report',
+      description: 'Get memory system health stats: counts by classification/state, dispute rate, average quality, last consolidation run info.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {},
+      },
+    },
   ],
 }))
 
@@ -250,14 +295,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const description = args.description as string
         const priority = (args.priority as string) ?? 'normal'
 
+        if (!AGENT_SESSIONS[to]) {
+          const validAgents = Object.keys(AGENT_SESSIONS).join(', ')
+          return { content: [{ type: 'text', text: `Invalid agent "${to}". Valid agents: ${validAgents}`, isError: true }] }
+        }
+
         const task = db.createTask({ from: SELF_LABEL, to, description, priority })
 
         const nudgeMsg = `You have a new task (#${task.id}) from ${SELF_LABEL}: ${description}`
-        await nudgeAgent(to, nudgeMsg)
-        await postToGroup(formatTaskCreated(task))
+        const [nudgeResult] = await Promise.all([
+          nudgeAgent(to, nudgeMsg),
+          postToGroup(formatTaskCreated(task)),
+        ])
         audit.log(SELF_LABEL, 'task_created', { to, description, priority }, task.id)
 
-        return { content: [{ type: 'text', text: `Task #${task.id} created and assigned to ${to}. Agent nudged.` }] }
+        const nudgeWarning = nudgeResult.ok ? '' : ` (warning: nudge failed — ${nudgeResult.error})`
+        return { content: [{ type: 'text', text: `Task #${task.id} created and assigned to ${to}. Agent nudged.${nudgeWarning}` }] }
       }
 
       case 'claim_task': {
@@ -277,16 +330,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'complete_task': {
         const taskId = args.task_id as number
         const result = args.result as string
-        const task = db.completeTask(taskId, result)
+
+        // Try agent-scoped completion first; boss can force-complete any task
+        let task = db.completeTask(taskId, result, SELF_LABEL)
+        if (!task && SELF_LABEL === 'boss') {
+          task = db.forceCompleteTask(taskId, result)
+        }
 
         if (!task) {
-          audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: 'not found or not in progress' }, taskId)
-          return { content: [{ type: 'text', text: `Cannot complete task #${taskId} — either it doesn't exist or isn't in progress.`, isError: true }] }
+          audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: 'not found, not in progress, or not assigned to you' }, taskId)
+          return { content: [{ type: 'text', text: `Cannot complete task #${taskId} — either it doesn't exist, isn't in progress, or isn't assigned to you.`, isError: true }] }
         }
 
         const nudgeMsg = `Task #${task.id} completed by ${SELF_LABEL}: ${result}`
-        await nudgeAgent(task.from_agent, nudgeMsg)
-        await postToGroup(formatTaskCompleted(task))
+        const [nudgeResult] = await Promise.all([
+          nudgeAgent(task.from_agent, nudgeMsg),
+          postToGroup(formatTaskCompleted(task)),
+        ])
 
         // Auto-extract task summary as memory
         const priorityToImportance: Record<string, number> = { low: 1, normal: 2, high: 3, urgent: 4 }
@@ -299,7 +359,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         })
         audit.log(SELF_LABEL, 'task_completed', { task_id: taskId, result }, taskId)
 
-        return { content: [{ type: 'text', text: `Task #${task.id} completed. Result: ${result}` }] }
+        const completeNudgeWarning = nudgeResult.ok ? '' : ` (warning: nudge to ${task.from_agent} failed — ${nudgeResult.error})`
+        return { content: [{ type: 'text', text: `Task #${task.id} completed. Result: ${result}${completeNudgeWarning}` }] }
       }
 
       case 'list_tasks': {
@@ -455,7 +516,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: `Unknown agent: ${agent}`, isError: true }] }
         }
 
-        const proc = Bun.spawn(['/Users/coachstokes/.local/bin/tmux', 'send-keys', '-t', session, 'C-c'], { stdout: 'pipe', stderr: 'pipe' })
+        const proc = Bun.spawn([TMUX_PATH, 'send-keys', '-t', session, 'C-c'], { stdout: 'pipe', stderr: 'pipe' })
         const exitCode = await proc.exited
 
         if (exitCode !== 0) {
@@ -474,10 +535,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const status = args.status as string
         const detail = args.detail as string
 
-        mkdirSync(STATUS_DIR, { recursive: true })
-        const filePath = join(STATUS_DIR, `${agent}-tasks.jsonl`)
-        const entry = JSON.stringify({ task_id: taskId, ts: new Date().toISOString(), status, detail })
-        appendFileSync(filePath, entry + '\n')
+        db.run(d => {
+          d.prepare('INSERT INTO task_status_events (agent, task_id, status, detail) VALUES (?, ?, ?, ?)').run(agent, taskId, status, detail)
+        })
 
         audit.log(SELF_LABEL, 'status_written', { agent, task_id: taskId, status, detail }, taskId)
         return { content: [{ type: 'text', text: `Status written for ${agent} task #${taskId}: [${status}] ${detail}` }] }
@@ -488,25 +548,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const taskId = args.task_id as number | undefined
         const lastN = (args.last_n as number) ?? 20
 
-        const filePath = join(STATUS_DIR, `${agent}-tasks.jsonl`)
-        if (!existsSync(filePath)) {
-          return { content: [{ type: 'text', text: `No status file for ${agent}. No delegated tasks have reported yet.` }] }
-        }
-
-        const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean)
-        let entries = lines.map(l => JSON.parse(l))
-
-        if (taskId !== undefined) {
-          entries = entries.filter((e: any) => e.task_id === taskId)
-        }
-
-        entries = entries.slice(-lastN)
+        const entries = db.run(d => {
+          if (taskId !== undefined) {
+            return d.prepare(
+              'SELECT * FROM task_status_events WHERE agent = ? AND task_id = ? ORDER BY created_at DESC LIMIT ?'
+            ).all(agent, taskId, lastN) as any[]
+          }
+          return d.prepare(
+            'SELECT * FROM task_status_events WHERE agent = ? ORDER BY created_at DESC LIMIT ?'
+          ).all(agent, lastN) as any[]
+        }).reverse()
 
         if (entries.length === 0) {
           return { content: [{ type: 'text', text: taskId ? `No status entries for task #${taskId}.` : `No status entries for ${agent}.` }] }
         }
 
-        const output = entries.map((e: any) => `[${e.ts}] task#${e.task_id} ${e.status}: ${e.detail}`).join('\n')
+        const output = entries.map((e: any) => `[${e.created_at}] task#${e.task_id} ${e.status}: ${e.detail}`).join('\n')
         return { content: [{ type: 'text', text: output }] }
       }
 
@@ -514,25 +571,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const agent = (args.agent as string).toLowerCase()
         const taskId = args.task_id as number
 
-        const filePath = join(STATUS_DIR, `${agent}-tasks.jsonl`)
-        if (!existsSync(filePath)) {
-          return { content: [{ type: 'text', text: `No status file for ${agent}.` }] }
-        }
-
-        const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean)
-        const remaining = lines.filter(l => {
-          const entry = JSON.parse(l)
-          return entry.task_id !== taskId
+        const deleted = db.run(d => {
+          const result = d.prepare('DELETE FROM task_status_events WHERE agent = ? AND task_id = ?').run(agent, taskId)
+          return result.changes
         })
 
-        if (remaining.length === 0) {
-          unlinkSync(filePath)
-        } else {
-          writeFileSync(filePath, remaining.join('\n') + '\n')
-        }
-
-        audit.log(SELF_LABEL, 'status_cleared', { agent, task_id: taskId }, taskId)
-        return { content: [{ type: 'text', text: `Cleared status entries for ${agent} task #${taskId}.` }] }
+        audit.log(SELF_LABEL, 'status_cleared', { agent, task_id: taskId, deleted }, taskId)
+        return { content: [{ type: 'text', text: `Cleared ${deleted} status entries for ${agent} task #${taskId}.` }] }
       }
 
       case 'query_audit_log': {
@@ -552,6 +597,48 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           const taskRef = e.task_id ? ` [task:#${e.task_id}]` : ''
           return `${e.created_at} | ${e.agent} | ${e.action}${taskRef}${detail}`
         })
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      case 'challenge_memory': {
+        const memoryId = Number(args.memory_id)
+        const reason = String(args.reason ?? '')
+        const result = mem.challengeMemory(memoryId, reason)
+        if (!result) return { content: [{ type: 'text', text: `Memory #${memoryId} not found.` }] }
+        audit.log(SELF_LABEL, 'memory_challenged', { reason, quality: result.quality, state: result.state }, undefined, memoryId)
+        return { content: [{ type: 'text', text: `Challenged memory #${memoryId}. State: ${result.state}, Quality: ${result.quality.toFixed(2)}, Challenges: ${result.challenge_count}, Supports: ${result.support_count}` }] }
+      }
+
+      case 'supersede_memory': {
+        const oldId = Number(args.old_memory_id)
+        const newContent = String(args.new_content ?? '')
+        const reason = String(args.reason ?? '')
+        const result = mem.supersedeMemory(oldId, newContent, reason)
+        if (!result) return { content: [{ type: 'text', text: `Memory #${oldId} not found.` }] }
+        audit.log(SELF_LABEL, 'memory_superseded', { reason, old_id: oldId, new_id: result.new.id }, undefined, result.new.id)
+        return { content: [{ type: 'text', text: `Superseded memory #${oldId} → #${result.new.id}. Old state: ${result.old.state}. New content saved.` }] }
+      }
+
+      case 'consolidate_memories': {
+        const dryRun = args.dry_run !== false
+        const maxChanges = Number(args.max_changes ?? 50)
+        const consolidator = new MemoryConsolidator(mem, db, dryRun, maxChanges)
+        const result = await consolidator.run(`manual trigger by ${SELF_LABEL}`)
+        audit.log(SELF_LABEL, 'consolidation_triggered', { summary: result.summary })
+        return { content: [{ type: 'text', text: result.summary }] }
+      }
+
+      case 'get_memory_health_report': {
+        const consolidator = new MemoryConsolidator(mem, db)
+        const report = consolidator.getHealthReport()
+        const lines = [
+          `Total active: ${report.totalActive}`,
+          `By classification: ${JSON.stringify(report.byClassification)}`,
+          `By state: ${JSON.stringify(report.byState)}`,
+          `Dispute rate: ${(report.disputeRate * 100).toFixed(1)}%`,
+          `Avg quality: ${report.avgQuality.toFixed(2)}`,
+          `Last run: ${report.lastRunAt ?? 'never'} (${report.lastRunMutations ?? 0} mutations)`,
+        ]
         return { content: [{ type: 'text', text: lines.join('\n') }] }
       }
 
