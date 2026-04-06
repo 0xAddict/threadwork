@@ -1,4 +1,4 @@
-import { AGENT_SESSIONS } from './config'
+import { AGENT_SESSIONS, TMUX_PATH } from './config'
 
 export function resolveSession(agent: string): string | null {
   const label = agent.toLowerCase()
@@ -6,7 +6,7 @@ export function resolveSession(agent: string): string | null {
 }
 
 export function buildNudgeCommand(session: string, message: string): string[] {
-  return ['/Users/coachstokes/.local/bin/tmux', 'send-keys', '-t', session, message, 'Enter']
+  return [TMUX_PATH, 'send-keys', '-t', session, message, 'Enter']
 }
 
 export async function nudgeAgent(
