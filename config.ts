@@ -41,5 +41,5 @@ export const STATUS_DIR = join(
 )
 
 // Consolidation daemon config
-export const CONSOLIDATION_DRY_RUN = true // Flip to false after 2-week validation
+export const CONSOLIDATION_DRY_RUN = false // Flipped live by Snoopy on 2026-04-05
 export const CONSOLIDATION_CHECK_INTERVAL_MS = 15 * 60 * 1000 // 15 minutes
