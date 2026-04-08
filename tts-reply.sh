@@ -17,11 +17,12 @@ AGENT_OR_VOICE="${2:-steve}"
 
 # Map agent names to voice IDs
 case "$AGENT_OR_VOICE" in
-  steve) VOICE_ID="cjVigY5qzO86Huf0OWal" ;;
-  boss)  VOICE_ID="pqHfZKP75CvOlQylNhV4" ;;
-  kiera) VOICE_ID="XrExE9yKIg1WjnnlVkGX" ;;
-  sadie) VOICE_ID="cgSgspJ2msm6clMCkdW9" ;;
-  *)     VOICE_ID="$AGENT_OR_VOICE" ;;  # raw voice_id passthrough
+  steve)  VOICE_ID="cjVigY5qzO86Huf0OWal" ;;
+  boss)   VOICE_ID="pqHfZKP75CvOlQylNhV4" ;;
+  kiera)  VOICE_ID="XrExE9yKIg1WjnnlVkGX" ;;
+  sadie)  VOICE_ID="cgSgspJ2msm6clMCkdW9" ;;
+  snoopy) VOICE_ID="SOYHLrjzK2X1ezoPC6cr" ;;  # Harry - Fierce Warrior
+  *)      VOICE_ID="$AGENT_OR_VOICE" ;;  # raw voice_id passthrough
 esac
 
 if [ -z "$TEXT" ]; then

@@ -51,13 +51,13 @@ describe('integration: full task lifecycle', () => {
     expect(notes).toHaveLength(1)
 
     // Steve completes
-    const completed = db.completeTask(task.id, '5 orders, $289.80 revenue')
+    const completed = db.completeTask(task.id, '5 orders, $289.80 revenue', 'steve')
     expect(completed?.status).toBe('completed')
     expect(completed?.result).toBe('5 orders, $289.80 revenue')
 
-    // Verify completion notification
+    // Verify completion notification (MarkdownV2 escapes special chars like '.')
     const completeMsg = formatTaskCompleted(completed!)
-    expect(completeMsg).toContain('$289.80')
+    expect(completeMsg).toContain('$289\\.80')
 
     // Verify listing
     const steveTasks = db.listTasks({ assignee: 'steve' })

@@ -67,7 +67,7 @@ describe('consolidation', () => {
   })
 
   test('generateBriefing writes JSON file for agent', () => {
-    mem.saveMemory({ agent: 'steve', content: 'CTO role', category: 'role', importance: 5, pinned: true })
+    mem.saveMemory({ agent: 'steve', content: 'CTO role', category: 'role', importance: 5, pinned: true, source_type: 'consolidation' })
     mem.saveMemory({ agent: 'steve', content: 'Key learning', category: 'learning', importance: 4 })
 
     generateBriefing('steve', mem, taskDb, TEST_BRIEFING_DIR)

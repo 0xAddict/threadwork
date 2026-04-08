@@ -3,6 +3,11 @@
     "task-board": {
       "command": "bun",
       "args": ["run", "/Users/coachstokes/.claude/mcp-servers/task-board/server.ts"]
+    },
+    "amazon-ads-mcp": {
+      "command": "node",
+      "args": ["src/server.js"],
+      "cwd": "/Users/coachstokes/Documents/New project 4/tools/amazon-ads-mcp"
     }
   }
 }

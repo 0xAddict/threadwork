@@ -1,7 +1,7 @@
 import type { TaskDB, Task } from './db'
 
 export type Classification = 'foundational' | 'strategic' | 'operational' | 'observational' | 'ephemeral'
-export type MemoryState = 'active' | 'disputed' | 'superseded' | 'archived'
+export type MemoryState = 'proposed' | 'active' | 'disputed' | 'superseded' | 'archived'
 export type SourceType = 'human' | 'agent' | 'consolidation' | 'system'
 
 export interface Memory {
@@ -33,6 +33,11 @@ export interface SaveMemoryInput {
   importance?: number
   pinned?: boolean
   source_task_id?: number
+  classification?: Classification
+  quality?: number
+  source_type?: SourceType
+  evidence?: string
+  supersedes_memory_id?: number
 }
 
 export interface RecallFilter {
@@ -93,12 +98,22 @@ export class MemoryDB {
         `).get(existing.id) as Memory
       }
 
-      const classification = this.inferClassification(input.content, input.category)
-      const sourceType = this.inferSourceType(input.agent)
+      const classification = input.classification ?? this.inferClassification(input.content, input.category)
+      const sourceType = input.source_type ?? this.inferSourceType(input.agent)
+      const quality = input.quality ?? 0.5
+      const evidence = input.evidence ?? null
+      const supersedes = input.supersedes_memory_id ?? null
+
+      // Spec AC #5: agent + foundational -> proposed state
+      let state: MemoryState = 'active'
+      if (sourceType === 'agent' && classification === 'foundational') {
+        state = 'proposed'
+      }
 
       const stmt = db.prepare(`
-        INSERT INTO memories (agent, content, category, importance, pinned, source_task_id, classification, source_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO memories (agent, content, category, importance, pinned, source_task_id,
+          classification, quality, state, source_type, evidence, supersedes_memory_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING *
       `)
       return stmt.get(
@@ -109,7 +124,11 @@ export class MemoryDB {
         input.pinned ? 1 : 0,
         input.source_task_id ?? null,
         classification,
+        quality,
+        state,
         sourceType,
+        evidence,
+        supersedes,
       ) as Memory
     })
   }
@@ -224,11 +243,11 @@ export class MemoryDB {
       ).all(agent) as Memory[]
 
       const topMemories = db.prepare(
-        `SELECT * FROM memories WHERE agent = ? AND category != 'role' AND state = 'active' ORDER BY quality DESC, importance DESC LIMIT 5`
+        `SELECT * FROM memories WHERE agent = ? AND category != 'role' AND state = 'active' AND quality >= 0.3 ORDER BY quality DESC, importance DESC LIMIT 5`
       ).all(agent) as Memory[]
 
       const sharedMemories = db.prepare(
-        `SELECT * FROM memories WHERE agent = 'shared' AND state = 'active' ORDER BY quality DESC, importance DESC LIMIT 5`
+        `SELECT * FROM memories WHERE agent = 'shared' AND state = 'active' AND quality >= 0.3 ORDER BY quality DESC, importance DESC LIMIT 5`
       ).all() as Memory[]
 
       const recentTasks = db.prepare(

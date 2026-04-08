@@ -1,5 +1,6 @@
 import { describe, test, expect } from 'bun:test'
 import { buildNudgeCommand, resolveSession } from '../nudge'
+import { TMUX_PATH } from '../config'
 
 describe('nudge', () => {
   test('resolveSession maps agent label to tmux session name', () => {
@@ -11,7 +12,7 @@ describe('nudge', () => {
   test('buildNudgeCommand creates correct tmux send-keys command', () => {
     const cmd = buildNudgeCommand('claude-steve', 'You have a new task (#5) from boss: Update landing page')
     expect(cmd).toEqual([
-      'tmux', 'send-keys', '-t', 'claude-steve',
+      TMUX_PATH, 'send-keys', '-t', 'claude-steve',
       'You have a new task (#5) from boss: Update landing page',
       'Enter',
     ])

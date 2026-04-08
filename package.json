@@ -9,5 +9,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.82.0",
     "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.2"
   }
 }

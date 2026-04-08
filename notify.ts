@@ -26,6 +26,18 @@ export function formatNudge(from: string, to: string, message: string): string {
   return `📨 *${esc(from)} → ${esc(to)}:*\n${esc(message)}`
 }
 
+export function formatDecisionOpened(decision: { id: number; title: string; opened_by: string }): string {
+  return `\u{1F5F3} *Decision \\#${decision.id} opened by ${esc(decision.opened_by)}*\n${esc(decision.title)}`
+}
+
+export function formatDecisionFinalized(decision: { id: number; title: string; finalized_by: string | null; outcome: string | null }): string {
+  return `\u2705 *Decision \\#${decision.id} finalized by ${esc(decision.finalized_by ?? 'unknown')}*\n${esc(decision.title)}\nOutcome: ${esc(decision.outcome ?? '')}`
+}
+
+export function formatDecisionExpired(decision: { id: number; title: string }): string {
+  return `\u23F0 *Decision \\#${decision.id} expired*\n${esc(decision.title)}`
+}
+
 export async function postToGroup(text: string): Promise<void> {
   const token = getTelegramToken()
   if (!token) return

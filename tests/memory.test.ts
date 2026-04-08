@@ -97,7 +97,7 @@ describe('MemoryDB', () => {
   })
 
   test('getBootBriefing returns tiered summary without updating access', () => {
-    mem.saveMemory({ agent: 'steve', content: 'You are the CTO', category: 'role', importance: 5, pinned: true })
+    mem.saveMemory({ agent: 'steve', content: 'You are the CTO', category: 'role', importance: 5, pinned: true, source_type: 'consolidation' })
     mem.saveMemory({ agent: 'steve', content: 'Important learning', category: 'learning', importance: 5 })
     mem.saveMemory({ agent: 'shared', content: 'Team uses Bun runtime', category: 'fact', importance: 4 })
     mem.saveMemory({ agent: 'steve', content: 'Low value', category: 'fact', importance: 1 })
