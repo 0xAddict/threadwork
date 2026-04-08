@@ -64,7 +64,7 @@ export function runArchive(mem: MemoryDB): number {
   }
 
   // Also sweep superseded memories older than 7 days
-  const superseded = mem.getSupersededOlderThan(7)
+  const superseded = mem.getSupersededOlderThan(3)
   for (const id of superseded) {
     mem.archiveMemory(id)
   }

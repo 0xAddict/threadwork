@@ -14,16 +14,38 @@ import {
   formatTaskCompleted,
   formatNote,
   formatNudge,
+  formatDecisionOpened,
+  formatDecisionFinalized,
+  formatDecisionExpired,
 } from './notify'
-import { DB_PATH, SELF_LABEL, AGENT_SESSIONS, TMUX_PATH } from './config'
+import { DB_PATH, SELF_LABEL, AGENT_SESSIONS, TMUX_PATH, TEAM_AGENTS } from './config'
 
 import { MemoryDB } from './memory'
+import { DecisionDB, expireStaleDecisions } from './decision'
+import { forceDebrief } from './debrief'
 import { AuditLog } from './audit'
 import { MemoryConsolidator } from './consolidator'
 
 const db = new TaskDB(DB_PATH)
 const mem = new MemoryDB(db)
+const dec = new DecisionDB(db, mem)
 const audit = new AuditLog(db)
+
+function normalizeScore(raw: unknown): number {
+  const n = Number(raw)
+  if (isNaN(n)) return 0.5
+  if (n > 1 && n <= 10) return n / 10
+  if (n > 10 && n <= 100) return n / 100
+  return Math.max(0, Math.min(1, n))
+}
+
+function parseAgentList(raw: string): string[] {
+  return raw.split(',').map(a => a.trim().toLowerCase()).filter(a => a in AGENT_SESSIONS)
+}
+
+function isKnownAgent(agent: string): boolean {
+  return agent in AGENT_SESSIONS
+}
 
 const mcp = new Server(
   { name: 'task-board', version: '0.1.0' },
@@ -31,10 +53,13 @@ const mcp = new Server(
     capabilities: { tools: {} },
     instructions: [
       `You are agent "${SELF_LABEL}". You have a shared task board and personal memory with other agents (boss, steve, sadie, kiera).`,
-      'TASK TOOLS: create_task, claim_task, complete_task, list_tasks, send_note, nudge_agent, interrupt_agent',
-      'STATUS TOOLS: write_status (sub-agents report progress), read_status (monitor loops check progress), clear_status (cleanup after task)',
+      'TASK TOOLS: create_task, delegate_task, claim_task, complete_task, list_tasks, send_note, nudge_agent, interrupt_agent',
+      'DELEGATION: Use delegate_task (not create_task) when assigning work to another agent. It sets up supervision automatically.',
+      'SUB-AGENT TRACKING: Before spawning Agent tool, call spawn_subagent to create a durable record. After Agent returns, call close_subagent. Use get_children to see child tasks.',
+      'STATUS TOOLS: write_status (sub-agents report progress, supports progress/blocked/eta), read_status (monitor loops check progress), clear_status (cleanup after task)',
       'MEMORY TOOLS: save_memory (store learnings), recall_memories (search your knowledge), get_boot_briefing (load context on startup)',
       'MEMORY MANAGEMENT: promote_memory (share with all agents), pin_memory (prevent decay)',
+      'DECISION TOOLS: open_decision, submit_position, critique_position, list_decisions, get_decision_brief, finalize_decision (boss only)',
       'On startup, call get_boot_briefing to load your role, top memories, and recent task history.',
       'After completing tasks, save important learnings with save_memory.',
       'Always delegate complex work to subagents (Agent tool) to keep your context clean.',
@@ -59,24 +84,42 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'delegate_task',
+      description: 'Delegate a task to another agent with durable supervision. Automatically sets you as supervisor, computes watchdog check times, and enables heartbeat/progress monitoring. Use this instead of create_task when assigning work to others.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          to: { type: 'string', description: 'Target agent: boss, steve, sadie, or kiera' },
+          description: { type: 'string', description: 'What needs to be done' },
+          priority: { type: 'string', enum: ['low', 'normal', 'high', 'urgent'], description: 'Task priority (default: normal)' },
+          parent_task_id: { type: 'number', description: 'Optional parent task ID to create a child task' },
+          heartbeat_timeout_sec: { type: 'number', description: `Seconds before heartbeat is considered overdue (default: 120)` },
+          progress_timeout_sec: { type: 'number', description: `Seconds before progress is considered stale (default: 600)` },
+        },
+        required: ['to', 'description'],
+      },
+    },
+    {
       name: 'claim_task',
-      description: 'Claim a pending task assigned to you. Sets status to in_progress.',
+      description: 'Claim a pending task assigned to you. Sets status to in_progress and initializes heartbeat timing for supervision.',
       inputSchema: {
         type: 'object',
         properties: {
           task_id: { type: 'number', description: 'The task ID to claim' },
+          session_id: { type: 'string', description: 'Optional session ID to bind the worker session' },
         },
         required: ['task_id'],
       },
     },
     {
       name: 'complete_task',
-      description: 'Mark a task as completed with a result summary. Posts to team group.',
+      description: 'Mark a task as completed with a result summary. Checks for open child tasks first — refuses if children are still active. Posts to team group.',
       inputSchema: {
         type: 'object',
         properties: {
           task_id: { type: 'number', description: 'The task ID to complete' },
           result: { type: 'string', description: 'Summary of what was done' },
+          result_finding_id: { type: 'number', description: 'Optional: finding_id containing the structured result (Sprint 3)' },
         },
         required: ['task_id', 'result'],
       },
@@ -129,6 +172,28 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           category: { type: 'string', enum: ['learning', 'preference', 'fact', 'role'], description: 'Memory category' },
           importance: { type: 'number', description: 'Importance 1-5 (default: 3). Higher = persists longer.' },
           pinned: { type: 'boolean', description: 'Pin to prevent decay (default: false). Use for role definitions.' },
+          classification: {
+            type: 'string',
+            enum: ['foundational', 'strategic', 'operational', 'observational', 'ephemeral'],
+            description: 'Memory classification tier. Defaults based on category. Agent+foundational -> proposed state.',
+          },
+          quality: {
+            type: 'number',
+            description: 'Quality score 0.0-1.0 (default: 0.5). Memories below 0.3 excluded from boot briefing.',
+          },
+          source_type: {
+            type: 'string',
+            enum: ['human', 'agent', 'system', 'consolidation'],
+            description: 'Source type (default: agent). Human source can create active foundational directly.',
+          },
+          evidence: {
+            type: 'string',
+            description: 'JSON string of supporting evidence/references.',
+          },
+          supersedes_memory_id: {
+            type: 'number',
+            description: 'ID of memory this supersedes. Creates lineage chain.',
+          },
         },
         required: ['content', 'category'],
       },
@@ -186,7 +251,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'write_status',
-      description: 'Write a JSONL status entry for a delegated task. Sub-agents call this to report progress.',
+      description: 'Write a status entry for a delegated task. Sub-agents call this to report progress. Also updates heartbeat/progress timestamps on the task row for durable supervision.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -194,6 +259,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           task_id: { type: 'number', description: 'The task ID being worked on' },
           status: { type: 'string', enum: ['working', 'blocked', 'complete', 'idle'], description: 'Current status' },
           detail: { type: 'string', description: 'What is happening right now' },
+          progress: { type: 'boolean', description: 'Whether real progress was made (default: true). If false, only heartbeat is updated, not progress timestamp.' },
+          blocked: { type: 'boolean', description: 'Whether the task is blocked (default: false). If true, triggers immediate supervisor notification.' },
+          blocked_reason: { type: 'string', description: 'Reason the task is blocked (used when blocked=true)' },
+          eta_sec: { type: 'number', description: 'Estimated seconds until next meaningful update. Extends next_check_at accordingly.' },
         },
         required: ['agent', 'task_id', 'status', 'detail'],
       },
@@ -281,6 +350,252 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {},
       },
     },
+    {
+      name: 'spawn_subagent',
+      description: 'Create a durable child task row BEFORE spawning a sub-agent via the Agent tool. Records the sub-agent invocation so the watchdog can monitor it. Call this before Agent tool, then pass the returned child_task_id to the sub-agent. Does NOT actually spawn the agent — you do that with the Agent tool.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          description: { type: 'string', description: 'What the sub-agent will work on' },
+          parent_task_id: { type: 'number', description: 'The task ID this sub-agent is working under' },
+          model: { type: 'string', description: 'Optional model hint (e.g., "haiku", "sonnet"). Stored in description for reference only.' },
+        },
+        required: ['description', 'parent_task_id'],
+      },
+    },
+    {
+      name: 'close_subagent',
+      description: 'Mark a synthetic sub-agent child task as completed. Call this AFTER the Agent tool returns. Clears watchdog monitoring for this child task.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'The child task ID returned by spawn_subagent' },
+          result: { type: 'string', description: 'Summary of what the sub-agent accomplished (or error if it failed)' },
+        },
+        required: ['task_id', 'result'],
+      },
+    },
+    {
+      name: 'get_children',
+      description: 'Get all child tasks of a parent task. Shows both delegated tasks and sub-agent invocations.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'The parent task ID' },
+          include_completed: { type: 'boolean', description: 'Include completed/cancelled children (default: true)' },
+        },
+        required: ['task_id'],
+      },
+    },
+    {
+      name: 'open_decision',
+      description: 'Open a new decision record for structured async deliberation. Any agent can open. Posts to team group.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          title: { type: 'string', description: 'Title of the decision' },
+          context: { type: 'string', description: 'Why this decision is needed' },
+          expires_in_hours: { type: 'number', description: 'Hours until auto-expiry (optional)' },
+          task_id: { type: 'number', description: 'Optional link to originating task' },
+        },
+        required: ['title'],
+      },
+    },
+    {
+      name: 'submit_position',
+      description: 'Submit a position (named stance with rationale) on an open decision. Any agent can submit.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          decision_id: { type: 'number', description: 'The decision ID' },
+          position: { type: 'string', description: 'Your stance/recommendation' },
+          rationale: { type: 'string', description: 'Why you hold this position' },
+          evidence: { type: 'string', description: 'Supporting data or references' },
+        },
+        required: ['decision_id', 'position'],
+      },
+    },
+    {
+      name: 'critique_position',
+      description: 'Critique a position or the decision as a whole. Any agent can critique.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          decision_id: { type: 'number', description: 'The decision ID' },
+          critique: { type: 'string', description: 'Your critique' },
+          position_id: { type: 'number', description: 'Optional: which position you are critiquing' },
+          severity: { type: 'string', enum: ['observation', 'concern', 'blocker'], description: 'Severity level (default: observation)' },
+        },
+        required: ['decision_id', 'critique'],
+      },
+    },
+    {
+      name: 'list_decisions',
+      description: 'List decisions. Defaults to showing open decisions.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          status: { type: 'string', enum: ['open', 'positions', 'critique', 'finalized', 'expired', 'cancelled'], description: 'Filter by status (default: open, which includes positions and critique)' },
+          limit: { type: 'number', description: 'Max results (default: 50)' },
+        },
+      },
+    },
+    {
+      name: 'get_decision_brief',
+      description: 'Get a formatted decision brief with all positions and critiques.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          decision_id: { type: 'number', description: 'The decision ID' },
+        },
+        required: ['decision_id'],
+      },
+    },
+    {
+      name: 'finalize_decision',
+      description: 'Finalize a decision with an outcome. BOSS ONLY. Creates a shared memory record. Posts to team group.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          decision_id: { type: 'number', description: 'The decision ID to finalize' },
+          outcome: { type: 'string', description: 'The final decision/outcome' },
+          rationale: { type: 'string', description: 'Why this outcome was chosen' },
+        },
+        required: ['decision_id', 'outcome', 'rationale'],
+      },
+    },
+    {
+      name: 'force_debrief',
+      description: 'Manually trigger a session debrief. Boss-only. Bypasses idle and volume gates but respects the lock gate. Creates a decision record with synthesis.',
+      inputSchema: { type: 'object' as const, properties: {} },
+    },
+    // Sprint 6: DB Hygiene + Hardening
+    {
+      name: 'run_hygiene',
+      description: 'Run DB hygiene: archive old tasks, prune events, clean expired artifacts, compress findings. Default: dry_run=true (preview only).',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          dry_run: { type: 'boolean', description: 'If true (default), preview what would be cleaned without making changes' },
+        },
+      },
+    },
+    {
+      name: 'get_db_stats',
+      description: 'Get database statistics: row counts, oldest/newest records per table, DB file size.',
+      inputSchema: { type: 'object' as const, properties: {} },
+    },
+    // Sprint 5: Communication Gates
+    {
+      name: 'get_violations',
+      description: 'Query gate violation history. Gated by gates_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          agent_id: { type: 'string', description: 'Filter by agent (optional)' },
+          last_n: { type: 'number', description: 'Max results (default: 50)' },
+        },
+      },
+    },
+    // Sprint 3: Unified Execution Events
+    {
+      name: 'report_progress',
+      description: 'Report structured progress on a task. Durable event stored in progress_events table. 30s throttle per task (lifecycle events bypass throttle). Gated by progress_events_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'Task ID to report progress on' },
+          event_type: {
+            type: 'string',
+            enum: ['started', 'heartbeat', 'progress', 'finding_written', 'completed', 'failed', 'abandoned'],
+            description: 'Type of progress event',
+          },
+          percent: { type: 'number', description: 'Completion percentage 0-100 (optional)' },
+          activity: { type: 'string', description: 'What is happening (optional)' },
+          metrics_json: { type: 'string', description: 'JSON string of metrics (optional)' },
+          attempt_id: { type: 'number', description: 'Task attempt ID (optional)' },
+          detail_ref: { type: 'number', description: 'Reference to a finding_id for detail (optional)' },
+        },
+        required: ['task_id', 'event_type'],
+      },
+    },
+    {
+      name: 'get_progress',
+      description: 'Get durable progress event history for a task. Gated by progress_events_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'Task ID to get progress for' },
+          last_n: { type: 'number', description: 'Max events to return (default: 50)' },
+          event_type: { type: 'string', description: 'Filter by event type' },
+        },
+        required: ['task_id'],
+      },
+    },
+    // Sprint 2: Blackboard Findings Store
+    {
+      name: 'write_finding',
+      description: 'Store a structured finding from task work. Gated by blackboard_enabled flag. Deduplicates on content hash.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'Task this finding belongs to' },
+          finding_type: { type: 'string', description: 'Type of finding (e.g., bug, insight, metric, decision, blocker, recommendation)' },
+          summary: { type: 'string', description: 'Summary text (max 1000 chars)' },
+          attempt_id: { type: 'number', description: 'Task attempt ID (optional)' },
+          parent_agent_id: { type: 'string', description: 'Parent agent if sub-agent (optional)' },
+          status: { type: 'string', enum: ['draft', 'published', 'superseded'], description: 'Finding status (default: draft)' },
+          is_final: { type: 'boolean', description: 'Mark as final finding (default: false)' },
+          metrics_json: { type: 'string', description: 'JSON string of metrics data' },
+          refs_json: { type: 'string', description: 'JSON string of references' },
+          metadata_json: { type: 'string', description: 'JSON string of additional metadata' },
+          priority: { type: 'string', enum: ['low', 'normal', 'high', 'critical'], description: 'Finding priority (default: normal)' },
+          expires_at: { type: 'string', description: 'ISO datetime when finding expires' },
+        },
+        required: ['task_id', 'finding_type', 'summary'],
+      },
+    },
+    {
+      name: 'read_findings',
+      description: 'Read finding summaries for a task. Returns summary-level data only. Gated by blackboard_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'Task ID to read findings for' },
+          finding_type: { type: 'string', description: 'Filter by finding type' },
+          is_final: { type: 'boolean', description: 'Filter by is_final flag' },
+          limit: { type: 'number', description: 'Max results (default: 50)' },
+        },
+        required: ['task_id'],
+      },
+    },
+    {
+      name: 'read_finding_raw',
+      description: 'Read full finding detail including all fields and linked artifacts. Gated by blackboard_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          finding_id: { type: 'number', description: 'The finding ID to read' },
+        },
+        required: ['finding_id'],
+      },
+    },
+    {
+      name: 'write_artifact',
+      description: 'Store an artifact (file content) linked to a task. Saved to disk with URI reference in DB. Gated by blackboard_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'Task this artifact belongs to' },
+          content: { type: 'string', description: 'The artifact content to store' },
+          mime_type: { type: 'string', description: 'MIME type (default: text/plain)' },
+          attempt_id: { type: 'number', description: 'Task attempt ID (optional)' },
+          finding_id: { type: 'number', description: 'Link to a finding (optional)' },
+          expires_at: { type: 'string', description: 'ISO datetime when artifact expires' },
+        },
+        required: ['task_id', 'content'],
+      },
+    },
   ],
 }))
 
@@ -295,14 +610,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const description = args.description as string
         const priority = (args.priority as string) ?? 'normal'
 
-        if (!AGENT_SESSIONS[to]) {
-          const validAgents = Object.keys(AGENT_SESSIONS).join(', ')
-          return { content: [{ type: 'text', text: `Invalid agent "${to}". Valid agents: ${validAgents}`, isError: true }] }
+        if (!isKnownAgent(to)) {
+          return { content: [{ type: 'text', text: `Invalid agent "${to}". Valid agents: ${TEAM_AGENTS.join(', ')}`, isError: true }] }
         }
 
         const task = db.createTask({ from: SELF_LABEL, to, description, priority })
 
-        const nudgeMsg = `You have a new task (#${task.id}) from ${SELF_LABEL}: ${description}`
+        const nudgeMsg = `You have a new task (#${task.id}) from ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
         const [nudgeResult] = await Promise.all([
           nudgeAgent(to, nudgeMsg),
           postToGroup(formatTaskCreated(task)),
@@ -313,17 +627,85 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return { content: [{ type: 'text', text: `Task #${task.id} created and assigned to ${to}. Agent nudged.${nudgeWarning}` }] }
       }
 
+      case 'delegate_task': {
+        const to = (args.to as string).toLowerCase()
+        const description = args.description as string
+        const priority = (args.priority as string) ?? 'normal'
+        const parentTaskId = args.parent_task_id as number | undefined
+        const heartbeatTimeoutSec = args.heartbeat_timeout_sec as number | undefined
+        const progressTimeoutSec = args.progress_timeout_sec as number | undefined
+
+        if (!isKnownAgent(to)) {
+          return { content: [{ type: 'text', text: `Invalid agent "${to}". Valid agents: ${TEAM_AGENTS.join(', ')}`, isError: true }] }
+        }
+
+        // Sprint 5: Gate 1 (Outbound) — check quarantine before delegating
+        if (db.isFeatureEnabled('gates_enabled') && db.isQuarantined(to)) {
+          const count = db.getRecentViolationCount(to, 24)
+          db.recordViolation(SELF_LABEL, 'delegation_to_quarantined', `Attempted delegation to quarantined agent ${to} (${count} violations in 24h)`)
+          // Soft quarantine: warn but allow (reduced priority noted)
+          // Log but don't block — council decision: soft quarantine, not hard block
+        }
+
+        // Sprint 4: Check circuit breaker before delegating
+        if (db.isCircuitOpen(to)) {
+          const circuitInfo = db.getCircuitState(to)
+          return { content: [{ type: 'text', text: `Cannot delegate to ${to} — circuit breaker is OPEN (${circuitInfo?.fault_count ?? 0} faults). Cooldown until: ${circuitInfo?.cooldown_until ?? 'unknown'}. Try another agent or wait for cooldown.`, isError: true }] }
+        }
+
+        try {
+          const task = db.delegateTask({
+            from: SELF_LABEL,
+            to,
+            description,
+            priority,
+            supervisor_agent: SELF_LABEL,
+            parent_task_id: parentTaskId,
+            heartbeat_timeout_sec: heartbeatTimeoutSec,
+            progress_timeout_sec: progressTimeoutSec,
+          })
+
+          const nudgeMsg = `You have a new delegated task (#${task.id}) from ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
+          const [nudgeResult] = await Promise.all([
+            nudgeAgent(to, nudgeMsg),
+            postToGroup(formatTaskCreated(task)),
+          ])
+          audit.log(SELF_LABEL, 'task_delegated', {
+            to, description, priority,
+            supervisor_agent: SELF_LABEL,
+            parent_task_id: parentTaskId ?? null,
+            heartbeat_timeout_sec: task.heartbeat_timeout_sec,
+            progress_timeout_sec: task.progress_timeout_sec,
+          }, task.id)
+
+          const nudgeWarning = nudgeResult.ok ? '' : ` (warning: nudge failed — ${nudgeResult.error})`
+          const parentInfo = parentTaskId ? ` (child of #${parentTaskId})` : ''
+          return { content: [{ type: 'text', text: `Task #${task.id} delegated to ${to}${parentInfo}. Supervisor: ${SELF_LABEL}. Next check: ${task.next_check_at}.${nudgeWarning}` }] }
+        } catch (err: any) {
+          return { content: [{ type: 'text', text: `Delegation failed: ${err.message}`, isError: true }] }
+        }
+      }
+
       case 'claim_task': {
         const taskId = args.task_id as number
-        const task = db.claimTask(taskId, SELF_LABEL)
+        const sessionId = args.session_id as string | undefined
+
+        // Use session-aware claim
+        const task = db.claimTaskWithSession(taskId, SELF_LABEL, sessionId ?? AGENT_SESSIONS[SELF_LABEL])
 
         if (!task) {
           audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: 'not found or already claimed' }, taskId)
           return { content: [{ type: 'text', text: `Cannot claim task #${taskId} — either it doesn't exist or is already claimed.`, isError: true }] }
         }
 
+        // Upsert agent session
+        const agentSession = AGENT_SESSIONS[SELF_LABEL]
+        if (agentSession) {
+          db.upsertAgentSession(SELF_LABEL, agentSession, 'alive')
+        }
+
         await postToGroup(formatTaskClaimed(task))
-        audit.log(SELF_LABEL, 'task_claimed', { task_id: taskId }, taskId)
+        audit.log(SELF_LABEL, 'task_claimed', { task_id: taskId, session_id: sessionId ?? agentSession ?? null }, taskId)
         return { content: [{ type: 'text', text: `Claimed task #${task.id}: ${task.description}` }] }
       }
 
@@ -331,10 +713,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const taskId = args.task_id as number
         const result = args.result as string
 
-        // Try agent-scoped completion first; boss can force-complete any task
-        let task = db.completeTask(taskId, result, SELF_LABEL)
+        // Use finalizer check: refuse if open child tasks exist
+        let completion = db.completeTaskWithFinalizerCheck(taskId, result, SELF_LABEL)
+        if (completion.error) {
+          audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: completion.error }, taskId)
+          return { content: [{ type: 'text', text: completion.error, isError: true }] }
+        }
+
+        let task = completion.task
+
+        // If agent-scoped completion didn't match, boss can force-complete
         if (!task && SELF_LABEL === 'boss') {
-          task = db.forceCompleteTask(taskId, result)
+          const forceCompletion = db.forceCompleteTaskWithFinalizerCheck(taskId, result)
+          if (forceCompletion.error) {
+            audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: forceCompletion.error }, taskId)
+            return { content: [{ type: 'text', text: forceCompletion.error, isError: true }] }
+          }
+          task = forceCompletion.task
         }
 
         if (!task) {
@@ -342,7 +737,39 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: `Cannot complete task #${taskId} — either it doesn't exist, isn't in progress, or isn't assigned to you.`, isError: true }] }
         }
 
-        const nudgeMsg = `Task #${task.id} completed by ${SELF_LABEL}: ${result}`
+        // Sprint 5: Gate 2 (Inbound) — soft check: warn if no findings exist for this task
+        if (db.isFeatureEnabled('gates_enabled') && db.isFeatureEnabled('blackboard_enabled')) {
+          const findings = db.readFindings({ task_id: task.id })
+          if (findings.length === 0) {
+            db.recordViolation(SELF_LABEL, 'no_findings_on_complete', `Task #${task.id} completed without any findings`, task.id)
+            // Soft: just log, don't block (calibration framing)
+          }
+        }
+
+        // Sprint 5: Gate 3 (Monitoring) — log oversized result summaries
+        if (db.isFeatureEnabled('gates_enabled') && result.length > 500) {
+          db.recordViolation(SELF_LABEL, 'oversized_summary', `Task #${task.id} result is ${result.length} chars (limit: 500)`, task.id)
+        }
+
+        // Sprint 4: If agent's circuit was half_open and task completed successfully, close circuit
+        const circuitState = db.getCircuitState(task.to_agent)
+        if (circuitState?.circuit_state === 'half_open') {
+          db.closeCircuit(task.to_agent)
+          audit.log(SELF_LABEL, 'circuit_closed', { agent: task.to_agent, reason: 'probe task completed successfully' }, taskId)
+        }
+
+        // Sprint 3: Set result_finding_id if provided
+        const resultFindingId = args.result_finding_id as number | undefined
+        if (resultFindingId) {
+          db.run(d => {
+            d.prepare('UPDATE tasks SET result_finding_id = ? WHERE id = ?').run(resultFindingId, task!.id)
+          })
+        }
+
+        // Sprint 3: Emit completion event to progress_events
+        db.emitCompletionEvent(task.id, SELF_LABEL, task.attempt_id)
+
+        const nudgeMsg = `Task #${task.id} completed by ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
         const [nudgeResult] = await Promise.all([
           nudgeAgent(task.from_agent, nudgeMsg),
           postToGroup(formatTaskCompleted(task)),
@@ -420,6 +847,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const category = args.category as string
         const importance = (args.importance as number) ?? 3
         const pinned = (args.pinned as boolean) ?? false
+        const classification = args.classification as string | undefined
+        const quality = args.quality as number | undefined
+        const source_type = args.source_type as string | undefined
+        const evidence = args.evidence as string | undefined
+        const supersedes_memory_id = args.supersedes_memory_id as number | undefined
 
         const memory = mem.saveMemory({
           agent: SELF_LABEL,
@@ -427,6 +859,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           category,
           importance,
           pinned,
+          classification: classification as import('./memory').Classification | undefined,
+          quality,
+          source_type: source_type as import('./memory').SourceType | undefined,
+          evidence,
+          supersedes_memory_id,
         })
         audit.log(SELF_LABEL, 'memory_saved', { category, importance: memory.importance }, undefined, memory.id)
 
@@ -534,13 +971,60 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const taskId = args.task_id as number
         const status = args.status as string
         const detail = args.detail as string
+        const isProgress = (args.progress as boolean) ?? true
+        const isBlocked = (args.blocked as boolean) ?? false
+        const blockedReason = args.blocked_reason as string | undefined
+        const etaSec = args.eta_sec as number | undefined
 
+        // Always write to task_status_events (preserving existing behavior)
         db.run(d => {
           d.prepare('INSERT INTO task_status_events (agent, task_id, status, detail) VALUES (?, ?, ?, ?)').run(agent, taskId, status, detail)
         })
 
-        audit.log(SELF_LABEL, 'status_written', { agent, task_id: taskId, status, detail }, taskId)
-        return { content: [{ type: 'text', text: `Status written for ${agent} task #${taskId}: [${status}] ${detail}` }] }
+        // Sprint 3: Also emit to progress_events if enabled (write_status is deprecated alias)
+        if (db.isFeatureEnabled('progress_events_enabled')) {
+          const eventType = status === 'blocked' ? 'heartbeat'
+            : status === 'complete' ? 'completed'
+            : status === 'idle' ? 'heartbeat'
+            : 'progress'
+          db.reportProgress({ task_id: taskId, agent_id: agent, event_type: eventType, activity: detail })
+        }
+
+        // Update heartbeat/progress/blocked on the task row for supervision
+        const updatedTask = db.updateHeartbeat({
+          taskId,
+          agent,
+          detail,
+          isProgress,
+          isBlocked,
+          blockedReason: blockedReason ?? (isBlocked ? detail : undefined),
+          etaSec,
+        })
+
+        // If blocked, attempt immediate Telegram notification to supervisor
+        let blockedNotice = ''
+        if (isBlocked && updatedTask?.supervisor_agent) {
+          const supervisor = updatedTask.supervisor_agent
+          const reason = blockedReason ?? detail
+          const blockedMsg = `Task #${taskId} is BLOCKED. Worker: ${agent}. Reason: ${reason}`
+
+          // Nudge supervisor and post to group (plain text — no MarkdownV2 escaping needed)
+          await Promise.all([
+            nudgeAgent(supervisor, blockedMsg),
+            postToGroup(formatNudge(agent, supervisor, `BLOCKED on task #${taskId}: ${reason}`)),
+          ])
+          blockedNotice = ` Supervisor (${supervisor}) notified.`
+        }
+
+        audit.log(SELF_LABEL, 'status_written', {
+          agent, task_id: taskId, status, detail,
+          progress: isProgress, blocked: isBlocked,
+          blocked_reason: blockedReason ?? null,
+          eta_sec: etaSec ?? null,
+        }, taskId)
+
+        const versionInfo = updatedTask ? ` (v${updatedTask.version})` : ''
+        return { content: [{ type: 'text', text: `Status written for ${agent} task #${taskId}: [${status}] ${detail}${versionInfo}${blockedNotice}` }] }
       }
 
       case 'read_status': {
@@ -640,6 +1124,384 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           `Last run: ${report.lastRunAt ?? 'never'} (${report.lastRunMutations ?? 0} mutations)`,
         ]
         return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      case 'spawn_subagent': {
+        const description = args.description as string
+        const parentTaskId = args.parent_task_id as number
+        const model = args.model as string | undefined
+
+        const fullDescription = model
+          ? `[subagent:${model}] ${description}`
+          : `[subagent] ${description}`
+
+        try {
+          const childTask = db.createSubagentTask({
+            description: fullDescription,
+            parent_task_id: parentTaskId,
+            supervisor_agent: SELF_LABEL,
+          })
+
+          audit.log(SELF_LABEL, 'subagent_spawned', {
+            parent_task_id: parentTaskId,
+            child_task_id: childTask.id,
+            description: fullDescription,
+            model: model ?? null,
+          }, childTask.id)
+
+          return { content: [{ type: 'text', text: `Sub-agent task #${childTask.id} created (child of #${parentTaskId}). Pass this ID to the sub-agent. Watchdog will monitor heartbeat (timeout: ${childTask.heartbeat_timeout_sec}s).` }] }
+        } catch (err: any) {
+          return { content: [{ type: 'text', text: `spawn_subagent failed: ${err.message}`, isError: true }] }
+        }
+      }
+
+      case 'close_subagent': {
+        const taskId = args.task_id as number
+        const result = args.result as string
+
+        const closed = db.closeSubagentTask(taskId, result)
+
+        if (!closed) {
+          // Maybe already completed or not a synthetic task
+          const task = db.getTask(taskId)
+          if (!task) {
+            return { content: [{ type: 'text', text: `Sub-agent task #${taskId} not found.`, isError: true }] }
+          }
+          if (task.status === 'completed') {
+            return { content: [{ type: 'text', text: `Sub-agent task #${taskId} was already completed.` }] }
+          }
+          if (!task.is_synthetic) {
+            return { content: [{ type: 'text', text: `Task #${taskId} is not a synthetic sub-agent task. Use complete_task instead.`, isError: true }] }
+          }
+          return { content: [{ type: 'text', text: `Cannot close sub-agent task #${taskId} (status: ${task.status}).`, isError: true }] }
+        }
+
+        audit.log(SELF_LABEL, 'subagent_closed', {
+          task_id: taskId,
+          result,
+          parent_task_id: closed.parent_task_id,
+        }, taskId)
+
+        return { content: [{ type: 'text', text: `Sub-agent task #${taskId} completed. Parent: #${closed.parent_task_id}.` }] }
+      }
+
+      case 'get_children': {
+        const taskId = args.task_id as number
+        const includeCompleted = (args.include_completed as boolean) ?? true
+
+        const children = db.getChildTasks(taskId, includeCompleted)
+
+        if (children.length === 0) {
+          return { content: [{ type: 'text', text: `No child tasks found for #${taskId}.` }] }
+        }
+
+        const lines = children.map(c => {
+          const kindTag = c.is_synthetic ? '[subagent]' : '[task]'
+          const resultInfo = c.result ? ` | Result: ${c.result}` : ''
+          return `#${c.id} ${kindTag} [${c.status}] ${c.description}${resultInfo}`
+        })
+        return { content: [{ type: 'text', text: `Children of #${taskId}:\n${lines.join('\n')}` }] }
+      }
+
+      case 'open_decision': {
+        const title = args.title as string
+        const context = (args.context as string) ?? null
+        const expiresInHours = args.expires_in_hours as number | undefined
+        const taskId = args.task_id as number | undefined
+
+        let expiresAt: string | undefined
+        if (expiresInHours) {
+          const d = new Date()
+          d.setHours(d.getHours() + expiresInHours)
+          expiresAt = d.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+        }
+
+        const decision = dec.openDecision(title, context, SELF_LABEL, { expiresAt, taskId })
+        await postToGroup(formatDecisionOpened(decision))
+        audit.log(SELF_LABEL, 'decision_opened', { title, decision_id: decision.id })
+
+        return { content: [{ type: 'text', text: `Decision #${decision.id} opened: ${title}${expiresAt ? ` (expires: ${expiresAt})` : ''}` }] }
+      }
+
+      case 'submit_position': {
+        const decisionId = args.decision_id as number
+        const position = args.position as string
+        const rationale = args.rationale as string | undefined
+        const evidence = args.evidence as string | undefined
+
+        try {
+          const pos = dec.addPosition(decisionId, SELF_LABEL, position, rationale, evidence)
+          audit.log(SELF_LABEL, 'decision_position_submitted', { decision_id: decisionId, position_id: pos.id })
+          return { content: [{ type: 'text', text: `Position #${pos.id} submitted on decision #${decisionId}.` }] }
+        } catch (err: any) {
+          return { content: [{ type: 'text', text: `Submit position failed: ${err.message}`, isError: true }] }
+        }
+      }
+
+      case 'critique_position': {
+        const decisionId = args.decision_id as number
+        const critique = args.critique as string
+        const positionId = args.position_id as number | undefined
+        const severity = args.severity as string | undefined
+
+        try {
+          const crit = dec.addCritique(decisionId, SELF_LABEL, critique, {
+            positionId,
+            severity: severity as import('./decision').CritiqueSeverity | undefined,
+          })
+          audit.log(SELF_LABEL, 'decision_critique_submitted', { decision_id: decisionId, critique_id: crit.id, severity: crit.severity })
+          return { content: [{ type: 'text', text: `Critique #${crit.id} submitted on decision #${decisionId} (severity: ${crit.severity}).` }] }
+        } catch (err: any) {
+          return { content: [{ type: 'text', text: `Critique failed: ${err.message}`, isError: true }] }
+        }
+      }
+
+      case 'list_decisions': {
+        const status = (args.status as string) ?? 'open'
+        const limit = args.limit as number | undefined
+
+        const decisions = dec.getDecisionsByStatus(status, limit)
+
+        if (decisions.length === 0) {
+          return { content: [{ type: 'text', text: `No decisions found with status '${status}'.` }] }
+        }
+
+        const lines = decisions.map(d => {
+          const expiry = d.expires_at ? ` (expires: ${d.expires_at})` : ''
+          const outcome = d.outcome ? ` | Outcome: ${d.outcome}` : ''
+          return `#${d.id} [${d.status}] ${d.title} — opened by ${d.opened_by}${expiry}${outcome}`
+        })
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      case 'get_decision_brief': {
+        const decisionId = args.decision_id as number
+        const detail = dec.getDecision(decisionId)
+
+        if (!detail) {
+          return { content: [{ type: 'text', text: `Decision #${decisionId} not found.`, isError: true }] }
+        }
+
+        const sections: string[] = [
+          `== Decision #${detail.id}: ${detail.title} ==`,
+          `Status: ${detail.status} | Opened by: ${detail.opened_by} | Created: ${detail.created_at}`,
+        ]
+
+        if (detail.context) sections.push(`Context: ${detail.context}`)
+        if (detail.expires_at) sections.push(`Expires: ${detail.expires_at}`)
+        if (detail.task_id) sections.push(`Linked task: #${detail.task_id}`)
+
+        if (detail.positions.length > 0) {
+          sections.push('\n-- Positions --')
+          for (const p of detail.positions) {
+            let line = `  #${p.id} ${p.agent}: ${p.position}`
+            if (p.rationale) line += ` | Rationale: ${p.rationale}`
+            if (p.evidence) line += ` | Evidence: ${p.evidence}`
+            sections.push(line)
+          }
+        }
+
+        if (detail.critiques.length > 0) {
+          sections.push('\n-- Critiques --')
+          for (const c of detail.critiques) {
+            const target = c.position_id ? ` (re: position #${c.position_id})` : ''
+            sections.push(`  #${c.id} [${c.severity}] ${c.agent}${target}: ${c.critique}`)
+          }
+        }
+
+        if (detail.outcome) {
+          sections.push(`\n-- Outcome --`)
+          sections.push(`Finalized by: ${detail.finalized_by ?? 'unknown'}`)
+          sections.push(`Outcome: ${detail.outcome}`)
+          if (detail.outcome_rationale) sections.push(`Rationale: ${detail.outcome_rationale}`)
+          if (detail.memory_id) sections.push(`Memory: #${detail.memory_id}`)
+        }
+
+        return { content: [{ type: 'text', text: sections.join('\n') }] }
+      }
+
+      case 'finalize_decision': {
+        if (SELF_LABEL !== 'boss') {
+          return { content: [{ type: 'text', text: 'Only boss can finalize decisions.', isError: true }] }
+        }
+
+        const decisionId = args.decision_id as number
+        const outcome = args.outcome as string
+        const rationale = args.rationale as string
+
+        try {
+          const result = dec.finalizeDecision(decisionId, SELF_LABEL, outcome, rationale)
+          await postToGroup(formatDecisionFinalized(result.decision))
+          audit.log(SELF_LABEL, 'decision_finalized', {
+            decision_id: decisionId,
+            outcome,
+            memory_id: result.memory.id,
+          })
+          return { content: [{ type: 'text', text: `Decision #${decisionId} finalized. Outcome: ${outcome}. Memory #${result.memory.id} created.` }] }
+        } catch (err: any) {
+          return { content: [{ type: 'text', text: `Finalize failed: ${err.message}`, isError: true }] }
+        }
+      }
+
+      case 'force_debrief': {
+        if (SELF_LABEL !== 'boss') {
+          return { content: [{ type: 'text', text: 'Only boss can force a debrief.', isError: true }] }
+        }
+        const result = await forceDebrief(db, mem, dec, audit)
+        if (result.error) {
+          return { content: [{ type: 'text', text: `Debrief failed: ${result.error}`, isError: true }] }
+        }
+        audit.log(SELF_LABEL, 'force_debrief', {
+          run_id: result.runId, decision_id: result.decisionId,
+          tasks: result.tasksReviewed, memories: result.memoriesReviewed,
+        })
+        return { content: [{ type: 'text', text: `Debrief #${result.runId} complete. Decision #${result.decisionId}. ${result.tasksReviewed} tasks, ${result.memoriesReviewed} memories reviewed.` }] }
+      }
+
+      // Sprint 6: DB Hygiene + Hardening handlers
+      case 'run_hygiene': {
+        const dryRun = (args.dry_run as boolean) ?? true
+        const result = db.runHygiene(dryRun)
+        audit.log(SELF_LABEL, 'hygiene_run', { dry_run: dryRun, ...result })
+        const mode = dryRun ? 'DRY RUN (preview)' : 'LIVE (changes applied)'
+        const lines = [
+          `Hygiene ${mode}:`,
+          `  Tasks to archive (>14d): ${result.archived_tasks}`,
+          `  Progress events to prune (>14d): ${result.pruned_events}`,
+          `  Expired artifacts to clean: ${result.expired_artifacts}`,
+          `  Findings to compress (>7d): ${result.compressed_findings}`,
+          `  Vacuumed: ${result.vacuumed}`,
+        ]
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      case 'get_db_stats': {
+        const stats = db.getDbStats()
+        const lines = Object.entries(stats).map(([table, s]) => {
+          if (table === '_db_file') return `DB file size: ${s.row_count} KB`
+          return `${table}: ${s.row_count} rows${s.oldest ? ` (${s.oldest} → ${s.newest})` : ''}`
+        })
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      // Sprint 5: Communication Gates handlers
+      case 'get_violations': {
+        if (!db.isFeatureEnabled('gates_enabled')) {
+          return { content: [{ type: 'text', text: 'Gates disabled (feature flag gates_enabled=0).', isError: true }] }
+        }
+        const violations = db.getViolations({
+          agent_id: args.agent_id as string | undefined,
+          last_n: args.last_n as number | undefined,
+        })
+        if (violations.length === 0) {
+          return { content: [{ type: 'text', text: 'No violations found.' }] }
+        }
+        const lines = violations.map((v: any) =>
+          `#${v.id} [${v.created_at}] ${v.agent_id} — ${v.violation_type}: ${v.detail?.slice(0, 200) ?? ''}`
+        )
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      // Sprint 3: Unified Execution Events handlers
+      case 'report_progress': {
+        const result = db.reportProgress({
+          task_id: args.task_id as number,
+          agent_id: SELF_LABEL,
+          event_type: args.event_type as string,
+          percent: args.percent as number | undefined,
+          activity: args.activity as string | undefined,
+          metrics_json: args.metrics_json as string | undefined,
+          attempt_id: args.attempt_id as number | undefined,
+          detail_ref: args.detail_ref as number | undefined,
+        })
+        if ('error' in result) {
+          return { content: [{ type: 'text', text: result.error, isError: true }] }
+        }
+        if ('throttled' in result) {
+          return { content: [{ type: 'text', text: `Throttled. Next progress event allowed in ${result.next_allowed_in_sec}s.` }] }
+        }
+        audit.log(SELF_LABEL, 'progress_reported', { task_id: args.task_id, event_type: args.event_type, event_id: result.event_id }, args.task_id as number)
+        return { content: [{ type: 'text', text: `Progress event #${result.event_id} recorded (${args.event_type}) for task #${args.task_id}.` }] }
+      }
+
+      case 'get_progress': {
+        const events = db.getProgress({
+          task_id: args.task_id as number,
+          last_n: args.last_n as number | undefined,
+          event_type: args.event_type as string | undefined,
+        })
+        if (events.length === 0) {
+          return { content: [{ type: 'text', text: `No progress events for task #${args.task_id}.` }] }
+        }
+        const lines = events.reverse().map((e: any) =>
+          `[${e.created_at}] #${e.event_id} ${e.event_type}${e.percent != null ? ` ${e.percent}%` : ''} — ${e.activity ?? '(no activity)'}`
+        )
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      // Sprint 2: Blackboard Findings Store handlers
+      case 'write_finding': {
+        const result = db.writeFinding({
+          task_id: args.task_id as number,
+          finding_type: args.finding_type as string,
+          summary: args.summary as string,
+          agent_id: SELF_LABEL,
+          attempt_id: args.attempt_id as number | undefined,
+          parent_agent_id: args.parent_agent_id as string | undefined,
+          status: args.status as string | undefined,
+          is_final: args.is_final as boolean | undefined,
+          metrics_json: args.metrics_json as string | undefined,
+          refs_json: args.refs_json as string | undefined,
+          metadata_json: args.metadata_json as string | undefined,
+          priority: args.priority as string | undefined,
+          expires_at: args.expires_at as string | undefined,
+        })
+        if ('error' in result) {
+          return { content: [{ type: 'text', text: result.error, isError: true }] }
+        }
+        audit.log(SELF_LABEL, 'finding_written', { task_id: args.task_id, finding_type: args.finding_type, finding_id: result.finding_id }, args.task_id as number)
+        return { content: [{ type: 'text', text: `Finding #${result.finding_id} written for task #${args.task_id} (type: ${args.finding_type}).` }] }
+      }
+
+      case 'read_findings': {
+        const findings = db.readFindings({
+          task_id: args.task_id as number,
+          finding_type: args.finding_type as string | undefined,
+          is_final: args.is_final as boolean | undefined,
+          limit: args.limit as number | undefined,
+        })
+        if (findings.length === 0) {
+          return { content: [{ type: 'text', text: `No findings for task #${args.task_id}.` }] }
+        }
+        const lines = findings.map(f =>
+          `#${f.finding_id} [${f.finding_type}] ${f.status}${f.is_final ? ' (FINAL)' : ''} — ${f.summary.slice(0, 200)}`
+        )
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      case 'read_finding_raw': {
+        const finding = db.readFindingRaw(args.finding_id as number)
+        if (!finding) {
+          return { content: [{ type: 'text', text: `Finding #${args.finding_id} not found (or blackboard disabled).`, isError: true }] }
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(finding, null, 2) }] }
+      }
+
+      case 'write_artifact': {
+        const result = db.writeArtifact({
+          task_id: args.task_id as number,
+          content: args.content as string,
+          agent_id: SELF_LABEL,
+          mime_type: args.mime_type as string | undefined,
+          attempt_id: args.attempt_id as number | undefined,
+          finding_id: args.finding_id as number | undefined,
+          expires_at: args.expires_at as string | undefined,
+        })
+        if ('error' in result) {
+          return { content: [{ type: 'text', text: result.error, isError: true }] }
+        }
+        audit.log(SELF_LABEL, 'artifact_written', { task_id: args.task_id, artifact_id: result.artifact_id, uri: result.uri }, args.task_id as number)
+        return { content: [{ type: 'text', text: `Artifact #${result.artifact_id} stored at ${result.uri}` }] }
       }
 
       default:

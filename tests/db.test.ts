@@ -40,7 +40,7 @@ describe('TaskDB', () => {
   test('completeTask sets status to completed with result', () => {
     const task = db.createTask({ from: 'boss', to: 'steve', description: 'test', priority: 'normal' })
     db.claimTask(task.id, 'steve')
-    const completed = db.completeTask(task.id, 'Done — updated hero text')
+    const completed = db.completeTask(task.id, 'Done — updated hero text', 'steve')
     expect(completed?.status).toBe('completed')
     expect(completed?.result).toBe('Done — updated hero text')
     expect(completed?.completed_at).toBeTruthy()
