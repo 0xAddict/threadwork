@@ -208,7 +208,7 @@ export class TaskDB {
       "ALTER TABLE memories ADD COLUMN support_count INTEGER DEFAULT 0",
       "ALTER TABLE memories ADD COLUMN challenge_count INTEGER DEFAULT 0",
       "ALTER TABLE memories ADD COLUMN supersedes_memory_id INTEGER REFERENCES memories(id)",
-      "ALTER TABLE memories ADD COLUMN last_validated TEXT",
+      "ALTER TABLE memories ADD COLUMN last_validated TEXT DEFAULT (datetime('now'))",
     ]
     for (const sql of dtcColumns) {
       try { this.db.exec(sql) } catch { /* column already exists */ }
@@ -535,9 +535,11 @@ export class TaskDB {
 
   createTask(input: CreateTaskInput): Task {
     return this.run(db => {
+      // Auto-infer supervisor_agent when delegating (from != to)
+      const supervisorAgent = input.from !== input.to ? input.from : null
       const stmt = db.prepare(`
-        INSERT INTO tasks (from_agent, to_agent, description, priority)
-        VALUES ($from, $to, $description, $priority)
+        INSERT INTO tasks (from_agent, to_agent, description, priority, supervisor_agent)
+        VALUES ($from, $to, $description, $priority, $supervisor_agent)
         RETURNING *
       `)
       return stmt.get({
@@ -545,6 +547,7 @@ export class TaskDB {
         $to: input.to,
         $description: input.description,
         $priority: input.priority,
+        $supervisor_agent: supervisorAgent,
       }) as Task
     })
   }
