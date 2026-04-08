@@ -7,10 +7,10 @@
 
 import { TaskDB, type Task } from './db'
 import { MemoryDB } from './memory'
-import { DecisionDB } from './decision'
+import { DecisionDB, expireStaleDecisions, type Decision, type DecisionWithDetail } from './decision'
 import { AuditLog } from './audit'
 import { nudgeAgent } from './nudge'
-import { postToGroup } from './notify'
+import { postToGroup, formatDecisionExpired } from './notify'
 import { checkAndRunDebrief } from './debrief'
 import {
   DB_PATH,
@@ -20,6 +20,8 @@ import {
   UNCLAIMED_CHECK_SEC,
   SESSION_TIMEOUT_SEC,
   SUPERVISION_DEFAULTS,
+  WORKER_AGENTS,
+  BOSS_AGENT,
 } from './config'
 
 // ---------------------------------------------------------------------------
@@ -32,6 +34,9 @@ export interface ReconcileResult {
   escalated: number
   blocked_relayed: number
   dead_sessions: number
+  decisions_expired: number
+  decisions_nudged: number
+  decisions_ready: number
 }
 
 export interface WatchdogConfig {
@@ -176,6 +181,9 @@ export class TaskReconciler {
       escalated: 0,
       blocked_relayed: 0,
       dead_sessions: 0,
+      decisions_expired: 0,
+      decisions_nudged: 0,
+      decisions_ready: 0,
     }
 
     // Query due tasks (exclude escalation tasks — they must NOT be re-escalated)
@@ -687,6 +695,142 @@ export class TaskReconciler {
   }
 
   // -------------------------------------------------------------------------
+  // 6. DECISION LIFECYCLE MONITORING
+  // -------------------------------------------------------------------------
+
+  /**
+   * Monitor open decisions for three conditions:
+   *   (a) Expire stale decisions whose deadline has passed
+   *   (b) Nudge agents when a decision has been 'open' for > 10 min with no positions
+   *   (c) Notify Boss when all expected positions are in (ready to finalize)
+   */
+  async monitorDecisions(result: ReconcileResult): Promise<void> {
+    const mem = new MemoryDB(this.taskDb)
+    const dec = new DecisionDB(this.taskDb, mem)
+
+    // (a) Expire stale decisions
+    const expiredCount = expireStaleDecisions(dec)
+    if (expiredCount > 0) {
+      result.decisions_expired += expiredCount
+      log(`Expired ${expiredCount} stale decision(s)`)
+
+      // Post Telegram notifications for each newly-expired decision
+      // Re-fetch expired decisions from last minute to notify
+      const recentExpired = this.taskDb.run(db =>
+        db.prepare(`
+          SELECT * FROM decisions
+          WHERE status = 'expired'
+          AND finalized_at >= datetime('now', '-60 seconds')
+          ORDER BY finalized_at DESC
+        `).all() as Decision[]
+      )
+      for (const d of recentExpired) {
+        await postToGroup(formatDecisionExpired(d))
+        this.audit.log('watchdog', 'decision_expired', {
+          decision_id: d.id,
+          title: d.title,
+        })
+      }
+    }
+
+    // (b) Nudge for stale open decisions (open > 10 min, no positions)
+    const openDecisions = dec.getOpenDecisions()
+    const now = Date.now()
+    const TEN_MINUTES_MS = 10 * 60 * 1000
+
+    // SQLite datetime('now') stores as 'YYYY-MM-DD HH:MM:SS' (no T, no Z).
+    // We must match that format for string comparison in audit queries.
+    const sqliteDatetime = (ms: number): string => {
+      const d = new Date(ms)
+      return d.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '')
+    }
+
+    for (const d of openDecisions) {
+      if (d.status !== 'open') continue // Only nudge 'open' (no positions yet)
+
+      const createdAt = new Date(d.created_at + 'Z').getTime()
+      const ageMs = now - createdAt
+      if (ageMs < TEN_MINUTES_MS) continue
+
+      // Check if we already nudged for this decision recently (within last 10 min)
+      const recentNudge = this.audit.query({
+        agent: 'watchdog',
+        action: 'decision_position_nudge',
+        since: sqliteDatetime(now - TEN_MINUTES_MS),
+        limit: 50,
+      }).find(e => {
+        try {
+          const detail = JSON.parse(e.detail ?? '{}')
+          return detail.decision_id === d.id
+        } catch { return false }
+      })
+      if (recentNudge) continue
+
+      // Nudge all worker agents to submit positions
+      const agentsToNudge = [...WORKER_AGENTS]
+      const nudgeMsg = `Decision #${d.id} "${d.title}" has been open for ${Math.floor(ageMs / 60000)} min with no positions. Please submit your position.`
+      for (const agent of agentsToNudge) {
+        await nudgeAgent(agent, nudgeMsg)
+      }
+
+      this.audit.log('watchdog', 'decision_position_nudge', {
+        decision_id: d.id,
+        title: d.title,
+        agents_nudged: agentsToNudge,
+        age_min: Math.floor(ageMs / 60000),
+      })
+
+      result.decisions_nudged++
+      log(`Nudged agents for decision #${d.id} (open ${Math.floor(ageMs / 60000)} min, no positions)`)
+    }
+
+    // (c) Detect decisions ready to finalize
+    // A decision in 'positions' or 'critique' status where >= 2 distinct agents
+    // have submitted positions is considered ready for Boss to finalize.
+    const POSITION_QUORUM = 2
+
+    for (const d of openDecisions) {
+      if (d.status !== 'positions' && d.status !== 'critique') continue
+
+      // Get full detail to check positions
+      const detail = dec.getDecision(d.id)
+      if (!detail) continue
+
+      const distinctAgents = new Set(detail.positions.map(p => p.agent))
+      if (distinctAgents.size < POSITION_QUORUM) continue
+
+      // Check if we already notified Boss for this decision recently (within last 10 min)
+      const recentNotify = this.audit.query({
+        agent: 'watchdog',
+        action: 'decision_ready_to_finalize',
+        since: sqliteDatetime(now - TEN_MINUTES_MS),
+        limit: 50,
+      }).find(e => {
+        try {
+          const detail = JSON.parse(e.detail ?? '{}')
+          return detail.decision_id === d.id
+        } catch { return false }
+      })
+      if (recentNotify) continue
+
+      // Notify Boss
+      const readyMsg = `Decision #${d.id} "${d.title}" has ${distinctAgents.size} position(s) from [${[...distinctAgents].join(', ')}] and is ready to finalize.`
+      await nudgeAgent(BOSS_AGENT, readyMsg)
+      await postToGroup(`\u2705 Decision #${d.id} ready to finalize: "${d.title}" \u2014 ${distinctAgents.size} positions in.`)
+
+      this.audit.log('watchdog', 'decision_ready_to_finalize', {
+        decision_id: d.id,
+        title: d.title,
+        position_count: distinctAgents.size,
+        agents: [...distinctAgents],
+      })
+
+      result.decisions_ready++
+      log(`Decision #${d.id} is ready to finalize (${distinctAgents.size} positions)`)
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // 7. PERSISTENT LOOP
   // -------------------------------------------------------------------------
 
@@ -714,6 +858,13 @@ export class TaskReconciler {
         // Step 3: Check agent sessions
         await this.checkAgentSessions()
 
+        // Step 3a: Monitor decision lifecycle
+        try {
+          await this.monitorDecisions(reconcileResult)
+        } catch (err) {
+          logError('Decision monitoring failed', err)
+        }
+
         // Step 3b: Check debrief gates
         try {
           const mem = new MemoryDB(this.taskDb)
@@ -727,8 +878,10 @@ export class TaskReconciler {
         }
 
         // Log cycle summary
-        if (reconcileResult.checked > 0 || reconcileResult.nudged > 0 || reconcileResult.escalated > 0 || reconcileResult.blocked_relayed > 0 || reconcileResult.dead_sessions > 0) {
-          log(`Cycle complete: checked=${reconcileResult.checked} nudged=${reconcileResult.nudged} escalated=${reconcileResult.escalated} blocked_relayed=${reconcileResult.blocked_relayed} dead_sessions=${reconcileResult.dead_sessions}`)
+        const r = reconcileResult
+        const hasActivity = r.checked > 0 || r.nudged > 0 || r.escalated > 0 || r.blocked_relayed > 0 || r.dead_sessions > 0 || r.decisions_expired > 0 || r.decisions_nudged > 0 || r.decisions_ready > 0
+        if (hasActivity) {
+          log(`Cycle complete: checked=${r.checked} nudged=${r.nudged} escalated=${r.escalated} blocked_relayed=${r.blocked_relayed} dead_sessions=${r.dead_sessions} decisions_expired=${r.decisions_expired} decisions_nudged=${r.decisions_nudged} decisions_ready=${r.decisions_ready}`)
         }
       } catch (err) {
         logError('Cycle error', err)
