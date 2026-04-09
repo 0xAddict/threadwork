@@ -1,0 +1,9 @@
+
+    // Phase 0 columns
+    const phase0Columns = [
+      "ALTER TABLE tasks ADD COLUMN attempt_id INTEGER DEFAULT 0",
+      "ALTER TABLE tasks ADD COLUMN result_finding_id INTEGER",
+    ]
+    for (const sql of phase0Columns) {
+      try { this.db.exec(sql) } catch { /* column already exists */ }
+    }

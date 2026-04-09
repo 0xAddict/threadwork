@@ -28,6 +28,8 @@ export interface Task {
   worker_session_id: string | null
   version: number
   is_synthetic: number
+  attempt_id: number
+  result_finding_id: number | null
 }
 
 export interface Note {
@@ -249,6 +251,27 @@ export class TaskDB {
       try { this.db.exec(sql) } catch { /* column already exists */ }
     }
 
+    // Phase 0 columns (Sprint 1)
+    const phase0Columns = [
+      "ALTER TABLE tasks ADD COLUMN attempt_id INTEGER DEFAULT 0",
+      "ALTER TABLE tasks ADD COLUMN result_finding_id INTEGER",
+    ]
+    for (const sql of phase0Columns) {
+      try { this.db.exec(sql) } catch { /* column already exists */ }
+    }
+
+    // Feature flags table (Sprint 1)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS feature_flags (
+        flag_name TEXT PRIMARY KEY,
+        enabled INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('blackboard_enabled', 0);
+      INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('progress_events_enabled', 0);
+      INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('gates_enabled', 0);
+    `)
+
     // Supervision indexes
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_tasks_next_check
@@ -271,6 +294,33 @@ export class TaskDB {
         started_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `)
+
+    // Sprint 5: Gate violations table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS gate_violations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        task_id INTEGER,
+        violation_type TEXT NOT NULL,
+        detail TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_violations_agent ON gate_violations(agent_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_violations_type ON gate_violations(violation_type);
+    `)
+
+    // Sprint 4: Circuit breaker columns on agent_sessions
+    const circuitBreakerCols = [
+      "ALTER TABLE agent_sessions ADD COLUMN circuit_state TEXT DEFAULT 'closed'",
+      "ALTER TABLE agent_sessions ADD COLUMN fault_count INTEGER DEFAULT 0",
+      "ALTER TABLE agent_sessions ADD COLUMN last_fault_at TEXT",
+      "ALTER TABLE agent_sessions ADD COLUMN last_fault_type TEXT",
+      "ALTER TABLE agent_sessions ADD COLUMN circuit_opened_at TEXT",
+      "ALTER TABLE agent_sessions ADD COLUMN cooldown_until TEXT",
+    ]
+    for (const sql of circuitBreakerCols) {
+      try { this.db.exec(sql) } catch { /* column already exists */ }
+    }
 
     // Watchdog lease table (Sprint 1 — Durable Supervision System)
     this.db.exec(`
@@ -347,6 +397,27 @@ export class TaskDB {
       CREATE INDEX IF NOT EXISTS idx_status_created ON task_status_events(created_at);
     `)
 
+    // Sprint 3: Unified Execution Events — progress_events table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS progress_events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL REFERENCES tasks(id),
+        attempt_id INTEGER,
+        agent_id TEXT NOT NULL,
+        event_type TEXT NOT NULL
+          CHECK(event_type IN ('started', 'heartbeat', 'progress', 'finding_written', 'completed', 'failed', 'abandoned')),
+        percent INTEGER,
+        activity TEXT,
+        metrics_json TEXT,
+        detail_ref INTEGER REFERENCES findings(finding_id),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_progress_task ON progress_events(task_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_progress_type ON progress_events(event_type);
+      CREATE INDEX IF NOT EXISTS idx_progress_agent ON progress_events(agent_id, task_id);
+    `)
+
     // Decision record tables (Phase 5a)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS decisions (
@@ -393,6 +464,52 @@ export class TaskDB {
       CREATE INDEX IF NOT EXISTS idx_decision_critiques_decision ON decision_critiques(decision_id);
     `)
 
+    // Sprint 2: Blackboard — Findings and Artifacts tables
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS findings (
+        finding_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL REFERENCES tasks(id),
+        attempt_id INTEGER,
+        agent_id TEXT NOT NULL,
+        parent_agent_id TEXT,
+        finding_type TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft'
+          CHECK(status IN ('draft', 'published', 'superseded')),
+        is_final INTEGER NOT NULL DEFAULT 0,
+        metrics_json TEXT,
+        refs_json TEXT,
+        metadata_json TEXT,
+        content_hash TEXT,
+        priority TEXT DEFAULT 'normal',
+        expires_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS artifacts (
+        artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL REFERENCES tasks(id),
+        finding_id INTEGER REFERENCES findings(finding_id),
+        attempt_id INTEGER,
+        agent_id TEXT NOT NULL,
+        uri TEXT NOT NULL,
+        mime_type TEXT DEFAULT 'text/plain',
+        size_bytes INTEGER,
+        content_hash TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_dedup
+        ON findings(task_id, attempt_id, content_hash)
+        WHERE content_hash IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id);
+      CREATE INDEX IF NOT EXISTS idx_findings_type ON findings(finding_type);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_finding ON artifacts(finding_id);
+    `)
+
     // Debrief daemon tables
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS debrief_runs (
@@ -412,6 +529,133 @@ export class TaskDB {
         acquired_at TEXT NOT NULL DEFAULT (datetime('now')),
         expires_at TEXT NOT NULL
       );
+    `)
+
+    // v2-lite watchdog sprint (2026-04-09): nudge debounce table
+    // Stores per-agent last-nudged timestamp and pending event counter.
+    // Seed one row per known worker agent so tryNudge can upsert cheaply.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tw_nudge_debounce (
+        agent TEXT PRIMARY KEY,
+        last_nudged_at TEXT,
+        pending_count INTEGER NOT NULL DEFAULT 0,
+        last_urgency TEXT NOT NULL DEFAULT 'normal',
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('boss', 0, 'normal');
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('steve', 0, 'normal');
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('sadie', 0, 'normal');
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('kiera', 0, 'normal');
+    `)
+
+    // v2-lite watchdog sprint (2026-04-09): stall_miss_count column on tasks
+    // Consecutive-miss counter used by watchdog to only fire stall warnings
+    // on the second consecutive detection. Reset to 0 when agent renews
+    // heartbeat via updateHeartbeat.
+    try {
+      this.db.exec('ALTER TABLE tasks ADD COLUMN stall_miss_count INTEGER NOT NULL DEFAULT 0')
+    } catch { /* column already exists */ }
+
+    // v2-lite watchdog sprint (2026-04-09): v_nudge_metrics_24h view
+    //
+    // Summarizes the last 24 hours of nudge behavior from audit_log. Reads
+    // rows written by nudge.ts::nudgeAgent: action IN ('nudge_fired',
+    // 'nudge_suppressed'), agent='watchdog', detail JSON with keys:
+    //   target         — agent being nudged
+    //   urgency        — low | normal | high | urgent
+    //   reason         — window_elapsed | urgent_bypass | first | debounced | disabled
+    //   pending_count  — events collapsed (for fired rows) or accumulated so far (for suppressed)
+    //   window_ms_remaining — only on suppressed rows
+    //
+    // Columns exposed:
+    //   window_start, window_end   — 24h window bounds (UTC)
+    //   target                     — per-agent breakdown row
+    //   nudges_fired_24h           — count of nudge_fired rows for this target
+    //   nudges_suppressed_24h      — count of nudge_suppressed rows for this target
+    //   suppression_rate           — suppressed / (suppressed + fired), or 0 if denom=0
+    //   avg_pending_per_fire       — mean pending_count across fired rows
+    //   max_pending_per_fire       — peak coalescing
+    //
+    // A second view v_nudge_metrics_24h_total aggregates the same columns
+    // across ALL targets for the scalar "sprint success criterion" check
+    // (suppression_rate >= 0.60).
+    //
+    // IMPORTANT: SQLite JSON1 is compiled in by default in Bun's bundled
+    // sqlite, so json_extract() is safe to use here. If a future build
+    // drops JSON1, these views must be replaced with a materialized table.
+    this.db.exec(`
+      DROP VIEW IF EXISTS v_nudge_metrics_24h;
+      CREATE VIEW v_nudge_metrics_24h AS
+      WITH window_bounds AS (
+        SELECT
+          datetime('now', '-24 hours') AS window_start,
+          datetime('now') AS window_end
+      ),
+      scoped AS (
+        SELECT
+          json_extract(al.detail, '$.target') AS target,
+          al.action,
+          al.created_at,
+          CAST(json_extract(al.detail, '$.pending_count') AS INTEGER) AS pending_count
+        FROM audit_log al, window_bounds wb
+        WHERE al.action IN ('nudge_fired', 'nudge_suppressed')
+          AND al.created_at >= wb.window_start
+      )
+      SELECT
+        wb.window_start,
+        wb.window_end,
+        s.target,
+        SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS nudges_fired_24h,
+        SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS nudges_suppressed_24h,
+        CASE
+          WHEN (SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END)) = 0 THEN 0.0
+          ELSE CAST(SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS REAL)
+             / CAST(SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END) AS REAL)
+        END AS suppression_rate,
+        COALESCE(
+          AVG(CASE WHEN s.action = 'nudge_fired' THEN s.pending_count END),
+          0.0
+        ) AS avg_pending_per_fire,
+        COALESCE(
+          MAX(CASE WHEN s.action = 'nudge_fired' THEN s.pending_count END),
+          0
+        ) AS max_pending_per_fire
+      FROM scoped s, window_bounds wb
+      WHERE s.target IS NOT NULL
+      GROUP BY wb.window_start, wb.window_end, s.target
+      ORDER BY s.target;
+
+      DROP VIEW IF EXISTS v_nudge_metrics_24h_total;
+      CREATE VIEW v_nudge_metrics_24h_total AS
+      WITH window_bounds AS (
+        SELECT
+          datetime('now', '-24 hours') AS window_start,
+          datetime('now') AS window_end
+      ),
+      scoped AS (
+        SELECT
+          al.action,
+          al.created_at
+        FROM audit_log al, window_bounds wb
+        WHERE al.action IN ('nudge_fired', 'nudge_suppressed')
+          AND al.created_at >= wb.window_start
+      )
+      SELECT
+        wb.window_start,
+        wb.window_end,
+        SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS nudges_fired_24h,
+        SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS nudges_suppressed_24h,
+        CASE
+          WHEN COUNT(*) = 0 THEN 0.0
+          ELSE CAST(SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS REAL)
+             / CAST(COUNT(*) AS REAL)
+        END AS suppression_rate
+      FROM scoped s, window_bounds wb
+      GROUP BY wb.window_start, wb.window_end;
     `)
 
   }
@@ -572,6 +816,7 @@ export class TaskDB {
 
       if (input.isBlocked) {
         // Blocked: set blocked fields and next_check_at to now (for immediate watchdog pickup)
+        // Reset stall_miss_count — a blocked status is an active signal, not a stall.
         const stmt = db.prepare(`
           UPDATE tasks SET
             last_heartbeat_at = datetime('now'),
@@ -579,6 +824,7 @@ export class TaskDB {
             blocked_at = datetime('now'),
             blocked_reason = ?,
             next_check_at = datetime('now'),
+            stall_miss_count = 0,
             version = version + 1
           WHERE id = ?
           RETURNING *
@@ -586,6 +832,7 @@ export class TaskDB {
         return stmt.get(input.blockedReason ?? null, input.taskId) as Task | null
       } else {
         // Not blocked: clear blocked fields if previously set, update heartbeat
+        // Reset stall_miss_count — any heartbeat clears consecutive-miss counter.
         const stmt = db.prepare(`
           UPDATE tasks SET
             last_heartbeat_at = datetime('now'),
@@ -593,6 +840,7 @@ export class TaskDB {
             blocked_at = NULL,
             blocked_reason = NULL,
             next_check_at = datetime('now', '+' || ? || ' seconds'),
+            stall_miss_count = 0,
             version = version + 1
           WHERE id = ?
           RETURNING *
@@ -689,7 +937,8 @@ export class TaskDB {
           worker_session_id = ?,
           last_heartbeat_at = datetime('now'),
           last_progress_at = datetime('now'),
-          next_check_at = datetime('now', '+' || ? || ' seconds')
+          next_check_at = datetime('now', '+' || ? || ' seconds'),
+          attempt_id = COALESCE(attempt_id, 0) + 1
         WHERE id = ? AND to_agent = ? AND status = 'pending'
         RETURNING *
       `)
@@ -846,6 +1095,559 @@ export class TaskDB {
           state = excluded.state
       `).run(agent, sessionId, state)
     })
+  }
+
+
+  isFeatureEnabled(flagName: string): boolean {
+    const row = this.db.prepare('SELECT enabled FROM feature_flags WHERE flag_name = ?').get(flagName) as any
+    return row ? !!row.enabled : false
+  }
+
+  setFeatureFlag(flagName: string, enabled: boolean): void {
+    this.db.prepare('INSERT OR REPLACE INTO feature_flags (flag_name, enabled) VALUES (?, ?)').run(flagName, enabled ? 1 : 0)
+  }
+
+
+  // ── Sprint 2: Blackboard Findings Store ──
+
+  writeFinding(input: {
+    task_id: number
+    finding_type: string
+    summary: string
+    agent_id: string
+    attempt_id?: number
+    parent_agent_id?: string
+    status?: string
+    is_final?: boolean
+    metrics_json?: string
+    refs_json?: string
+    metadata_json?: string
+    priority?: string
+    expires_at?: string
+  }): { finding_id: number } | { error: string } {
+    if (!this.isFeatureEnabled('blackboard_enabled')) {
+      return { error: 'Blackboard is disabled (feature flag blackboard_enabled=0). Enable it first.' }
+    }
+    if (input.summary.length > 1000) {
+      return { error: `Summary exceeds 1000 chars (got ${input.summary.length})` }
+    }
+    return this.run(db => {
+      // Compute content hash for dedup
+      const hasher = new Bun.CryptoHasher('sha256')
+      hasher.update(input.summary)
+      const contentHash = hasher.digest('hex').slice(0, 16)
+
+      // Check for duplicate
+      const existing = db.prepare(
+        'SELECT finding_id FROM findings WHERE task_id = ? AND attempt_id = ? AND content_hash = ?'
+      ).get(input.task_id, input.attempt_id ?? null, contentHash) as { finding_id: number } | null
+      if (existing) {
+        return { finding_id: existing.finding_id }
+      }
+
+      const stmt = db.prepare(`
+        INSERT INTO findings (
+          task_id, attempt_id, agent_id, parent_agent_id, finding_type,
+          summary, status, is_final, metrics_json, refs_json, metadata_json,
+          content_hash, priority, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING finding_id
+      `)
+      const row = stmt.get(
+        input.task_id,
+        input.attempt_id ?? null,
+        input.agent_id,
+        input.parent_agent_id ?? null,
+        input.finding_type,
+        input.summary,
+        input.status ?? 'draft',
+        input.is_final ? 1 : 0,
+        input.metrics_json ?? null,
+        input.refs_json ?? null,
+        input.metadata_json ?? null,
+        contentHash,
+        input.priority ?? 'normal',
+        input.expires_at ?? null,
+      ) as { finding_id: number }
+      return { finding_id: row.finding_id }
+    })
+  }
+
+  readFindings(input: {
+    task_id: number
+    finding_type?: string
+    is_final?: boolean
+    limit?: number
+  }): any[] {
+    if (!this.isFeatureEnabled('blackboard_enabled')) {
+      return []
+    }
+    return this.run(db => {
+      const conditions = ['task_id = ?']
+      const params: any[] = [input.task_id]
+      if (input.finding_type) {
+        conditions.push('finding_type = ?')
+        params.push(input.finding_type)
+      }
+      if (input.is_final !== undefined) {
+        conditions.push('is_final = ?')
+        params.push(input.is_final ? 1 : 0)
+      }
+      const where = conditions.join(' AND ')
+      const limit = input.limit ?? 50
+      return db.prepare(
+        `SELECT finding_id, task_id, attempt_id, agent_id, finding_type, summary, status, is_final, priority, created_at
+         FROM findings WHERE ${where} ORDER BY created_at DESC LIMIT ?`
+      ).all(...params, limit) as any[]
+    })
+  }
+
+  readFindingRaw(findingId: number): any | null {
+    if (!this.isFeatureEnabled('blackboard_enabled')) {
+      return null
+    }
+    return this.run(db => {
+      const finding = db.prepare('SELECT * FROM findings WHERE finding_id = ?').get(findingId) as any | null
+      if (!finding) return null
+      const artifacts = db.prepare('SELECT * FROM artifacts WHERE finding_id = ?').all(findingId) as any[]
+      return { ...finding, artifacts }
+    })
+  }
+
+  writeArtifact(input: {
+    task_id: number
+    content: string
+    agent_id: string
+    mime_type?: string
+    attempt_id?: number
+    finding_id?: number
+    expires_at?: string
+  }): { artifact_id: number; uri: string } | { error: string } {
+    if (!this.isFeatureEnabled('blackboard_enabled')) {
+      return { error: 'Blackboard is disabled (feature flag blackboard_enabled=0). Enable it first.' }
+    }
+    return this.run(db => {
+      const fs = require('fs')
+      const path = require('path')
+      const artifactsDir = path.join(path.dirname(this.dbPath), 'artifacts', String(input.task_id))
+      fs.mkdirSync(artifactsDir, { recursive: true })
+
+      // Compute hash
+      const hasher = new Bun.CryptoHasher('sha256')
+      hasher.update(input.content)
+      const contentHash = hasher.digest('hex').slice(0, 16)
+
+      // Determine extension from mime type
+      const ext = (input.mime_type ?? 'text/plain').includes('json') ? '.json'
+        : (input.mime_type ?? '').includes('html') ? '.html'
+        : '.txt'
+
+      // Insert to get artifact_id first
+      const stmt = db.prepare(`
+        INSERT INTO artifacts (
+          task_id, finding_id, attempt_id, agent_id, uri, mime_type, size_bytes, content_hash, expires_at
+        ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?)
+        RETURNING artifact_id
+      `)
+      const row = stmt.get(
+        input.task_id,
+        input.finding_id ?? null,
+        input.attempt_id ?? null,
+        input.agent_id,
+        input.mime_type ?? 'text/plain',
+        Buffer.byteLength(input.content, 'utf8'),
+        contentHash,
+        input.expires_at ?? null,
+      ) as { artifact_id: number }
+
+      const filename = `${row.artifact_id}${ext}`
+      const filePath = path.join(artifactsDir, filename)
+      fs.writeFileSync(filePath, input.content, 'utf8')
+
+      // Update uri
+      db.prepare('UPDATE artifacts SET uri = ? WHERE artifact_id = ?').run(filePath, row.artifact_id)
+
+      return { artifact_id: row.artifact_id, uri: filePath }
+    })
+  }
+
+  // ── Sprint 6: DB Hygiene + Hardening ──
+
+  runHygiene(dryRun: boolean = true): {
+    archived_tasks: number
+    pruned_events: number
+    expired_artifacts: number
+    compressed_findings: number
+    vacuumed: boolean
+  } {
+    return this.run(db => {
+      const result = {
+        archived_tasks: 0,
+        pruned_events: 0,
+        expired_artifacts: 0,
+        compressed_findings: 0,
+        vacuumed: false,
+      }
+
+      // 1. Archive completed tasks older than 14 days
+      const oldTasks = db.prepare(`
+        SELECT * FROM tasks
+        WHERE status IN ('completed', 'cancelled')
+        AND completed_at < datetime('now', '-14 days')
+      `).all() as any[]
+      result.archived_tasks = oldTasks.length
+
+      if (!dryRun && oldTasks.length > 0) {
+        // Create tasks_archive if not exists
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS tasks_archive (
+            id INTEGER PRIMARY KEY,
+            from_agent TEXT, to_agent TEXT, description TEXT, priority TEXT,
+            status TEXT, result TEXT, created_at TEXT, claimed_at TEXT, completed_at TEXT,
+            archived_at TEXT NOT NULL DEFAULT (datetime('now'))
+          )
+        `)
+        const insertStmt = db.prepare(`
+          INSERT OR IGNORE INTO tasks_archive (id, from_agent, to_agent, description, priority, status, result, created_at, claimed_at, completed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        for (const t of oldTasks) {
+          insertStmt.run(t.id, t.from_agent, t.to_agent, t.description, t.priority, t.status, t.result, t.created_at, t.claimed_at, t.completed_at)
+        }
+        db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'cancelled') AND completed_at < datetime('now', '-14 days')").run()
+      }
+
+      // 2. Prune progress_events older than 14 days
+      const oldEvents = db.prepare("SELECT COUNT(*) as cnt FROM progress_events WHERE created_at < datetime('now', '-14 days')").get() as { cnt: number }
+      result.pruned_events = oldEvents.cnt
+      if (!dryRun && oldEvents.cnt > 0) {
+        db.prepare("DELETE FROM progress_events WHERE created_at < datetime('now', '-14 days')").run()
+      }
+
+      // 3. Clean up expired artifacts
+      const expiredArtifacts = db.prepare("SELECT COUNT(*) as cnt FROM artifacts WHERE expires_at IS NOT NULL AND expires_at < datetime('now')").get() as { cnt: number }
+      result.expired_artifacts = expiredArtifacts.cnt
+      if (!dryRun && expiredArtifacts.cnt > 0) {
+        // Get URIs to delete files
+        const artifacts = db.prepare("SELECT artifact_id, uri FROM artifacts WHERE expires_at IS NOT NULL AND expires_at < datetime('now')").all() as any[]
+        for (const a of artifacts) {
+          try { require('fs').unlinkSync(a.uri) } catch { /* file may not exist */ }
+        }
+        db.prepare("DELETE FROM artifacts WHERE expires_at IS NOT NULL AND expires_at < datetime('now')").run()
+      }
+
+      // 4. Compress old findings (mark as archived summary-only, clear large JSON fields)
+      const oldFindings = db.prepare("SELECT COUNT(*) as cnt FROM findings WHERE created_at < datetime('now', '-7 days') AND metrics_json IS NOT NULL").get() as { cnt: number }
+      result.compressed_findings = oldFindings.cnt
+      if (!dryRun && oldFindings.cnt > 0) {
+        db.prepare("UPDATE findings SET metrics_json = NULL, refs_json = NULL, metadata_json = NULL WHERE created_at < datetime('now', '-7 days') AND metrics_json IS NOT NULL").run()
+      }
+
+      // 5. Vacuum (only on explicit non-dry-run)
+      if (!dryRun) {
+        try {
+          db.exec('VACUUM')
+          result.vacuumed = true
+        } catch { /* VACUUM can fail if in transaction */ }
+      }
+
+      return result
+    })
+  }
+
+  getDbStats(): Record<string, { row_count: number; oldest?: string; newest?: string }> {
+    return this.run(db => {
+      const tables = ['tasks', 'notes', 'memories', 'findings', 'artifacts', 'progress_events',
+        'gate_violations', 'audit_log', 'task_status_events', 'agent_sessions']
+      const stats: Record<string, { row_count: number; oldest?: string; newest?: string }> = {}
+
+      for (const table of tables) {
+        try {
+          const count = db.prepare(`SELECT COUNT(*) as cnt FROM ${table}`).get() as { cnt: number }
+          const oldest = db.prepare(`SELECT MIN(created_at) as ts FROM ${table}`).get() as { ts: string | null }
+          const newest = db.prepare(`SELECT MAX(created_at) as ts FROM ${table}`).get() as { ts: string | null }
+          stats[table] = {
+            row_count: count.cnt,
+            oldest: oldest.ts ?? undefined,
+            newest: newest.ts ?? undefined,
+          }
+        } catch {
+          stats[table] = { row_count: 0 }
+        }
+      }
+
+      // DB file size
+      try {
+        const fs = require('fs')
+        const stat = fs.statSync(this.dbPath)
+        stats['_db_file'] = { row_count: Math.round(stat.size / 1024) } // KB
+      } catch {}
+
+      return stats
+    })
+  }
+
+  // ── Sprint 5: Communication Gates ──
+
+  recordViolation(agentId: string, violationType: string, detail: string, taskId?: number): number {
+    return this.run(db => {
+      const row = db.prepare(`
+        INSERT INTO gate_violations (agent_id, task_id, violation_type, detail)
+        VALUES (?, ?, ?, ?)
+        RETURNING id
+      `).get(agentId, taskId ?? null, violationType, detail) as { id: number }
+      return row.id
+    })
+  }
+
+  getViolations(input: { agent_id?: string; last_n?: number }): any[] {
+    return this.run(db => {
+      const conditions: string[] = []
+      const params: any[] = []
+      if (input.agent_id) {
+        conditions.push('agent_id = ?')
+        params.push(input.agent_id)
+      }
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+      const limit = input.last_n ?? 50
+      return db.prepare(
+        `SELECT * FROM gate_violations ${where} ORDER BY created_at DESC LIMIT ?`
+      ).all(...params, limit) as any[]
+    })
+  }
+
+  getRecentViolationCount(agentId: string, windowHours: number = 24): number {
+    return this.run(db => {
+      const row = db.prepare(`
+        SELECT COUNT(*) as cnt FROM gate_violations
+        WHERE agent_id = ? AND created_at > datetime('now', '-' || ? || ' hours')
+      `).get(agentId, windowHours) as { cnt: number }
+      return row.cnt
+    })
+  }
+
+  isQuarantined(agentId: string): boolean {
+    if (!this.isFeatureEnabled('gates_enabled')) return false
+    const count = this.getRecentViolationCount(agentId, 24)
+    if (count < 5) return false
+
+    // Check if 4 hours have passed since the last violation (auto-recovery)
+    const lastViolation = this.run(db =>
+      db.prepare('SELECT created_at FROM gate_violations WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1').get(agentId) as { created_at: string } | null
+    )
+    if (lastViolation) {
+      const lastTime = new Date(lastViolation.created_at + 'Z').getTime()
+      const fourHoursMs = 4 * 60 * 60 * 1000
+      if (Date.now() - lastTime > fourHoursMs) return false // Auto-recovery
+    }
+    return true
+  }
+
+  // ── Sprint 4: Circuit Breakers ──
+
+  readonly FAULT_THRESHOLD = 3
+  readonly COOLDOWN_SEC = 300 // 5 minutes
+
+  getCircuitState(agent: string): { circuit_state: string; fault_count: number; cooldown_until: string | null } | null {
+    return this.run(db => {
+      return db.prepare(
+        'SELECT circuit_state, fault_count, cooldown_until FROM agent_sessions WHERE agent = ?'
+      ).get(agent) as { circuit_state: string; fault_count: number; cooldown_until: string | null } | null
+    })
+  }
+
+  recordFault(agent: string, faultType: string): { circuit_state: string; fault_count: number } {
+    return this.run(db => {
+      // Increment fault count
+      db.prepare(`
+        UPDATE agent_sessions SET
+          fault_count = COALESCE(fault_count, 0) + 1,
+          last_fault_at = datetime('now'),
+          last_fault_type = ?
+        WHERE agent = ?
+      `).run(faultType, agent)
+
+      const row = db.prepare('SELECT fault_count, circuit_state FROM agent_sessions WHERE agent = ?').get(agent) as any
+      if (!row) return { circuit_state: 'closed', fault_count: 0 }
+
+      // Check if we should open the circuit
+      if (row.fault_count >= this.FAULT_THRESHOLD && row.circuit_state !== 'open') {
+        db.prepare(`
+          UPDATE agent_sessions SET
+            circuit_state = 'open',
+            circuit_opened_at = datetime('now'),
+            cooldown_until = datetime('now', '+' || ? || ' seconds')
+          WHERE agent = ?
+        `).run(this.COOLDOWN_SEC, agent)
+        return { circuit_state: 'open', fault_count: row.fault_count }
+      }
+
+      return { circuit_state: row.circuit_state ?? 'closed', fault_count: row.fault_count }
+    })
+  }
+
+  tryHalfOpen(agent: string): boolean {
+    return this.run(db => {
+      const row = db.prepare(
+        'SELECT circuit_state, cooldown_until FROM agent_sessions WHERE agent = ?'
+      ).get(agent) as any
+      if (!row || row.circuit_state !== 'open') return false
+
+      // Check if cooldown has elapsed
+      if (row.cooldown_until) {
+        const cooldownTime = new Date(row.cooldown_until + 'Z').getTime()
+        if (Date.now() < cooldownTime) return false
+      }
+
+      // Transition to half_open
+      db.prepare("UPDATE agent_sessions SET circuit_state = 'half_open' WHERE agent = ?").run(agent)
+      return true
+    })
+  }
+
+  closeCircuit(agent: string): void {
+    this.run(db => {
+      db.prepare(`
+        UPDATE agent_sessions SET
+          circuit_state = 'closed',
+          fault_count = 0,
+          circuit_opened_at = NULL,
+          cooldown_until = NULL
+        WHERE agent = ?
+      `).run(agent)
+    })
+  }
+
+  reopenCircuit(agent: string): void {
+    this.run(db => {
+      db.prepare(`
+        UPDATE agent_sessions SET
+          circuit_state = 'open',
+          cooldown_until = datetime('now', '+' || ? || ' seconds')
+        WHERE agent = ?
+      `).run(this.COOLDOWN_SEC, agent)
+    })
+  }
+
+  isCircuitOpen(agent: string): boolean {
+    // Timestamp comparison policy: SQLite datetimes are 'YYYY-MM-DD HH:MM:SS' UTC;
+    // always parse with `new Date(v + 'Z').getTime()` before comparing to
+    // `Date.now()`. See sprint 2026-04-09-v2-lite-watchdog.
+    const state = this.getCircuitState(agent)
+    if (state?.circuit_state !== 'open') return false
+
+    // Auto-recover if cooldown elapsed — breaks the "no overdue task = no heal"
+    // deadlock where tryHalfOpen only runs inside watchdog task reconciliation,
+    // which only runs when an agent has an overdue task, which the delegator
+    // refuses to create because isCircuitOpen returns true.
+    if (state.cooldown_until) {
+      const cooldownMs = new Date(state.cooldown_until + 'Z').getTime()
+      if (!Number.isNaN(cooldownMs) && Date.now() >= cooldownMs) {
+        // tryHalfOpen is idempotent — it guards `circuit_state !== 'open'`,
+        // so concurrent callers both hitting this path are safe: only the
+        // first transition wins, the rest no-op.
+        this.tryHalfOpen(agent)
+        return false
+      }
+    }
+
+    // If cooldown_until is NULL on an open circuit, treat as healed (bad state).
+    // Reachable via schema default — better to self-heal than hang.
+    if (!state.cooldown_until) {
+      console.warn(`[circuit-breaker] agent=${agent} open with NULL cooldown_until; forcing closed`)
+      this.closeCircuit(agent)
+      return false
+    }
+    return true
+  }
+
+  // ── Sprint 3: Unified Execution Events ──
+
+  private progressThrottleCache = new Map<number, number>() // task_id -> last event timestamp ms
+
+  reportProgress(input: {
+    task_id: number
+    agent_id: string
+    event_type: string
+    percent?: number
+    activity?: string
+    metrics_json?: string
+    attempt_id?: number
+    detail_ref?: number
+  }): { event_id: number } | { throttled: true; next_allowed_in_sec: number } | { error: string } {
+    if (!this.isFeatureEnabled('progress_events_enabled')) {
+      return { error: 'Progress events disabled (feature flag progress_events_enabled=0).' }
+    }
+
+    // 30s throttle per task (skip for started/completed/failed/abandoned which are lifecycle events)
+    const lifecycleEvents = new Set(['started', 'completed', 'failed', 'abandoned'])
+    if (!lifecycleEvents.has(input.event_type)) {
+      const lastTime = this.progressThrottleCache.get(input.task_id) ?? 0
+      const now = Date.now()
+      const throttleSec = 30
+      const elapsed = (now - lastTime) / 1000
+      if (elapsed < throttleSec) {
+        return { throttled: true, next_allowed_in_sec: Math.ceil(throttleSec - elapsed) }
+      }
+      this.progressThrottleCache.set(input.task_id, now)
+    }
+
+    return this.run(db => {
+      const stmt = db.prepare(`
+        INSERT INTO progress_events (task_id, attempt_id, agent_id, event_type, percent, activity, metrics_json, detail_ref)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING event_id
+      `)
+      const row = stmt.get(
+        input.task_id,
+        input.attempt_id ?? null,
+        input.agent_id,
+        input.event_type,
+        input.percent ?? null,
+        input.activity ?? null,
+        input.metrics_json ?? null,
+        input.detail_ref ?? null,
+      ) as { event_id: number }
+      return { event_id: row.event_id }
+    })
+  }
+
+  getProgress(input: {
+    task_id: number
+    last_n?: number
+    event_type?: string
+  }): any[] {
+    if (!this.isFeatureEnabled('progress_events_enabled')) {
+      return []
+    }
+    return this.run(db => {
+      const conditions = ['task_id = ?']
+      const params: any[] = [input.task_id]
+      if (input.event_type) {
+        conditions.push('event_type = ?')
+        params.push(input.event_type)
+      }
+      const where = conditions.join(' AND ')
+      const limit = input.last_n ?? 50
+      return db.prepare(
+        `SELECT * FROM progress_events WHERE ${where} ORDER BY created_at DESC LIMIT ?`
+      ).all(...params, limit) as any[]
+    })
+  }
+
+  /** Emit a completion event to progress_events when a task completes */
+  emitCompletionEvent(taskId: number, agentId: string, attemptId?: number): void {
+    if (!this.isFeatureEnabled('progress_events_enabled')) return
+    try {
+      this.run(db => {
+        db.prepare(
+          `INSERT INTO progress_events (task_id, attempt_id, agent_id, event_type, percent, activity)
+           VALUES (?, ?, ?, 'completed', 100, 'Task completed')`
+        ).run(taskId, attemptId ?? null, agentId)
+      })
+    } catch {
+      // Never block completion for a progress event failure
+    }
   }
 
   close(): void {

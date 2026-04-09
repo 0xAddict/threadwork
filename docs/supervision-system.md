@@ -1,8 +1,8 @@
-# Durable Supervision System
+# Supervision System
 
 ## Overview
 
-The Durable Supervision System closes the accountability gap in multi-agent delegation. Before this system, agents could delegate work via `create_task` and the Agent tool without any hard gate ensuring supervision. Monitor loops were optional and ephemeral -- agents would skip them, and when a worker stalled, detection lag could reach 30+ minutes before anyone noticed.
+The Supervision System closes the accountability gap in multi-agent delegation. Before this system, agents could delegate work via `create_task` and the Agent tool without any hard gate ensuring supervision. Monitor loops were optional and ephemeral — agents would skip them, and when a worker stalled, detection lag could reach 30+ minutes before anyone noticed.
 
 This system makes supervision **durable and automatic**:
 

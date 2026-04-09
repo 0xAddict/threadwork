@@ -1,0 +1,69 @@
+{
+  "run_id": "GOD_20260409_2229_6732",
+  "task_description": "Fix nudge-delivery bug in threadwork task board: nudges to sadie land in audit_log but not in her tmux pane. Steve nudges land fine. Implement the council-derived consolidation fix per spec at /Users/coachstokes/threadwork/sprints/2026-04-09-nudge-delivery-fix-spec.md",
+  "project_path": "/Users/coachstokes/.claude/mcp-servers/task-board",
+  "args": {
+    "scope": "full",
+    "depth": "thorough",
+    "skip_phases": ["spec", "spec-research", "plan", "visual", "ui-audit"],
+    "generator": "sonnet-medium",
+    "verifier": "sonnet-high",
+    "auto_approve": true,
+    "spec_gate": "hard",
+    "monitor": true
+  },
+  "handoff": {
+    "source": "council",
+    "mode": "from-plan",
+    "prepared_prompt_path": null,
+    "approved_plan_path": "/Users/coachstokes/threadwork/sprints/2026-04-09-nudge-delivery-fix-spec.md",
+    "normalized_plan_path": "/Users/coachstokes/.claude/mcp-servers/task-board/.claude-arsenal/runs/GOD_20260409_2229_6732/plan.md",
+    "council_report_path": "/tmp/council-nudge-report.md",
+    "imported_at": "2026-04-09T19:30:00Z",
+    "start_phase": "implement"
+  },
+  "ralph_iteration": 1,
+  "max_ralph_iterations": 5,
+  "status": "running",
+  "started_at": "2026-04-09T19:30:00Z",
+  "last_updated_at": "2026-04-09T19:30:00Z",
+  "branch": "autoresearch/GOD_20260409_2229_6732",
+  "phases": {
+    "spec":              { "status": "complete", "artifact": "/Users/coachstokes/threadwork/sprints/2026-04-09-nudge-delivery-fix-spec.md", "completed_at": "2026-04-09T19:28:00Z", "note": "Spec pre-approved by Boss post-council synthesis. Chairman timed out so Boss synthesized from unanimous Stage 1 responses." },
+    "spec_research":     { "status": "complete", "artifact": "/tmp/council-nudge-report.md", "completed_at": "2026-04-09T19:20:00Z", "note": "LLM Council (4/5 models responded fully, unanimous on all 6 sub-questions). Gemini cut off, chairman timed out." },
+    "competitive_research": { "status": "skipped", "artifact": null, "completed_at": null, "note": "No competitor comparison applicable — internal infrastructure fix." },
+    "plan":              { "status": "complete", "artifact": "/Users/coachstokes/threadwork/sprints/2026-04-09-nudge-delivery-fix-spec.md", "completed_at": "2026-04-09T19:28:00Z", "note": "Plan IS the spec. 3 patch groups (A delivery path, B observability, C tests/guardrails), 11-gate spec-gate, staged rollout with canary." },
+    "visual_baseline":   { "status": "skipped", "artifact": null, "completed_at": null, "note": "No UI. Backend/infra fix only." },
+    "implement":         { "status": "pending", "artifact": null, "completed_at": null,
+                           "tasks_total": 0, "tasks_complete": 0, "tasks_remaining": [],
+                           "epics_total": 3, "epics_complete": 0 },
+    "verify":            { "status": "pending", "artifact": null, "completed_at": null },
+    "fix":               { "status": "pending", "artifact": null, "completed_at": null },
+    "ui-audit":          { "status": "skipped", "artifact": null, "completed_at": null, "note": "No UI. Backend/infra fix only." },
+    "close":             { "status": "pending", "artifact": null, "completed_at": null }
+  },
+  "monitor": {
+    "active": false,
+    "loop_id": null,
+    "last_tick": null,
+    "stall_count": 0,
+    "visual_diffs_triggered": 0
+  },
+  "verification_gate": {
+    "passed": false,
+    "agreement_score": null,
+    "last_run_at": null,
+    "scanners_passed": 0,
+    "verifiers_passed": 0,
+    "cross_model_used": false,
+    "spec_gates_passed": 0,
+    "spec_gates_total": 11
+  },
+  "context_exhaustion_count": 0,
+  "convergence": {
+    "baseline_findings": null,
+    "final_findings": null,
+    "kept_count": 0,
+    "discarded_count": 0
+  }
+}

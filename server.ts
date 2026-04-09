@@ -6,7 +6,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { TaskDB } from './db'
-import { nudgeAgent } from './nudge'
+import { nudgeAgent, configureNudgeDebounce } from './nudge'
 import {
   postToGroup,
   formatTaskCreated,
@@ -30,6 +30,7 @@ const db = new TaskDB(DB_PATH)
 const mem = new MemoryDB(db)
 const dec = new DecisionDB(db, mem)
 const audit = new AuditLog(db)
+configureNudgeDebounce(db, audit)
 
 function normalizeScore(raw: unknown): number {
   const n = Number(raw)
@@ -119,6 +120,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           task_id: { type: 'number', description: 'The task ID to complete' },
           result: { type: 'string', description: 'Summary of what was done' },
+          result_finding_id: { type: 'number', description: 'Optional: finding_id containing the structured result (Sprint 3)' },
         },
         required: ['task_id', 'result'],
       },
@@ -468,6 +470,133 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: 'Manually trigger a session debrief. Boss-only. Bypasses idle and volume gates but respects the lock gate. Creates a decision record with synthesis.',
       inputSchema: { type: 'object' as const, properties: {} },
     },
+    // Sprint 6: DB Hygiene + Hardening
+    {
+      name: 'run_hygiene',
+      description: 'Run DB hygiene: archive old tasks, prune events, clean expired artifacts, compress findings. Default: dry_run=true (preview only).',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          dry_run: { type: 'boolean', description: 'If true (default), preview what would be cleaned without making changes' },
+        },
+      },
+    },
+    {
+      name: 'get_db_stats',
+      description: 'Get database statistics: row counts, oldest/newest records per table, DB file size.',
+      inputSchema: { type: 'object' as const, properties: {} },
+    },
+    // Sprint 5: Communication Gates
+    {
+      name: 'get_violations',
+      description: 'Query gate violation history. Gated by gates_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          agent_id: { type: 'string', description: 'Filter by agent (optional)' },
+          last_n: { type: 'number', description: 'Max results (default: 50)' },
+        },
+      },
+    },
+    // Sprint 3: Unified Execution Events
+    {
+      name: 'report_progress',
+      description: 'Report structured progress on a task. Durable event stored in progress_events table. 30s throttle per task (lifecycle events bypass throttle). Gated by progress_events_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'Task ID to report progress on' },
+          event_type: {
+            type: 'string',
+            enum: ['started', 'heartbeat', 'progress', 'finding_written', 'completed', 'failed', 'abandoned'],
+            description: 'Type of progress event',
+          },
+          percent: { type: 'number', description: 'Completion percentage 0-100 (optional)' },
+          activity: { type: 'string', description: 'What is happening (optional)' },
+          metrics_json: { type: 'string', description: 'JSON string of metrics (optional)' },
+          attempt_id: { type: 'number', description: 'Task attempt ID (optional)' },
+          detail_ref: { type: 'number', description: 'Reference to a finding_id for detail (optional)' },
+        },
+        required: ['task_id', 'event_type'],
+      },
+    },
+    {
+      name: 'get_progress',
+      description: 'Get durable progress event history for a task. Gated by progress_events_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'Task ID to get progress for' },
+          last_n: { type: 'number', description: 'Max events to return (default: 50)' },
+          event_type: { type: 'string', description: 'Filter by event type' },
+        },
+        required: ['task_id'],
+      },
+    },
+    // Sprint 2: Blackboard Findings Store
+    {
+      name: 'write_finding',
+      description: 'Store a structured finding from task work. Gated by blackboard_enabled flag. Deduplicates on content hash.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'Task this finding belongs to' },
+          finding_type: { type: 'string', description: 'Type of finding (e.g., bug, insight, metric, decision, blocker, recommendation)' },
+          summary: { type: 'string', description: 'Summary text (max 1000 chars)' },
+          attempt_id: { type: 'number', description: 'Task attempt ID (optional)' },
+          parent_agent_id: { type: 'string', description: 'Parent agent if sub-agent (optional)' },
+          status: { type: 'string', enum: ['draft', 'published', 'superseded'], description: 'Finding status (default: draft)' },
+          is_final: { type: 'boolean', description: 'Mark as final finding (default: false)' },
+          metrics_json: { type: 'string', description: 'JSON string of metrics data' },
+          refs_json: { type: 'string', description: 'JSON string of references' },
+          metadata_json: { type: 'string', description: 'JSON string of additional metadata' },
+          priority: { type: 'string', enum: ['low', 'normal', 'high', 'critical'], description: 'Finding priority (default: normal)' },
+          expires_at: { type: 'string', description: 'ISO datetime when finding expires' },
+        },
+        required: ['task_id', 'finding_type', 'summary'],
+      },
+    },
+    {
+      name: 'read_findings',
+      description: 'Read finding summaries for a task. Returns summary-level data only. Gated by blackboard_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'Task ID to read findings for' },
+          finding_type: { type: 'string', description: 'Filter by finding type' },
+          is_final: { type: 'boolean', description: 'Filter by is_final flag' },
+          limit: { type: 'number', description: 'Max results (default: 50)' },
+        },
+        required: ['task_id'],
+      },
+    },
+    {
+      name: 'read_finding_raw',
+      description: 'Read full finding detail including all fields and linked artifacts. Gated by blackboard_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          finding_id: { type: 'number', description: 'The finding ID to read' },
+        },
+        required: ['finding_id'],
+      },
+    },
+    {
+      name: 'write_artifact',
+      description: 'Store an artifact (file content) linked to a task. Saved to disk with URI reference in DB. Gated by blackboard_enabled flag.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'Task this artifact belongs to' },
+          content: { type: 'string', description: 'The artifact content to store' },
+          mime_type: { type: 'string', description: 'MIME type (default: text/plain)' },
+          attempt_id: { type: 'number', description: 'Task attempt ID (optional)' },
+          finding_id: { type: 'number', description: 'Link to a finding (optional)' },
+          expires_at: { type: 'string', description: 'ISO datetime when artifact expires' },
+        },
+        required: ['task_id', 'content'],
+      },
+    },
   ],
 }))
 
@@ -509,6 +638,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         if (!isKnownAgent(to)) {
           return { content: [{ type: 'text', text: `Invalid agent "${to}". Valid agents: ${TEAM_AGENTS.join(', ')}`, isError: true }] }
+        }
+
+        // Sprint 5: Gate 1 (Outbound) — check quarantine before delegating
+        if (db.isFeatureEnabled('gates_enabled') && db.isQuarantined(to)) {
+          const count = db.getRecentViolationCount(to, 24)
+          db.recordViolation(SELF_LABEL, 'delegation_to_quarantined', `Attempted delegation to quarantined agent ${to} (${count} violations in 24h)`)
+          // Soft quarantine: warn but allow (reduced priority noted)
+          // Log but don't block — council decision: soft quarantine, not hard block
+        }
+
+        // Sprint 4: Check circuit breaker before delegating
+        if (db.isCircuitOpen(to)) {
+          const circuitInfo = db.getCircuitState(to)
+          return { content: [{ type: 'text', text: `Cannot delegate to ${to} — circuit breaker is OPEN (${circuitInfo?.fault_count ?? 0} faults). Cooldown until: ${circuitInfo?.cooldown_until ?? 'unknown'}. Try another agent or wait for cooldown.`, isError: true }] }
         }
 
         try {
@@ -594,6 +737,38 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: 'not found, not in progress, or not assigned to you' }, taskId)
           return { content: [{ type: 'text', text: `Cannot complete task #${taskId} — either it doesn't exist, isn't in progress, or isn't assigned to you.`, isError: true }] }
         }
+
+        // Sprint 5: Gate 2 (Inbound) — soft check: warn if no findings exist for this task
+        if (db.isFeatureEnabled('gates_enabled') && db.isFeatureEnabled('blackboard_enabled')) {
+          const findings = db.readFindings({ task_id: task.id })
+          if (findings.length === 0) {
+            db.recordViolation(SELF_LABEL, 'no_findings_on_complete', `Task #${task.id} completed without any findings`, task.id)
+            // Soft: just log, don't block (calibration framing)
+          }
+        }
+
+        // Sprint 5: Gate 3 (Monitoring) — log oversized result summaries
+        if (db.isFeatureEnabled('gates_enabled') && result.length > 500) {
+          db.recordViolation(SELF_LABEL, 'oversized_summary', `Task #${task.id} result is ${result.length} chars (limit: 500)`, task.id)
+        }
+
+        // Sprint 4: If agent's circuit was half_open and task completed successfully, close circuit
+        const circuitState = db.getCircuitState(task.to_agent)
+        if (circuitState?.circuit_state === 'half_open') {
+          db.closeCircuit(task.to_agent)
+          audit.log(SELF_LABEL, 'circuit_closed', { agent: task.to_agent, reason: 'probe task completed successfully' }, taskId)
+        }
+
+        // Sprint 3: Set result_finding_id if provided
+        const resultFindingId = args.result_finding_id as number | undefined
+        if (resultFindingId) {
+          db.run(d => {
+            d.prepare('UPDATE tasks SET result_finding_id = ? WHERE id = ?').run(resultFindingId, task!.id)
+          })
+        }
+
+        // Sprint 3: Emit completion event to progress_events
+        db.emitCompletionEvent(task.id, SELF_LABEL, task.attempt_id)
 
         const nudgeMsg = `Task #${task.id} completed by ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
         const [nudgeResult] = await Promise.all([
@@ -806,6 +981,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         db.run(d => {
           d.prepare('INSERT INTO task_status_events (agent, task_id, status, detail) VALUES (?, ?, ?, ?)').run(agent, taskId, status, detail)
         })
+
+        // Sprint 3: Also emit to progress_events if enabled (write_status is deprecated alias)
+        if (db.isFeatureEnabled('progress_events_enabled')) {
+          const eventType = status === 'blocked' ? 'heartbeat'
+            : status === 'complete' ? 'completed'
+            : status === 'idle' ? 'heartbeat'
+            : 'progress'
+          db.reportProgress({ task_id: taskId, agent_id: agent, event_type: eventType, activity: detail })
+        }
 
         // Update heartbeat/progress/blocked on the task row for supervision
         const updatedTask = db.updateHeartbeat({
@@ -1173,6 +1357,152 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           tasks: result.tasksReviewed, memories: result.memoriesReviewed,
         })
         return { content: [{ type: 'text', text: `Debrief #${result.runId} complete. Decision #${result.decisionId}. ${result.tasksReviewed} tasks, ${result.memoriesReviewed} memories reviewed.` }] }
+      }
+
+      // Sprint 6: DB Hygiene + Hardening handlers
+      case 'run_hygiene': {
+        const dryRun = (args.dry_run as boolean) ?? true
+        const result = db.runHygiene(dryRun)
+        audit.log(SELF_LABEL, 'hygiene_run', { dry_run: dryRun, ...result })
+        const mode = dryRun ? 'DRY RUN (preview)' : 'LIVE (changes applied)'
+        const lines = [
+          `Hygiene ${mode}:`,
+          `  Tasks to archive (>14d): ${result.archived_tasks}`,
+          `  Progress events to prune (>14d): ${result.pruned_events}`,
+          `  Expired artifacts to clean: ${result.expired_artifacts}`,
+          `  Findings to compress (>7d): ${result.compressed_findings}`,
+          `  Vacuumed: ${result.vacuumed}`,
+        ]
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      case 'get_db_stats': {
+        const stats = db.getDbStats()
+        const lines = Object.entries(stats).map(([table, s]) => {
+          if (table === '_db_file') return `DB file size: ${s.row_count} KB`
+          return `${table}: ${s.row_count} rows${s.oldest ? ` (${s.oldest} → ${s.newest})` : ''}`
+        })
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      // Sprint 5: Communication Gates handlers
+      case 'get_violations': {
+        if (!db.isFeatureEnabled('gates_enabled')) {
+          return { content: [{ type: 'text', text: 'Gates disabled (feature flag gates_enabled=0).', isError: true }] }
+        }
+        const violations = db.getViolations({
+          agent_id: args.agent_id as string | undefined,
+          last_n: args.last_n as number | undefined,
+        })
+        if (violations.length === 0) {
+          return { content: [{ type: 'text', text: 'No violations found.' }] }
+        }
+        const lines = violations.map((v: any) =>
+          `#${v.id} [${v.created_at}] ${v.agent_id} — ${v.violation_type}: ${v.detail?.slice(0, 200) ?? ''}`
+        )
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      // Sprint 3: Unified Execution Events handlers
+      case 'report_progress': {
+        const result = db.reportProgress({
+          task_id: args.task_id as number,
+          agent_id: SELF_LABEL,
+          event_type: args.event_type as string,
+          percent: args.percent as number | undefined,
+          activity: args.activity as string | undefined,
+          metrics_json: args.metrics_json as string | undefined,
+          attempt_id: args.attempt_id as number | undefined,
+          detail_ref: args.detail_ref as number | undefined,
+        })
+        if ('error' in result) {
+          return { content: [{ type: 'text', text: result.error, isError: true }] }
+        }
+        if ('throttled' in result) {
+          return { content: [{ type: 'text', text: `Throttled. Next progress event allowed in ${result.next_allowed_in_sec}s.` }] }
+        }
+        audit.log(SELF_LABEL, 'progress_reported', { task_id: args.task_id, event_type: args.event_type, event_id: result.event_id }, args.task_id as number)
+        return { content: [{ type: 'text', text: `Progress event #${result.event_id} recorded (${args.event_type}) for task #${args.task_id}.` }] }
+      }
+
+      case 'get_progress': {
+        const events = db.getProgress({
+          task_id: args.task_id as number,
+          last_n: args.last_n as number | undefined,
+          event_type: args.event_type as string | undefined,
+        })
+        if (events.length === 0) {
+          return { content: [{ type: 'text', text: `No progress events for task #${args.task_id}.` }] }
+        }
+        const lines = events.reverse().map((e: any) =>
+          `[${e.created_at}] #${e.event_id} ${e.event_type}${e.percent != null ? ` ${e.percent}%` : ''} — ${e.activity ?? '(no activity)'}`
+        )
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      // Sprint 2: Blackboard Findings Store handlers
+      case 'write_finding': {
+        const result = db.writeFinding({
+          task_id: args.task_id as number,
+          finding_type: args.finding_type as string,
+          summary: args.summary as string,
+          agent_id: SELF_LABEL,
+          attempt_id: args.attempt_id as number | undefined,
+          parent_agent_id: args.parent_agent_id as string | undefined,
+          status: args.status as string | undefined,
+          is_final: args.is_final as boolean | undefined,
+          metrics_json: args.metrics_json as string | undefined,
+          refs_json: args.refs_json as string | undefined,
+          metadata_json: args.metadata_json as string | undefined,
+          priority: args.priority as string | undefined,
+          expires_at: args.expires_at as string | undefined,
+        })
+        if ('error' in result) {
+          return { content: [{ type: 'text', text: result.error, isError: true }] }
+        }
+        audit.log(SELF_LABEL, 'finding_written', { task_id: args.task_id, finding_type: args.finding_type, finding_id: result.finding_id }, args.task_id as number)
+        return { content: [{ type: 'text', text: `Finding #${result.finding_id} written for task #${args.task_id} (type: ${args.finding_type}).` }] }
+      }
+
+      case 'read_findings': {
+        const findings = db.readFindings({
+          task_id: args.task_id as number,
+          finding_type: args.finding_type as string | undefined,
+          is_final: args.is_final as boolean | undefined,
+          limit: args.limit as number | undefined,
+        })
+        if (findings.length === 0) {
+          return { content: [{ type: 'text', text: `No findings for task #${args.task_id}.` }] }
+        }
+        const lines = findings.map(f =>
+          `#${f.finding_id} [${f.finding_type}] ${f.status}${f.is_final ? ' (FINAL)' : ''} — ${f.summary.slice(0, 200)}`
+        )
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      case 'read_finding_raw': {
+        const finding = db.readFindingRaw(args.finding_id as number)
+        if (!finding) {
+          return { content: [{ type: 'text', text: `Finding #${args.finding_id} not found (or blackboard disabled).`, isError: true }] }
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(finding, null, 2) }] }
+      }
+
+      case 'write_artifact': {
+        const result = db.writeArtifact({
+          task_id: args.task_id as number,
+          content: args.content as string,
+          agent_id: SELF_LABEL,
+          mime_type: args.mime_type as string | undefined,
+          attempt_id: args.attempt_id as number | undefined,
+          finding_id: args.finding_id as number | undefined,
+          expires_at: args.expires_at as string | undefined,
+        })
+        if ('error' in result) {
+          return { content: [{ type: 'text', text: result.error, isError: true }] }
+        }
+        audit.log(SELF_LABEL, 'artifact_written', { task_id: args.task_id, artifact_id: result.artifact_id, uri: result.uri }, args.task_id as number)
+        return { content: [{ type: 'text', text: `Artifact #${result.artifact_id} stored at ${result.uri}` }] }
       }
 
       default:
