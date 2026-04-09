@@ -19,10 +19,17 @@ export function buildNudgeCommand(session: string, message: string): string[] {
 // Without this guard, tests that use isolated TEST_DBs would still fire real tmux
 // send-keys at real claude-{agent} sessions via the side-effectful nudgeAgent,
 // producing fixture-title spam in running agents' main threads.
+//
+// BUG FIX 2026-04-09 (GOD_20260409_2229_6732): the original guard included a
+// `typeof Bun.jest === 'function'` check intended to detect `bun test`. That symbol
+// is ALWAYS exposed by the Bun runtime regardless of whether you're in test mode —
+// so `nudgeAgent()` silently no-op'd every single call in production (MCP server,
+// watchdog, everywhere). Removed — we now rely only on NODE_ENV and the explicit
+// env escape hatch. If test runs start firing nudges again, set
+// THREADWORK_NUDGE_DISABLE=1 in the test harness instead.
 const NUDGE_DISABLED =
   process.env.NODE_ENV === 'test' ||
-  process.env.THREADWORK_NUDGE_DISABLE === '1' ||
-  typeof (globalThis as any).Bun?.jest === 'function'
+  process.env.THREADWORK_NUDGE_DISABLE === '1'
 
 // v2-lite debounce plumbing — module-level so every callsite goes through
 // the same debounce state. Main/server/watchdog set this once at boot via
