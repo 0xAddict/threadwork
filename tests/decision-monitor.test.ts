@@ -18,6 +18,7 @@ function freshResult(): ReconcileResult {
     decisions_expired: 0,
     decisions_nudged: 0,
     decisions_ready: 0,
+    idle_nudges: 0,
   }
 }
 

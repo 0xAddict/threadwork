@@ -1,0 +1,58 @@
+{
+  "schema_version": "1.0",
+  "sprint_id": "sprint-example",
+  "created_at": "2026-04-10T17:30:00Z",
+  "planner": "opus",
+  "roadmap_ref": ".harness/roadmap.md#sprint-example",
+  "lanes": [
+    {
+      "lane_id": "lane-1",
+      "goal": "Add append-only gate log reader CLI",
+      "executor_model": "sonnet-4.6",
+      "verifier_model": "opus",
+      "allowed_paths": [
+        "threadwork/scripts/gate-log-*.sh",
+        "threadwork/tests/gate-log/**"
+      ],
+      "forbidden_paths": [
+        "threadwork/server.ts",
+        "threadwork/db.ts"
+      ],
+      "acceptance_criteria": [
+        {
+          "id": "AC-1",
+          "statement": "gate-log-tail.sh prints the last N entries of a gate.log",
+          "test_command": "bash threadwork/scripts/gate-log-tail.sh threadwork/tests/gate-log/sample.log 3 | wc -l | tr -d ' '",
+          "expected": "3"
+        },
+        {
+          "id": "AC-2",
+          "statement": "gate-log-tail.sh exits 0 on happy path",
+          "test_command": "bash threadwork/scripts/gate-log-tail.sh threadwork/tests/gate-log/sample.log 3 >/dev/null; echo $?",
+          "expected": "0"
+        },
+        {
+          "id": "AC-3",
+          "statement": "gate-log-tail.sh exits 1 on missing file",
+          "test_command": "bash threadwork/scripts/gate-log-tail.sh /nonexistent.log 3 >/dev/null 2>&1; echo $?",
+          "expected": "1"
+        }
+      ],
+      "definition_of_done": "All ACs pass, lane stays in scope, verifier verdict = PASS",
+      "max_retries": 3
+    }
+  ],
+  "global_gates": [
+    {
+      "id": "G-1",
+      "name": "shellcheck",
+      "command": "shellcheck threadwork/scripts/gate-log-*.sh",
+      "expected_exit_code": 0
+    }
+  ],
+  "signature": {
+    "algo": "sha256",
+    "hash": "PENDING_SIGN",
+    "signed_at": "PENDING_SIGN"
+  }
+}

@@ -46,7 +46,7 @@ fi
 rmdir "$PLACEHOLDER_LOCK" 2>/dev/null
 
 # Also kill any OTHER stale sessions' loops for this chat (cleanup)
-for flag in "${STATE_DIR}/${CHAT_ID}".*.flag; do
+for flag in "${STATE_DIR}/${CHAT_ID}".*.flag(N); do
   [[ -f "$flag" ]] || continue
   pid=$(cat "$flag" 2>/dev/null)
   if [[ -n "$pid" ]]; then

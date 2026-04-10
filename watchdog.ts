@@ -10,7 +10,7 @@ import { MemoryDB } from './memory'
 import { DecisionDB, expireStaleDecisions, type Decision, type DecisionWithDetail } from './decision'
 import { AuditLog } from './audit'
 import { nudgeAgent } from './nudge'
-import { postToGroup, formatDecisionExpired } from './notify'
+import { postToGroup, formatDecisionExpired, esc } from './notify'
 import { checkAndRunDebrief } from './debrief'
 import {
   DB_PATH,
@@ -22,6 +22,7 @@ import {
   SUPERVISION_DEFAULTS,
   WORKER_AGENTS,
   BOSS_AGENT,
+  TEAM_AGENTS,
 } from './config'
 
 // ---------------------------------------------------------------------------
@@ -37,6 +38,7 @@ export interface ReconcileResult {
   decisions_expired: number
   decisions_nudged: number
   decisions_ready: number
+  idle_nudges: number
 }
 
 export interface WatchdogConfig {
@@ -184,6 +186,7 @@ export class TaskReconciler {
       decisions_expired: 0,
       decisions_nudged: 0,
       decisions_ready: 0,
+      idle_nudges: 0,
     }
 
     // Query due tasks (exclude escalation tasks — they must NOT be re-escalated)
@@ -274,7 +277,7 @@ export class TaskReconciler {
     await nudgeAgent(supervisor, msg)
 
     // Post to Telegram for visibility
-    await postToGroup(`\u26a0\ufe0f ${msg}`)
+    await postToGroup(`\u26a0\ufe0f ${esc(msg)}`)
 
     this.audit.log('watchdog', 'blocked_relay', {
       task_id: task.id,
@@ -329,7 +332,7 @@ export class TaskReconciler {
 
     // Notify boss (do NOT nudge the dead worker)
     await nudgeAgent('boss', `DEAD SESSION: Task #${task.id} (${task.to_agent}) \u2014 worker session is dead. Escalation task created.`)
-    await postToGroup(`\ud83d\udea8 DEAD SESSION: Task #${task.id} (${task.to_agent}) \u2014 worker session dead. Escalated to Boss.`)
+    await postToGroup(`\ud83d\udea8 DEAD SESSION: Task \\#${task.id} \\(${esc(task.to_agent)}\\) \u2014 worker session dead\\. Escalated to Boss\\.`)
 
     this.audit.log('watchdog', 'dead_session_escalation', {
       task_id: task.id,
@@ -357,7 +360,7 @@ export class TaskReconciler {
       log(`Circuit OPEN for ${task.to_agent} (${faultResult.fault_count} faults). Alerting boss.`)
       await this.taskDb.run(async () => {}) // no-op, just for type
       await nudgeAgent('boss', `Circuit OPEN for ${task.to_agent}: ${faultResult.fault_count} consecutive faults. Agent degraded.`)
-      await postToGroup(`\u26a0\ufe0f Circuit breaker OPEN for ${task.to_agent} — ${faultResult.fault_count} faults`)
+      await postToGroup(`\u26a0\ufe0f Circuit breaker OPEN for ${esc(task.to_agent)} \\- ${faultResult.fault_count} faults`)
     }
 
     if (newLevel >= 3) {
@@ -527,7 +530,7 @@ export class TaskReconciler {
     })
 
     await nudgeAgent('boss', `Escalation L${level}: Task #${task.id} (${task.to_agent}) \u2014 ${reason}`)
-    await postToGroup(`\ud83d\udea8 Escalation L${level}: Task #${task.id} (${task.to_agent}) \u2014 ${reason}`)
+    await postToGroup(`\ud83d\udea8 Escalation L${level}: Task \\#${task.id} \\(${esc(task.to_agent)}\\) \\- ${esc(reason)}`)
 
     this.audit.log('watchdog', 'escalation_created', {
       task_id: task.id,
@@ -611,7 +614,7 @@ export class TaskReconciler {
           `).run(session.agent)
         })
 
-        await postToGroup(`\u26a0\ufe0f Agent ${session.agent} session (${tmuxSessionName}) is dead.`)
+        await postToGroup(`\u26a0\ufe0f Agent ${esc(session.agent)} session \\(${esc(tmuxSessionName)}\\) is dead\\.`)
         this.audit.log('watchdog', 'session_dead', {
           agent: session.agent,
           session: tmuxSessionName,
@@ -734,7 +737,11 @@ export class TaskReconciler {
     }
 
     // (b) Nudge for stale open decisions (open > 10 min, no positions)
-    const openDecisions = dec.getOpenDecisions()
+    // getOpenDecisions() already filters to status IN ('open','positions','critique'),
+    // but we also guard explicitly here to ensure finalized/expired/cancelled decisions
+    // are never nudged even if the in-memory list is stale.
+    const TERMINAL_STATUSES_SET = new Set(['finalized', 'expired', 'cancelled'])
+    const openDecisions = dec.getOpenDecisions().filter(d => !TERMINAL_STATUSES_SET.has(d.status))
     const now = Date.now()
     const TEN_MINUTES_MS = 10 * 60 * 1000
 
@@ -745,19 +752,30 @@ export class TaskReconciler {
       return d.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '')
     }
 
-    for (const d of openDecisions) {
-      if (d.status !== 'open') continue // Only nudge 'open' (no positions yet)
+    // In-cycle tracking Set to prevent double-nudging the same decision within
+    // a single watchdog cycle (guards against audit write latency edge cases).
+    const nudgedThisCycle = new Set<number>()
+    const notifiedThisCycle = new Set<number>()
 
-      const createdAt = new Date(d.created_at + 'Z').getTime()
+    for (const d of openDecisions) {
+      // Guard: only nudge decisions in 'open' status (no positions submitted yet).
+      // Skip finalized, expired, cancelled, or decisions that already have positions.
+      if (d.status !== 'open') continue
+
+      const createdAt = new Date(d.created_at.replace(' ', 'T') + 'Z').getTime()
       const ageMs = now - createdAt
       if (ageMs < TEN_MINUTES_MS) continue
 
-      // Check if we already nudged for this decision recently (within last 10 min)
+      // Skip if already nudged this cycle
+      if (nudgedThisCycle.has(d.id)) continue
+
+      // Check if we already nudged for this decision recently (within last 10 min).
+      // Use a high limit to ensure we don't miss prior nudge entries in busy systems.
       const recentNudge = this.audit.query({
         agent: 'watchdog',
         action: 'decision_position_nudge',
         since: sqliteDatetime(now - TEN_MINUTES_MS),
-        limit: 50,
+        limit: 500,
       }).find(e => {
         try {
           const detail = JSON.parse(e.detail ?? '{}')
@@ -780,6 +798,7 @@ export class TaskReconciler {
         age_min: Math.floor(ageMs / 60000),
       })
 
+      nudgedThisCycle.add(d.id)
       result.decisions_nudged++
       log(`Nudged agents for decision #${d.id} (open ${Math.floor(ageMs / 60000)} min, no positions)`)
     }
@@ -790,21 +809,30 @@ export class TaskReconciler {
     const POSITION_QUORUM = 2
 
     for (const d of openDecisions) {
+      // Guard: only check decisions in 'positions' or 'critique' status.
+      // Finalized/expired/cancelled decisions are already excluded from openDecisions.
       if (d.status !== 'positions' && d.status !== 'critique') continue
+
+      // Skip if already notified this cycle
+      if (notifiedThisCycle.has(d.id)) continue
 
       // Get full detail to check positions
       const detail = dec.getDecision(d.id)
       if (!detail) continue
 
+      // Re-verify the decision is still in an open status (handles TOCTOU race)
+      if (TERMINAL_STATUSES_SET.has(detail.status)) continue
+
       const distinctAgents = new Set(detail.positions.map(p => p.agent))
       if (distinctAgents.size < POSITION_QUORUM) continue
 
-      // Check if we already notified Boss for this decision recently (within last 10 min)
+      // Check if we already notified Boss for this decision recently (within last 10 min).
+      // Use a high limit to ensure we don't miss prior notify entries in busy systems.
       const recentNotify = this.audit.query({
         agent: 'watchdog',
         action: 'decision_ready_to_finalize',
         since: sqliteDatetime(now - TEN_MINUTES_MS),
-        limit: 50,
+        limit: 500,
       }).find(e => {
         try {
           const detail = JSON.parse(e.detail ?? '{}')
@@ -816,7 +844,7 @@ export class TaskReconciler {
       // Notify Boss
       const readyMsg = `Decision #${d.id} "${d.title}" has ${distinctAgents.size} position(s) from [${[...distinctAgents].join(', ')}] and is ready to finalize.`
       await nudgeAgent(BOSS_AGENT, readyMsg)
-      await postToGroup(`\u2705 Decision #${d.id} ready to finalize: "${d.title}" \u2014 ${distinctAgents.size} positions in.`)
+      await postToGroup(`\u2705 Decision \\#${d.id} ready to finalize: "${esc(d.title)}" \\- ${distinctAgents.size} positions in\\.`)
 
       this.audit.log('watchdog', 'decision_ready_to_finalize', {
         decision_id: d.id,
@@ -825,13 +853,163 @@ export class TaskReconciler {
         agents: [...distinctAgents],
       })
 
+      notifiedThisCycle.add(d.id)
       result.decisions_ready++
       log(`Decision #${d.id} is ready to finalize (${distinctAgents.size} positions)`)
     }
   }
 
   // -------------------------------------------------------------------------
-  // 7. PERSISTENT LOOP
+  // 7. IDLE AGENT BOARD CHECK NUDGING
+  // -------------------------------------------------------------------------
+
+  /**
+   * Idle detection thresholds (in milliseconds).
+   */
+  static readonly IDLE_THRESHOLD_MS = 15 * 60 * 1000   // 15 minutes
+  static readonly NUDGE_COOLDOWN_MS = 30 * 60 * 1000   // 30 minutes
+
+  /**
+   * Actions that count as agent "activity" for idle detection.
+   */
+  private static readonly ACTIVITY_ACTIONS = [
+    'task_claimed',
+    'status_written',
+    'decision_position_submitted',
+    'decision_critique_submitted',
+    'note_added',
+    'task_completed',
+  ]
+
+  /**
+   * Monitor idle agents and nudge them if there is pending work.
+   *
+   * For each known agent:
+   *   (a) Skip if agent has active in_progress tasks (they are busy)
+   *   (b) Check last activity timestamp from audit_log
+   *   (c) If idle > 15 min, check for pending tasks or open decisions
+   *   (d) If there is pending work AND cooldown has elapsed, nudge agent
+   */
+  async monitorIdleAgents(result: ReconcileResult): Promise<void> {
+    const now = Date.now()
+
+    for (const agent of TEAM_AGENTS) {
+      try {
+        // (a) Skip agents with active in_progress tasks
+        const activeTasks = this.taskDb.run(db =>
+          db.prepare(`
+            SELECT COUNT(*) as cnt FROM tasks
+            WHERE to_agent = ? AND status = 'in_progress'
+          `).get(agent) as { cnt: number }
+        )
+        if (activeTasks.cnt > 0) continue
+
+        // (b) Check last activity timestamp from audit_log
+        const lastActivity = this.taskDb.run(db =>
+          db.prepare(`
+            SELECT MAX(created_at) as last_at FROM audit_log
+            WHERE agent = ? AND action IN (${TaskReconciler.ACTIVITY_ACTIONS.map(() => '?').join(',')})
+          `).get(agent, ...TaskReconciler.ACTIVITY_ACTIONS) as { last_at: string | null }
+        )
+
+        if (!lastActivity.last_at) continue  // No activity recorded at all — skip (agent never used the system)
+
+        const lastAtMs = new Date(lastActivity.last_at + 'Z').getTime()
+        const idleMs = now - lastAtMs
+        if (idleMs < TaskReconciler.IDLE_THRESHOLD_MS) continue
+
+        // (c) Check for pending work: tasks assigned to this agent + open decisions
+        const pendingTasks = this.taskDb.run(db =>
+          db.prepare(`
+            SELECT COUNT(*) as cnt FROM tasks
+            WHERE to_agent = ? AND status = 'pending'
+          `).get(agent) as { cnt: number }
+        )
+
+        const openDecisions = this.taskDb.run(db =>
+          db.prepare(`
+            SELECT COUNT(*) as cnt FROM decisions
+            WHERE status IN ('open', 'positions', 'critique')
+            AND id NOT IN (
+              SELECT decision_id FROM decision_positions WHERE agent = ?
+            )
+          `).get(agent) as { cnt: number }
+        )
+
+        if (pendingTasks.cnt === 0 && openDecisions.cnt === 0) continue
+
+        // (d) Check cooldown: was this agent nudged within the last 30 minutes?
+        const sqliteDatetime = (ms: number): string => {
+          const d = new Date(ms)
+          return d.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '')
+        }
+
+        const recentNudge = this.audit.query({
+          agent: 'watchdog',
+          action: 'idle_board_nudge',
+          since: sqliteDatetime(now - TaskReconciler.NUDGE_COOLDOWN_MS),
+          limit: 50,
+        }).find(e => {
+          try {
+            const detail = JSON.parse(e.detail ?? '{}')
+            return detail.agent === agent
+          } catch { return false }
+        })
+
+        if (recentNudge) continue
+
+        // (e) Cross-nudge guard: if the agent has no pending tasks and was
+        // already nudged by decision monitoring (decision_position_nudge) within
+        // the last 60 seconds, skip the idle nudge to avoid double-nudging.
+        // When the agent DOES have pending tasks, the idle nudge covers different
+        // work (tasks), so it should still fire.
+        if (pendingTasks.cnt === 0) {
+          const CROSS_NUDGE_WINDOW_MS = 60 * 1000
+          const recentDecisionNudge = this.audit.query({
+            agent: 'watchdog',
+            action: 'decision_position_nudge',
+            since: sqliteDatetime(now - CROSS_NUDGE_WINDOW_MS),
+            limit: 50,
+          }).find(e => {
+            try {
+              const detail = JSON.parse(e.detail ?? '{}')
+              return Array.isArray(detail.agents_nudged) && detail.agents_nudged.includes(agent)
+            } catch { return false }
+          })
+
+          if (recentDecisionNudge) continue
+        }
+
+        // Build nudge message with board summary
+        const parts: string[] = []
+        if (pendingTasks.cnt > 0) {
+          parts.push(`${pendingTasks.cnt} pending task(s)`)
+        }
+        if (openDecisions.cnt > 0) {
+          parts.push(`${openDecisions.cnt} open decision(s) awaiting input`)
+        }
+        const summary = parts.join(' and ')
+        const nudgeMsg = `Board check: You have ${summary}. Run list_tasks and list_decisions to catch up.`
+
+        await nudgeAgent(agent, nudgeMsg)
+
+        this.audit.log('watchdog', 'idle_board_nudge', {
+          agent,
+          idle_min: Math.floor(idleMs / 60000),
+          pending_tasks: pendingTasks.cnt,
+          open_decisions: openDecisions.cnt,
+        })
+
+        result.idle_nudges++
+        log(`Idle nudge sent to ${agent} (idle ${Math.floor(idleMs / 60000)} min): ${summary}`)
+      } catch (err) {
+        logError(`Failed to check idle status for ${agent}`, err)
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 8. PERSISTENT LOOP
   // -------------------------------------------------------------------------
 
   /**
@@ -865,7 +1043,14 @@ export class TaskReconciler {
           logError('Decision monitoring failed', err)
         }
 
-        // Step 3b: Check debrief gates
+        // Step 3b: Monitor idle agents and nudge for board check
+        try {
+          await this.monitorIdleAgents(reconcileResult)
+        } catch (err) {
+          logError('Idle agent monitoring failed', err)
+        }
+
+        // Step 3c: Check debrief gates
         try {
           const mem = new MemoryDB(this.taskDb)
           const dec = new DecisionDB(this.taskDb, mem)
@@ -879,9 +1064,9 @@ export class TaskReconciler {
 
         // Log cycle summary
         const r = reconcileResult
-        const hasActivity = r.checked > 0 || r.nudged > 0 || r.escalated > 0 || r.blocked_relayed > 0 || r.dead_sessions > 0 || r.decisions_expired > 0 || r.decisions_nudged > 0 || r.decisions_ready > 0
+        const hasActivity = r.checked > 0 || r.nudged > 0 || r.escalated > 0 || r.blocked_relayed > 0 || r.dead_sessions > 0 || r.decisions_expired > 0 || r.decisions_nudged > 0 || r.decisions_ready > 0 || r.idle_nudges > 0
         if (hasActivity) {
-          log(`Cycle complete: checked=${r.checked} nudged=${r.nudged} escalated=${r.escalated} blocked_relayed=${r.blocked_relayed} dead_sessions=${r.dead_sessions} decisions_expired=${r.decisions_expired} decisions_nudged=${r.decisions_nudged} decisions_ready=${r.decisions_ready}`)
+          log(`Cycle complete: checked=${r.checked} nudged=${r.nudged} escalated=${r.escalated} blocked_relayed=${r.blocked_relayed} dead_sessions=${r.dead_sessions} decisions_expired=${r.decisions_expired} decisions_nudged=${r.decisions_nudged} decisions_ready=${r.decisions_ready} idle_nudges=${r.idle_nudges}`)
         }
       } catch (err) {
         logError('Cycle error', err)
