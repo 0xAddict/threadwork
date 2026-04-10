@@ -6,7 +6,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { TaskDB } from './db'
-import { nudgeAgent } from './nudge'
+import { dispatchAgentNudge, dispatchAgentInterrupt, configureNudgeDebounce } from './nudge'
 import {
   postToGroup,
   formatTaskCreated,
@@ -618,7 +618,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         const nudgeMsg = `You have a new task (#${task.id}) from ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
         const [nudgeResult] = await Promise.all([
-          nudgeAgent(to, nudgeMsg),
+          dispatchAgentNudge(to, nudgeMsg, { source: SELF_LABEL }),
           postToGroup(formatTaskCreated(task)),
         ])
         audit.log(SELF_LABEL, 'task_created', { to, description, priority }, task.id)
@@ -667,7 +667,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
           const nudgeMsg = `You have a new delegated task (#${task.id}) from ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
           const [nudgeResult] = await Promise.all([
-            nudgeAgent(to, nudgeMsg),
+            dispatchAgentNudge(to, nudgeMsg, { source: SELF_LABEL }),
             postToGroup(formatTaskCreated(task)),
           ])
           audit.log(SELF_LABEL, 'task_delegated', {
@@ -771,7 +771,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         const nudgeMsg = `Task #${task.id} completed by ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
         const [nudgeResult] = await Promise.all([
-          nudgeAgent(task.from_agent, nudgeMsg),
+          dispatchAgentNudge(task.from_agent, nudgeMsg, { source: SELF_LABEL }),
           postToGroup(formatTaskCompleted(task)),
         ])
 
@@ -831,17 +831,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'nudge_agent': {
         const agent = (args.agent as string).toLowerCase()
         const message = args.message as string
-        const result = await nudgeAgent(agent, message, { source: SELF_LABEL })
+        const result = await dispatchAgentNudge(agent, message, { source: SELF_LABEL })
 
         if (!result.ok) {
           return { content: [{ type: 'text', text: `Nudge failed: ${result.error}`, isError: true }] }
         }
 
         await postToGroup(formatNudge(SELF_LABEL, agent, message))
-        // NOTE: audit_log('agent_nudged') is now written INSIDE nudgeAgent() on the
-        // successful sendTmux path only. Do NOT add a direct write here — that was
-        // the exact bug fixed in sprint #256: unconditional audit after debounce-suppressed
-        // or test-disabled nudges made the log lie about keystroke delivery.
+        // audit_log('agent_nudged') is emitted inside dispatchAgentNudge() on the
+        // successful sendTmux path only — this is the single canonical write site
+        // (sprint #256 gate 3). Do NOT re-add a direct write here.
         return { content: [{ type: 'text', text: `Nudged ${agent}: ${message}` }] }
       }
 
@@ -950,23 +949,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'interrupt_agent': {
         const agent = (args.agent as string).toLowerCase()
         const reason = args.reason as string
-        const session = AGENT_SESSIONS[agent]
 
-        if (!session) {
-          return { content: [{ type: 'text', text: `Unknown agent: ${agent}`, isError: true }] }
+        // Sprint #256 gate 4: all raw tmux send-keys invocations live inside
+        // nudge.ts only. Ctrl+C delivery now goes through dispatchAgentInterrupt,
+        // which does its own stateless session resolution, has-session preflight,
+        // and audit-log write (action: NUDGE_ACTIONS.INTERRUPTED).
+        const result = await dispatchAgentInterrupt(agent, reason, { source: SELF_LABEL })
+
+        if (!result.ok) {
+          return { content: [{ type: 'text', text: `Interrupt failed: ${result.error}`, isError: true }] }
         }
 
-        const proc = Bun.spawn([TMUX_PATH, 'send-keys', '-t', session, 'C-c'], { stdout: 'pipe', stderr: 'pipe' })
-        const exitCode = await proc.exited
-
-        if (exitCode !== 0) {
-          const stderr = await new Response(proc.stderr).text()
-          return { content: [{ type: 'text', text: `Interrupt failed: ${stderr.trim()}`, isError: true }] }
-        }
-
-        audit.log(SELF_LABEL, 'agent_interrupted', { target: agent, reason })
         await postToGroup(`🛑 ${SELF_LABEL} interrupted ${agent}: ${reason}`)
-        return { content: [{ type: 'text', text: `Sent Ctrl+C to ${agent} (${session}). Reason: ${reason}` }] }
+        return { content: [{ type: 'text', text: `Sent Ctrl+C to ${agent}. Reason: ${reason}` }] }
       }
 
       case 'write_status': {
@@ -1013,7 +1008,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
           // Nudge supervisor and post to group (plain text — no MarkdownV2 escaping needed)
           await Promise.all([
-            nudgeAgent(supervisor, blockedMsg),
+            dispatchAgentNudge(supervisor, blockedMsg, { source: agent }),
             postToGroup(formatNudge(agent, supervisor, `BLOCKED on task #${taskId}: ${reason}`)),
           ])
           blockedNotice = ` Supervisor (${supervisor}) notified.`
