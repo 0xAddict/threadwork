@@ -341,6 +341,22 @@ describe('recallMemories query normalization (S3.1)', () => {
     expect(results).toHaveLength(2)
   })
 
+  test('Unicode NFC normalization: composed vs decomposed accents match', () => {
+    // 'café' written with a single precomposed character U+00E9 (é)
+    const composed = 'caf\u00e9 menu has great coffee'
+    // 'café' written with c + e + combining acute U+0301
+    const decomposed = 'caf\u0065\u0301'
+    // Sanity check: these byte sequences are different
+    expect(composed.includes(decomposed)).toBe(false)
+
+    mem.saveMemory({ agent: 'steve', content: composed, category: 'learning' })
+    // Query with the decomposed form — should find the composed content
+    // because normalizeContent applies NFC to both sides.
+    const results = mem.recallMemories('steve', { query: decomposed })
+    expect(results).toHaveLength(1)
+    expect(results[0].content).toBe(composed)
+  })
+
   test('numeric ref with hash prefix: #381 matches content containing #381', () => {
     mem.saveMemory({ agent: 'steve', content: 'Issue #381 blocked relay', category: 'learning' })
     const results = mem.recallMemories('steve', { query: '#381' })
