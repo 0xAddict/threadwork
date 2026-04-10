@@ -719,8 +719,12 @@ export class TaskDB {
         `)
         const updated = stmt.get(timeoutSec, input.taskId) as Task | null
 
-        // Decay fault_count on successful heartbeat (bounded at 0, not a full reset)
-        if (updated) {
+        // Decay fault_count on successful heartbeat (bounded at 0, not a full reset).
+        // S2.1 parity: subagent tasks carry to_agent = supervisor (parent). Since subagent
+        // faults do NOT charge the parent's fault_count (see watchdog.handleHeartbeatOverdue),
+        // subagent heartbeats must NOT decay the parent either — otherwise the parent's
+        // circuit walks downward on subagent activity without having walked upward.
+        if (updated && task.kind !== 'subagent') {
           db.prepare(`
             UPDATE agent_sessions SET fault_count = MAX(0, COALESCE(fault_count, 0) - 1) WHERE agent = ?
           `).run(task.to_agent)

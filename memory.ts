@@ -61,7 +61,10 @@ export class MemoryDB {
   }
 
   normalizeContent(text: string): string {
-    return text.replace(/\s+/g, ' ').trim().toLowerCase()
+    // NFC normalization folds composed vs decomposed accented characters
+    // (e.g. 'café' as c+é vs c+e+combining-acute) into a canonical form,
+    // so recall on Unicode-heavy content doesn't silently miss.
+    return text.normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase()
   }
 
   inferClassification(content: string, category: string): Classification {

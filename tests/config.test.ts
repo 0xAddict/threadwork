@@ -1,18 +1,32 @@
 import { describe, test, expect } from 'bun:test'
-import { SELF_LABEL, AGENT_SESSIONS, assertAgentIdentity } from '../config'
+import { AGENT_SESSIONS, assertAgentIdentityOrThrow } from '../config'
 
-describe('assertAgentIdentity', () => {
-  test('throws when SELF_LABEL is "unknown"', () => {
-    // In test environment, AGENT_LABEL is not set, so SELF_LABEL === 'unknown'
-    expect(SELF_LABEL).toBe('unknown')
-    expect(() => assertAgentIdentity()).toThrow('FATAL: AGENT_LABEL env var not set')
+describe('assertAgentIdentityOrThrow', () => {
+  test('throws when label is "unknown"', () => {
+    // Pure helper — does not rely on process.env.AGENT_LABEL state, which is
+    // captured by SELF_LABEL at module load and cannot be mutated by tests.
+    // This makes the test robust in agent-runtime environments where
+    // AGENT_LABEL is exported by the tmux session.
+    expect(() => assertAgentIdentityOrThrow('unknown')).toThrow(
+      'FATAL: AGENT_LABEL env var not set',
+    )
   })
 
-  test('does not throw when SELF_LABEL is a valid agent name', () => {
-    // We can't easily change SELF_LABEL (it's a const), so we test the function's
-    // logic indirectly: if SELF_LABEL were valid, the function would not throw.
-    // Since we can verify the function exists and the throw path works,
-    // we validate the non-throw path by checking AGENT_SESSIONS keys.
+  test('does not throw for valid agent labels', () => {
+    for (const agent of Object.keys(AGENT_SESSIONS)) {
+      expect(() => assertAgentIdentityOrThrow(agent)).not.toThrow()
+    }
+  })
+
+  test('does not throw for any non-"unknown" string', () => {
+    // The contract is: reject the sentinel 'unknown' fallback. Any other
+    // label is trusted — the caller is responsible for validating labels
+    // against AGENT_SESSIONS if stricter behavior is needed.
+    expect(() => assertAgentIdentityOrThrow('boss')).not.toThrow()
+    expect(() => assertAgentIdentityOrThrow('steve')).not.toThrow()
+  })
+
+  test('AGENT_SESSIONS is non-empty and contains boss', () => {
     const validAgents = Object.keys(AGENT_SESSIONS)
     expect(validAgents.length).toBeGreaterThan(0)
     expect(validAgents).toContain('boss')
