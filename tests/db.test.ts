@@ -71,3 +71,61 @@ describe('TaskDB', () => {
     expect(notes[0].message).toBe('Make sure to update the CTA too')
   })
 })
+
+describe('fault_count decay on successful heartbeat', () => {
+  let db: TaskDB
+
+  beforeEach(() => {
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(TEST_DB + suffix) } catch {}
+    }
+    db = new TaskDB(TEST_DB)
+  })
+
+  test('successful heartbeat decrements fault_count by 1', () => {
+    // Register agent with fault_count=3
+    db.upsertAgentSession('steve', 'sess-1', 'active')
+    db.run(d => {
+      d.prepare('UPDATE agent_sessions SET fault_count = 3 WHERE agent = ?').run('steve')
+    })
+
+    // Create and claim a task for steve
+    const task = db.createTask({ from: 'boss', to: 'steve', description: 'test', priority: 'normal' })
+    db.claimTask(task.id, 'steve')
+
+    // First successful (non-blocked) heartbeat -> fault_count should go from 3 to 2
+    db.updateHeartbeat({ taskId: task.id, agent: 'steve' })
+    let state = db.getCircuitState('steve')
+    expect(state?.fault_count).toBe(2)
+
+    // Second successful heartbeat -> 2 to 1
+    db.updateHeartbeat({ taskId: task.id, agent: 'steve' })
+    state = db.getCircuitState('steve')
+    expect(state?.fault_count).toBe(1)
+
+    // Third -> 1 to 0
+    db.updateHeartbeat({ taskId: task.id, agent: 'steve' })
+    state = db.getCircuitState('steve')
+    expect(state?.fault_count).toBe(0)
+
+    // Fourth -> bounded at 0, should NOT go negative
+    db.updateHeartbeat({ taskId: task.id, agent: 'steve' })
+    state = db.getCircuitState('steve')
+    expect(state?.fault_count).toBe(0)
+  })
+
+  test('blocked heartbeat does NOT decay fault_count', () => {
+    db.upsertAgentSession('steve', 'sess-1', 'active')
+    db.run(d => {
+      d.prepare('UPDATE agent_sessions SET fault_count = 3 WHERE agent = ?').run('steve')
+    })
+
+    const task = db.createTask({ from: 'boss', to: 'steve', description: 'test', priority: 'normal' })
+    db.claimTask(task.id, 'steve')
+
+    // Blocked heartbeat should NOT decay
+    db.updateHeartbeat({ taskId: task.id, agent: 'steve', isBlocked: true, blockedReason: 'waiting on API' })
+    const state = db.getCircuitState('steve')
+    expect(state?.fault_count).toBe(3)
+  })
+})
