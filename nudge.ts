@@ -48,6 +48,8 @@ export interface NudgeOptions {
   urgency?: NudgeUrgency
   /** Skip debounce entirely for this call (e.g., raw test harness). */
   bypassDebounce?: boolean
+  /** Source agent label for audit attribution (who is nudging). Defaults to 'watchdog'. */
+  source?: string
 }
 
 async function sendTmux(session: string, message: string): Promise<{ ok: boolean; error?: string }> {
@@ -60,6 +62,16 @@ async function sendTmux(session: string, message: string): Promise<{ ok: boolean
     return { ok: false, error: `tmux failed (exit ${exitCode}): ${stderr.trim()}` }
   }
   return { ok: true }
+}
+
+// The canonical `agent_nudged` audit write. Fires ONLY when keystrokes actually
+// reached a live tmux pane. Any other write to audit_log with action='agent_nudged'
+// anywhere in the codebase is a bug — use grep to enforce this invariant.
+function logAgentNudged(source: string, agent: string, message: string): void {
+  if (!_debounceAudit) return
+  try {
+    _debounceAudit.log(source, 'agent_nudged', { target: agent, message })
+  } catch { /* audit failure must never break a nudge decision */ }
 }
 
 export async function nudgeAgent(
@@ -79,20 +91,27 @@ export async function nudgeAgent(
   }
 
   const urgency: NudgeUrgency = options?.urgency ?? 'normal'
+  const source = options?.source ?? 'watchdog'
 
   // If debounce hasn't been configured, or the caller explicitly opted out,
-  // fall back to direct send (legacy behavior).
+  // fall back to direct send (legacy behavior). Still emit the canonical
+  // agent_nudged audit row on successful send.
   if (!_debounceDb || options?.bypassDebounce) {
-    return sendTmux(session, message)
+    const sendResult = await sendTmux(session, message)
+    if (sendResult.ok) {
+      logAgentNudged(source, agent, message)
+    }
+    return sendResult
   }
 
   const result = tryNudge(_debounceDb, agent, urgency)
 
   if (!result.shouldFire) {
     // Suppressed — audit-log for metrics (v_nudge_metrics_24h view).
+    // CRITICAL: do NOT write agent_nudged here. Suppressed = no keystrokes = no nudge event.
     if (_debounceAudit) {
       try {
-        _debounceAudit.log('watchdog', 'nudge_suppressed', {
+        _debounceAudit.log(source, 'nudge_suppressed', {
           target: agent,
           urgency,
           reason: result.reason ?? 'debounced',
@@ -111,7 +130,7 @@ export async function nudgeAgent(
 
   if (_debounceAudit) {
     try {
-      _debounceAudit.log('watchdog', 'nudge_fired', {
+      _debounceAudit.log(source, 'nudge_fired', {
         target: agent,
         urgency,
         reason: result.reason ?? 'window_elapsed',
@@ -121,5 +140,11 @@ export async function nudgeAgent(
   }
 
   const sendResult = await sendTmux(session, payload)
+  // Canonical agent_nudged write — only on successful keystroke delivery.
+  // Server.ts and watchdog.ts MUST NOT write audit_log('agent_nudged') directly;
+  // this is the single source of truth for that audit row.
+  if (sendResult.ok) {
+    logAgentNudged(source, agent, payload)
+  }
   return { ...sendResult, suppressed: false, pendingCount: result.pendingCount }
 }

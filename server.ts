@@ -832,14 +832,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'nudge_agent': {
         const agent = (args.agent as string).toLowerCase()
         const message = args.message as string
-        const result = await nudgeAgent(agent, message)
+        const result = await nudgeAgent(agent, message, { source: SELF_LABEL })
 
         if (!result.ok) {
           return { content: [{ type: 'text', text: `Nudge failed: ${result.error}`, isError: true }] }
         }
 
         await postToGroup(formatNudge(SELF_LABEL, agent, message))
-        audit.log(SELF_LABEL, 'agent_nudged', { target: agent, message })
+        // NOTE: audit_log('agent_nudged') is now written INSIDE nudgeAgent() on the
+        // successful sendTmux path only. Do NOT add a direct write here — that was
+        // the exact bug fixed in sprint #256: unconditional audit after debounce-suppressed
+        // or test-disabled nudges made the log lie about keystroke delivery.
         return { content: [{ type: 'text', text: `Nudged ${agent}: ${message}` }] }
       }
 
