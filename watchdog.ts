@@ -9,7 +9,7 @@ import { TaskDB, type Task } from './db'
 import { MemoryDB } from './memory'
 import { DecisionDB, expireStaleDecisions, type Decision, type DecisionWithDetail } from './decision'
 import { AuditLog } from './audit'
-import { nudgeAgent, configureNudgeDebounce } from './nudge'
+import { dispatchAgentNudge, configureNudgeDebounce } from './nudge'
 import { postToGroup, formatDecisionExpired, esc } from './notify'
 import { checkAndRunDebrief } from './debrief'
 import {
@@ -274,7 +274,7 @@ export class TaskReconciler {
     log(`Relaying blocked status for task #${task.id} to ${supervisor}`)
 
     // Nudge supervisor
-    await nudgeAgent(supervisor, msg)
+    await dispatchAgentNudge(supervisor, msg)
 
     // Post to Telegram for visibility
     await postToGroup(`\u26a0\ufe0f ${esc(msg)}`)
@@ -331,7 +331,7 @@ export class TaskReconciler {
     })
 
     // Notify boss (do NOT nudge the dead worker)
-    await nudgeAgent('boss', `DEAD SESSION: Task #${task.id} (${task.to_agent}) \u2014 worker session is dead. Escalation task created.`)
+    await dispatchAgentNudge('boss', `DEAD SESSION: Task #${task.id} (${task.to_agent}) \u2014 worker session is dead. Escalation task created.`)
     await postToGroup(`\ud83d\udea8 DEAD SESSION: Task \\#${task.id} \\(${esc(task.to_agent)}\\) \u2014 worker session dead\\. Escalated to Boss\\.`)
 
     this.audit.log('watchdog', 'dead_session_escalation', {
@@ -387,7 +387,7 @@ export class TaskReconciler {
     if (faultResult.circuit_state === 'open') {
       log(`Circuit OPEN for ${task.to_agent} (${faultResult.fault_count} faults). Alerting boss.`)
       await this.taskDb.run(async () => {}) // no-op, just for type
-      await nudgeAgent('boss', `Circuit OPEN for ${task.to_agent}: ${faultResult.fault_count} consecutive faults. Agent degraded.`, { urgency: 'urgent' })
+      await dispatchAgentNudge('boss', `Circuit OPEN for ${task.to_agent}: ${faultResult.fault_count} consecutive faults. Agent degraded.`, { urgency: 'urgent' })
       await postToGroup(`\u26a0\ufe0f Circuit breaker OPEN for ${esc(task.to_agent)} \\- ${faultResult.fault_count} faults`)
     }
 
@@ -398,7 +398,7 @@ export class TaskReconciler {
     } else {
       // Nudge the worker
       const msg = `Heartbeat overdue: Task #${task.id} has not sent a heartbeat in ${timeoutSec}s. Send a write_status update. (escalation level ${newLevel}/3)`
-      await nudgeAgent(task.to_agent, msg)
+      await dispatchAgentNudge(task.to_agent, msg)
       result.nudged++
     }
 
@@ -436,10 +436,10 @@ export class TaskReconciler {
     const msg = `Progress overdue: Task #${task.id} (${task.to_agent}) \u2014 worker is alive but no progress in ${timeoutSec}s. (escalation level ${newLevel})`
 
     // Nudge the supervisor
-    await nudgeAgent(supervisor, msg)
+    await dispatchAgentNudge(supervisor, msg)
 
     // Also nudge the worker
-    await nudgeAgent(task.to_agent, `Progress check: Task #${task.id} \u2014 no progress update in ${timeoutSec}s. Send write_status with progress=true.`)
+    await dispatchAgentNudge(task.to_agent, `Progress check: Task #${task.id} \u2014 no progress update in ${timeoutSec}s. Send write_status with progress=true.`)
 
     // Update escalation level
     this.taskDb.run(db => {
@@ -474,7 +474,7 @@ export class TaskReconciler {
     log(`Unclaimed task #${task.id} assigned to ${task.to_agent} (level ${newLevel})`)
 
     const msg = `Reminder: Task #${task.id} is pending and assigned to you: ${task.description}`
-    await nudgeAgent(task.to_agent, msg)
+    await dispatchAgentNudge(task.to_agent, msg)
 
     // Update escalation level and next_check_at
     this.taskDb.run(db => {
@@ -558,7 +558,7 @@ export class TaskReconciler {
       `).run(escalationDesc)
     })
 
-    await nudgeAgent('boss', `Escalation L${level}: Task #${task.id} (${task.to_agent}) \u2014 ${reason}`)
+    await dispatchAgentNudge('boss', `Escalation L${level}: Task #${task.id} (${task.to_agent}) \u2014 ${reason}`)
     await postToGroup(`\ud83d\udea8 Escalation L${level}: Task \\#${task.id} \\(${esc(task.to_agent)}\\) \\- ${esc(reason)}`)
 
     this.audit.log('watchdog', 'escalation_created', {
@@ -817,7 +817,7 @@ export class TaskReconciler {
       const agentsToNudge = [...WORKER_AGENTS]
       const nudgeMsg = `Decision #${d.id} "${d.title}" has been open for ${Math.floor(ageMs / 60000)} min with no positions. Please submit your position.`
       for (const agent of agentsToNudge) {
-        await nudgeAgent(agent, nudgeMsg)
+        await dispatchAgentNudge(agent, nudgeMsg)
       }
 
       this.audit.log('watchdog', 'decision_position_nudge', {
@@ -872,7 +872,7 @@ export class TaskReconciler {
 
       // Notify Boss
       const readyMsg = `Decision #${d.id} "${d.title}" has ${distinctAgents.size} position(s) from [${[...distinctAgents].join(', ')}] and is ready to finalize.`
-      await nudgeAgent(BOSS_AGENT, readyMsg)
+      await dispatchAgentNudge(BOSS_AGENT, readyMsg)
       await postToGroup(`\u2705 Decision \\#${d.id} ready to finalize: "${esc(d.title)}" \\- ${distinctAgents.size} positions in\\.`)
 
       this.audit.log('watchdog', 'decision_ready_to_finalize', {
@@ -1020,7 +1020,7 @@ export class TaskReconciler {
         const summary = parts.join(' and ')
         const nudgeMsg = `Board check: You have ${summary}. Run list_tasks and list_decisions to catch up.`
 
-        await nudgeAgent(agent, nudgeMsg)
+        await dispatchAgentNudge(agent, nudgeMsg)
 
         this.audit.log('watchdog', 'idle_board_nudge', {
           agent,

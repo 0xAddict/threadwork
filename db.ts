@@ -602,7 +602,7 @@ export class TaskDB {
           al.created_at,
           CAST(json_extract(al.detail, '$.pending_count') AS INTEGER) AS pending_count
         FROM audit_log al, window_bounds wb
-        WHERE al.action IN ('nudge_fired', 'nudge_suppressed')
+        WHERE al.action IN ('nudge_fired', 'nudge_suppressed', 'nudge_sent', 'nudge_delivery_failed', 'agent_nudged')
           AND al.created_at >= wb.window_start
       )
       SELECT
@@ -611,11 +611,25 @@ export class TaskDB {
         s.target,
         SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS nudges_fired_24h,
         SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS nudges_suppressed_24h,
+        -- Sprint #256 gate 5: canonical delivery outcome strings.
+        SUM(CASE WHEN s.action = 'nudge_sent' THEN 1 ELSE 0 END) AS nudges_sent_24h,
+        SUM(CASE WHEN s.action = 'nudge_delivery_failed' THEN 1 ELSE 0 END) AS nudges_delivery_failed_24h,
+        -- Legacy alias kept for metrics continuity with pre-sprint-#256 rows.
+        SUM(CASE WHEN s.action = 'agent_nudged' THEN 1 ELSE 0 END) AS agent_nudged_legacy_24h,
         CASE
           WHEN (SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END)) = 0 THEN 0.0
           ELSE CAST(SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS REAL)
              / CAST(SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END) AS REAL)
         END AS suppression_rate,
+        -- delivery_rate = sent / fired. A dispatcher that's healthy will see this
+        -- hover near 1.0. If it dips below 1.0 persistently, the tmux send-keys
+        -- layer is failing after the fire decision. The exact bug sprint #256
+        -- was diagnosing.
+        CASE
+          WHEN SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) = 0 THEN 1.0
+          ELSE CAST(SUM(CASE WHEN s.action = 'nudge_sent' THEN 1 ELSE 0 END) AS REAL)
+             / CAST(SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS REAL)
+        END AS delivery_rate,
         COALESCE(
           AVG(CASE WHEN s.action = 'nudge_fired' THEN s.pending_count END),
           0.0
@@ -641,7 +655,7 @@ export class TaskDB {
           al.action,
           al.created_at
         FROM audit_log al, window_bounds wb
-        WHERE al.action IN ('nudge_fired', 'nudge_suppressed')
+        WHERE al.action IN ('nudge_fired', 'nudge_suppressed', 'nudge_sent', 'nudge_delivery_failed', 'agent_nudged')
           AND al.created_at >= wb.window_start
       )
       SELECT
@@ -649,11 +663,20 @@ export class TaskDB {
         wb.window_end,
         SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS nudges_fired_24h,
         SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS nudges_suppressed_24h,
+        SUM(CASE WHEN s.action = 'nudge_sent' THEN 1 ELSE 0 END) AS nudges_sent_24h,
+        SUM(CASE WHEN s.action = 'nudge_delivery_failed' THEN 1 ELSE 0 END) AS nudges_delivery_failed_24h,
+        SUM(CASE WHEN s.action = 'agent_nudged' THEN 1 ELSE 0 END) AS agent_nudged_legacy_24h,
         CASE
-          WHEN COUNT(*) = 0 THEN 0.0
+          WHEN SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END) = 0 THEN 0.0
           ELSE CAST(SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS REAL)
-             / CAST(COUNT(*) AS REAL)
-        END AS suppression_rate
+             / CAST(SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END) AS REAL)
+        END AS suppression_rate,
+        -- delivery_rate uses fired as denominator (every fire should produce a sent)
+        CASE
+          WHEN SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) = 0 THEN 1.0
+          ELSE CAST(SUM(CASE WHEN s.action = 'nudge_sent' THEN 1 ELSE 0 END) AS REAL)
+             / CAST(SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS REAL)
+        END AS delivery_rate
       FROM scoped s, window_bounds wb
       GROUP BY wb.window_start, wb.window_end;
     `)
