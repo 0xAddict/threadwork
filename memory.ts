@@ -195,8 +195,15 @@ export class MemoryDB {
       const params: unknown[] = [agent, 'shared']
 
       if (filter.query) {
-        conditions.push('content LIKE ?')
-        params.push(`%${filter.query}%`)
+        const normalized = this.normalizeContent(filter.query)
+        if (normalized.length > 0) {
+          const tokens = normalized.split(' ').filter(t => t.length > 0)
+          for (const token of tokens) {
+            const escaped = token.replace(/%/g, '\\%').replace(/_/g, '\\_')
+            conditions.push("LOWER(content) LIKE ? ESCAPE '\\'")
+            params.push(`%${escaped}%`)
+          }
+        }
       }
       if (filter.category) {
         conditions.push('category = ?')

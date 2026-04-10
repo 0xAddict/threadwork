@@ -717,7 +717,16 @@ export class TaskDB {
           WHERE id = ?
           RETURNING *
         `)
-        return stmt.get(timeoutSec, input.taskId) as Task | null
+        const updated = stmt.get(timeoutSec, input.taskId) as Task | null
+
+        // Decay fault_count on successful heartbeat (bounded at 0, not a full reset)
+        if (updated) {
+          db.prepare(`
+            UPDATE agent_sessions SET fault_count = MAX(0, COALESCE(fault_count, 0) - 1) WHERE agent = ?
+          `).run(task.to_agent)
+        }
+
+        return updated
       }
     })
   }

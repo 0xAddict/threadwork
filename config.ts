@@ -30,6 +30,19 @@ if (SELF_LABEL === 'unknown') {
   console.error('[task-board] WARNING: AGENT_LABEL env var not set — SELF_LABEL is "unknown". Set AGENT_LABEL to one of: ' + Object.keys(AGENT_SESSIONS).join(', '))
 }
 
+/**
+ * Call at server startup to crash immediately if AGENT_LABEL is unset.
+ * Tests never run server.ts main, so they bypass this check safely.
+ */
+export function assertAgentIdentity(): void {
+  if (SELF_LABEL === 'unknown') {
+    throw new Error(
+      'FATAL: AGENT_LABEL env var not set. Cannot start with unknown identity. Set AGENT_LABEL to one of: ' +
+        Object.keys(AGENT_SESSIONS).join(', '),
+    )
+  }
+}
+
 // Absolute path to tmux binary
 export const TMUX_PATH = '/Users/coachstokes/.local/bin/tmux'
 
