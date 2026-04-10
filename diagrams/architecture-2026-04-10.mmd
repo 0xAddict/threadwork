@@ -1,0 +1,99 @@
+%% Explorer -> Planner -> Executor -> Verifier Framework
+%% Task #264, sadie, 2026-04-10
+flowchart TD
+    User([Boss / User])
+    Harness[/harness goal/]
+    User --> Harness
+
+    subgraph EXPLORE["PHASE 1 — EXPLORE (read-only)"]
+        E1[Explorer 1<br/>Sonnet 4.6]
+        E2[Explorer 2<br/>Sonnet 4.6]
+        E3[Explorer 3<br/>Sonnet 4.6]
+        E4[Explorer 4<br/>Sonnet 4.6]
+    end
+    Harness -->|spawn parallel| E1
+    Harness -->|spawn parallel| E2
+    Harness -->|spawn parallel| E3
+    Harness -->|spawn parallel| E4
+
+    ExpOut[/exploration/*.md<br/>done.txt/]
+    E1 --> ExpOut
+    E2 --> ExpOut
+    E3 --> ExpOut
+    E4 --> ExpOut
+
+    subgraph PLAN["PHASE 2 — PLAN"]
+        Planner[Planner<br/>Opus]
+    end
+    ExpOut --> Planner
+
+    ContractJSON[(contract.json)]
+    Planner -->|emits| ContractJSON
+
+    Gate1{{spec_gate.sh<br/>contract-sign}}
+    ContractJSON --> Gate1
+    Gate1 -->|signed hash| ContractVerified[(contract.json<br/>signed)]
+
+    subgraph IMPLEMENT["PHASE 3 — IMPLEMENT (parallel lanes)"]
+        X1[Executor lane-1<br/>Sonnet 4.6]
+        X2[Executor lane-2<br/>Sonnet 4.6]
+        X3[Executor lane-3<br/>Sonnet 4.6]
+        Xn[Executor lane-N<br/>Sonnet 4.6]
+    end
+    ContractVerified --> X1
+    ContractVerified --> X2
+    ContractVerified --> X3
+    ContractVerified --> Xn
+
+    Gate2{{spec_gate.sh<br/>lane-scope<br/>per lane}}
+    X1 --> Gate2
+    X2 --> Gate2
+    X3 --> Gate2
+    Xn --> Gate2
+
+    subgraph VERIFY["PHASE 4 — VERIFY (parallel)"]
+        V1[Verifier lane-1<br/>Opus]
+        V2[Verifier lane-2<br/>Opus]
+        V3[Verifier lane-3<br/>Opus]
+        Vn[Verifier lane-N<br/>Opus]
+    end
+    Gate2 -->|scope ok| V1
+    Gate2 -->|scope ok| V2
+    Gate2 -->|scope ok| V3
+    Gate2 -->|scope ok| Vn
+
+    Reports[/lane-N/verifier-report.json/]
+    V1 --> Reports
+    V2 --> Reports
+    V3 --> Reports
+    Vn --> Reports
+
+    Gate3{{spec_gate.sh<br/>lane-verify<br/>per lane}}
+    Reports --> Gate3
+
+    Gate4{{spec_gate.sh<br/>sprint-close<br/>HARD GATE}}
+    Gate3 --> Gate4
+
+    Complete[complete_task]
+    Gate4 -->|exit 0| Complete
+    Gate4 -->|exit 1| Block[[BLOCK<br/>decision:block JSON<br/>via PreToolUse hook]]
+
+    GateLog[(gate.log<br/>append-only audit)]
+    Gate1 -.-> GateLog
+    Gate2 -.-> GateLog
+    Gate3 -.-> GateLog
+    Gate4 -.-> GateLog
+
+    classDef hardgate fill:#ff6b6b,stroke:#c92a2a,color:#fff,stroke-width:3px;
+    classDef gate fill:#ffa94d,stroke:#d9480f,color:#000;
+    classDef opus fill:#845ef7,stroke:#5f3dc4,color:#fff;
+    classDef sonnet fill:#4dabf7,stroke:#1864ab,color:#fff;
+    classDef block fill:#212529,stroke:#000,color:#fff;
+    classDef audit fill:#868e96,stroke:#495057,color:#fff,stroke-dasharray: 5 5;
+
+    class E1,E2,E3,E4,X1,X2,X3,Xn sonnet;
+    class Planner,V1,V2,V3,Vn opus;
+    class Gate1,Gate2,Gate3 gate;
+    class Gate4 hardgate;
+    class Block block;
+    class GateLog audit;

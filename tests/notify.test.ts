@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test'
-import { formatTaskCreated, formatTaskCompleted, formatTaskClaimed } from '../notify'
+import { formatTaskCreated, formatTaskCompleted, formatTaskClaimed, esc } from '../notify'
 
 describe('notify formatting', () => {
   test('formatTaskCreated produces correct status message', () => {
@@ -37,5 +37,29 @@ describe('notify formatting', () => {
     })
     expect(msg).toContain('#5')
     expect(msg).toContain('steve')
+  })
+
+  test('esc function escapes MarkdownV2 special characters', () => {
+    expect(esc('#')).toBe('\\#')
+    expect(esc('Task #5')).toBe('Task \\#5')
+    expect(esc('(test)')).toBe('\\(test\\)')
+    expect(esc('hello.world')).toBe('hello\\.world')
+    expect(esc('a-b')).toBe('a\\-b')
+    expect(esc('plain')).toBe('plain')
+  })
+
+  test('esc is exported and usable for inline watchdog messages', () => {
+    // This verifies the Sprint 2 fix: esc is now exported from notify.ts
+    // so watchdog.ts can use it for inline postToGroup calls
+    const msg = `Decision \\#${42} ready to finalize: "${esc('My Decision')}" \\- ${3} positions in\\.`
+    expect(msg).toContain('\\#42')
+    expect(msg).toContain('My Decision') // title is escaped but has no special chars here
+    expect(msg).toContain('\\-')
+    expect(msg).toContain('\\.')
+
+    // Verify that a title with special chars gets properly escaped
+    const msg2 = `Decision \\#${7} ready to finalize: "${esc('Use #hashtag (beta)')}" \\- ${2} positions in\\.`
+    expect(msg2).toContain('\\#hashtag')
+    expect(msg2).toContain('\\(beta\\)')
   })
 })

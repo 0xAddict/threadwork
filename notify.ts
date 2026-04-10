@@ -2,7 +2,7 @@ import type { Task } from './db'
 import { TELEGRAM_GROUP_ID, getTelegramToken } from './config'
 
 /** Escape special characters for Telegram MarkdownV2 */
-function esc(text: string): string {
+export function esc(text: string): string {
   return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1')
 }
 
@@ -38,7 +38,14 @@ export function formatDecisionExpired(decision: { id: number; title: string }): 
   return `\u23F0 *Decision \\#${decision.id} expired*\n${esc(decision.title)}`
 }
 
+// Test-mode guard: prevents tests from posting real Telegram group messages
+// when they use isolated test DBs but call through real side-effectful functions.
+const POST_DISABLED =
+  process.env.NODE_ENV === 'test' ||
+  process.env.THREADWORK_NUDGE_DISABLE === '1'
+
 export async function postToGroup(text: string): Promise<void> {
+  if (POST_DISABLED) return
   const token = getTelegramToken()
   if (!token) return
 
