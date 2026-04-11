@@ -26,6 +26,13 @@ import {
 } from './config'
 
 // ---------------------------------------------------------------------------
+// Blocked state TTL — if a worker reports blocked and then dies, stop relaying
+// after this many seconds without a fresh heartbeat.
+// ---------------------------------------------------------------------------
+
+const BLOCKED_TTL_SEC = 600 // 10 minutes
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -219,10 +226,38 @@ export class TaskReconciler {
    * Reconcile a single due task based on its state.
    */
   private async reconcileTask(task: Task, result: ReconcileResult): Promise<void> {
-    // (a) BLOCKED: relay to supervisor immediately
+    // (a) BLOCKED: relay to supervisor — but check TTL first
     if (task.blocked_at) {
-      await this.handleBlocked(task, result)
-      return
+      const blockedStale = this.isOverdue(task.blocked_at, BLOCKED_TTL_SEC)
+      const heartbeatFresh = task.last_heartbeat_at
+        && new Date(task.last_heartbeat_at + 'Z').getTime() > new Date(task.blocked_at + 'Z').getTime()
+
+      if (blockedStale && !heartbeatFresh) {
+        // Worker reported blocked but has gone silent — clear blocked state
+        // and fall through to normal crash/heartbeat checks.
+        // Capture timestamps BEFORE clearing so the audit row preserves forensics.
+        const blockedSince = task.blocked_at
+        const lastHeartbeat = task.last_heartbeat_at
+        log(`Blocked TTL expired for task #${task.id} (blocked ${blockedSince}, last heartbeat ${lastHeartbeat}) — clearing blocked state`)
+        this.taskDb.run(db => {
+          db.prepare(`
+            UPDATE tasks SET blocked_at = NULL, blocked_reason = NULL WHERE id = ?
+          `).run(task.id)
+        })
+        this.audit.log('watchdog', 'blocked_ttl_expired', {
+          task_id: task.id,
+          agent: task.to_agent,
+          blocked_since: blockedSince,
+          last_heartbeat: lastHeartbeat,
+        }, task.id)
+        // Refresh the task object so downstream checks see cleared state
+        task.blocked_at = null
+        task.blocked_reason = null
+        // DO NOT return — fall through to (b), (c), (d), (e), (f)
+      } else {
+        await this.handleBlocked(task, result)
+        return
+      }
     }
 
     // (b) PENDING (unclaimed): nudge the assigned agent
@@ -301,8 +336,19 @@ export class TaskReconciler {
 
     log(`Dead session detected for task #${task.id} (worker: ${task.to_agent})`)
 
-    // Sprint 4: Record crash fault
-    this.taskDb.recordFault(task.to_agent, 'crash')
+    // Sprint 4: Record crash fault.
+    // S2.1 parity: subagent tasks carry to_agent = supervisor (parent). A crashed
+    // subagent must NOT charge the parent's circuit breaker — same reasoning as the
+    // heartbeat overdue guard in handleHeartbeatOverdue.
+    if (task.kind === 'subagent') {
+      log(`Subagent task #${task.id} dead session — skipping parent fault (parent: ${task.to_agent})`)
+      this.audit.log('watchdog', 'subagent_dead_session', {
+        task_id: task.id,
+        parent_agent: task.to_agent,
+      }, task.id)
+    } else {
+      this.taskDb.recordFault(task.to_agent, 'crash')
+    }
 
     // Check if an escalation task already exists for this
     if (this.escalationExists(task.id, level + 1)) {
@@ -355,12 +401,25 @@ export class TaskReconciler {
     log(`Heartbeat overdue for task #${task.id} (worker: ${task.to_agent}, level ${level} -> ${newLevel})`)
 
     // Sprint 4: Record fault and check circuit breaker
-    const faultResult = this.taskDb.recordFault(task.to_agent, 'timeout')
-    if (faultResult.circuit_state === 'open') {
-      log(`Circuit OPEN for ${task.to_agent} (${faultResult.fault_count} faults). Alerting boss.`)
-      await this.taskDb.run(async () => {}) // no-op, just for type
-      await nudgeAgent('boss', `Circuit OPEN for ${task.to_agent}: ${faultResult.fault_count} consecutive faults. Agent degraded.`)
-      await postToGroup(`\u26a0\ufe0f Circuit breaker OPEN for ${esc(task.to_agent)} \\- ${faultResult.fault_count} faults`)
+    // S2.1 fix: Do NOT charge subagent heartbeat faults to the parent's circuit breaker.
+    // Subagent tasks have to_agent = supervisor (parent), so faulting to_agent would
+    // penalize the parent for a child's timeout.
+    if (task.kind === 'subagent') {
+      log(`Subagent task #${task.id} heartbeat overdue — skipping parent fault (parent: ${task.to_agent})`)
+      this.audit.log('watchdog', 'subagent_heartbeat_overdue', {
+        task_id: task.id,
+        parent_agent: task.to_agent,
+        timeout_sec: timeoutSec,
+        escalation_level: newLevel,
+      }, task.id)
+    } else {
+      const faultResult = this.taskDb.recordFault(task.to_agent, 'timeout')
+      if (faultResult.circuit_state === 'open') {
+        log(`Circuit OPEN for ${task.to_agent} (${faultResult.fault_count} faults). Alerting boss.`)
+        await this.taskDb.run(async () => {}) // no-op, just for type
+        await nudgeAgent('boss', `Circuit OPEN for ${task.to_agent}: ${faultResult.fault_count} consecutive faults. Agent degraded.`)
+        await postToGroup(`\u26a0\ufe0f Circuit breaker OPEN for ${esc(task.to_agent)} \\- ${faultResult.fault_count} faults`)
+      }
     }
 
     if (newLevel >= 3) {
