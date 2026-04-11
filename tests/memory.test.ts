@@ -286,6 +286,128 @@ describe('supersedeMemory', () => {
   })
 })
 
+describe('recallMemories query normalization (S3.1)', () => {
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(TEST_DB + suffix) } catch {}
+    }
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+
+  test('case insensitive: lowercase query matches mixed-case content', () => {
+    mem.saveMemory({ agent: 'steve', content: 'Shopify API returns UTC', category: 'learning' })
+    const results = mem.recallMemories('steve', { query: 'shopify api' })
+    expect(results).toHaveLength(1)
+    expect(results[0].content).toBe('Shopify API returns UTC')
+  })
+
+  test('token order: reversed tokens still match', () => {
+    mem.saveMemory({ agent: 'steve', content: 'Shopify API returns UTC', category: 'learning' })
+    const results = mem.recallMemories('steve', { query: 'UTC Shopify' })
+    expect(results).toHaveLength(1)
+    expect(results[0].content).toBe('Shopify API returns UTC')
+  })
+
+  test('numeric query: recall with just a number', () => {
+    mem.saveMemory({ agent: 'steve', content: 'Campaign #381 had 2x ROAS', category: 'learning' })
+    const results = mem.recallMemories('steve', { query: '381' })
+    expect(results).toHaveLength(1)
+    expect(results[0].content).toContain('381')
+  })
+
+  test('LIKE wildcard escape: underscore is literal, not wildcard', () => {
+    mem.saveMemory({ agent: 'steve', content: 'Use snake_case for params', category: 'learning' })
+    mem.saveMemory({ agent: 'steve', content: 'Use snakeXcase for params', category: 'learning' })
+    const results = mem.recallMemories('steve', { query: 'snake_case' })
+    expect(results).toHaveLength(1)
+    expect(results[0].content).toBe('Use snake_case for params')
+  })
+
+  test('extra whitespace: query with extra spaces still matches', () => {
+    mem.saveMemory({ agent: 'steve', content: 'Shopify API returns UTC', category: 'learning' })
+    const results = mem.recallMemories('steve', { query: '  shopify   api  ' })
+    expect(results).toHaveLength(1)
+    expect(results[0].content).toBe('Shopify API returns UTC')
+  })
+
+  test('whitespace-only query: treated as no filter', () => {
+    mem.saveMemory({ agent: 'steve', content: 'Some memory', category: 'learning' })
+    mem.saveMemory({ agent: 'steve', content: 'Another memory', category: 'fact' })
+    const results = mem.recallMemories('steve', { query: '   ' })
+    expect(results).toHaveLength(2)
+  })
+
+  test('Unicode NFC normalization: composed vs decomposed accents match', () => {
+    // 'café' written with a single precomposed character U+00E9 (é)
+    const composed = 'caf\u00e9 menu has great coffee'
+    // 'café' written with c + e + combining acute U+0301
+    const decomposed = 'caf\u0065\u0301'
+    // Sanity check: these byte sequences are different
+    expect(composed.includes(decomposed)).toBe(false)
+
+    mem.saveMemory({ agent: 'steve', content: composed, category: 'learning' })
+    // Query with the decomposed form — should find the composed content
+    // because normalizeContent applies NFC to both sides.
+    const results = mem.recallMemories('steve', { query: decomposed })
+    expect(results).toHaveLength(1)
+    expect(results[0].content).toBe(composed)
+  })
+
+  test('numeric ref with hash prefix: #381 matches content containing #381', () => {
+    mem.saveMemory({ agent: 'steve', content: 'Issue #381 blocked relay', category: 'learning' })
+    const results = mem.recallMemories('steve', { query: '#381' })
+    expect(results).toHaveLength(1)
+    expect(results[0].content).toContain('#381')
+  })
+
+  test('underscore vs hyphen: hyphen query does NOT match underscore content', () => {
+    mem.saveMemory({ agent: 'steve', content: 'blocked_relay circuit issue', category: 'learning' })
+    const results = mem.recallMemories('steve', { query: 'blocked-relay' })
+    expect(results).toHaveLength(0)
+  })
+})
+
+describe('recallMemories agent scoping (S3.3)', () => {
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(TEST_DB + suffix) } catch {}
+    }
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+
+  test('promoted-shared memory is visible to non-owner', () => {
+    const m = mem.saveMemory({ agent: 'steve', content: 'Steve discovered a shortcut', category: 'learning' })
+    mem.promoteMemory(m.id)
+    const results = mem.recallMemories('sadie', { query: 'shortcut' })
+    expect(results).toHaveLength(1)
+    expect(results[0].content).toBe('Steve discovered a shortcut')
+    expect(results[0].agent).toBe('shared')
+  })
+
+  test('non-owner cannot see another agents non-shared memories', () => {
+    mem.saveMemory({ agent: 'steve', content: 'Steve private secret', category: 'learning' })
+    const results = mem.recallMemories('sadie', { query: 'secret' })
+    expect(results).toHaveLength(0)
+  })
+
+  test('recall scope includes agents own AND shared memories', () => {
+    mem.saveMemory({ agent: 'steve', content: 'Steve own memory', category: 'learning' })
+    mem.saveMemory({ agent: 'shared', content: 'Shared team memory', category: 'fact' })
+    const results = mem.recallMemories('steve', { limit: 20 })
+    expect(results).toHaveLength(2)
+    const agents = results.map(r => r.agent).sort()
+    expect(agents).toEqual(['shared', 'steve'])
+  })
+})
+
 describe('saveMemory dedup', () => {
   let taskDb7: TaskDB
   let mem7: MemoryDB

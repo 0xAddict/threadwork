@@ -18,7 +18,7 @@ import {
   formatDecisionFinalized,
   formatDecisionExpired,
 } from './notify'
-import { DB_PATH, SELF_LABEL, AGENT_SESSIONS, TMUX_PATH, TEAM_AGENTS } from './config'
+import { DB_PATH, SELF_LABEL, AGENT_SESSIONS, TMUX_PATH, TEAM_AGENTS, assertAgentIdentity } from './config'
 
 import { MemoryDB } from './memory'
 import { DecisionDB, expireStaleDecisions } from './decision'
@@ -1511,6 +1511,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     return { content: [{ type: 'text', text: `Error: ${err}`, isError: true }] }
   }
 })
+
+// Fail fast if AGENT_LABEL env var is not set — prevents silent wrong-tenant writes
+assertAgentIdentity()
 
 await mcp.connect(new StdioServerTransport())
 
