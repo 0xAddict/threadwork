@@ -1,0 +1,34 @@
+{
+  "agent_name": "implementation-orchestrator",
+  "run_id": "GOD_20260410_1052_7928",
+  "created_at": "2026-04-10T10:52:00Z",
+  "allow_partial": false,
+  "tasks": [
+    {
+      "id": "A1",
+      "title": "Patch Group A — create dispatchAgentNudge() in nudge.ts",
+      "description": "Create or extend /Users/coachstokes/.claude/mcp-servers/task-board/nudge.ts to export a single dispatchAgentNudge(agentId, urgency, reason, source?) function. Responsibilities in order: (1) resolve target tmux session FRESH (stateless lookup against AGENT_SESSIONS in config.ts, NO cached pane/session handle), (2) run debounce.ts::tryNudge() if THREADWORK_DEBOUNCE_ENABLED flag is set, (3) if tryNudge returned suppress, write audit_log with reason='debounced' and return, (4) if tryNudge returned send, invoke tmux send-keys via the stateless pane lookup, (5) write audit_log with action='agent_nudged' on successful send, OR action='agent_nudge_failed' on send-keys failure. No direct audit_log or send-keys outside this function."
+    },
+    {
+      "id": "A2",
+      "title": "Patch Group B — consolidate 5 callsites in server.ts",
+      "description": "Find ALL 5 nudge callsites in /Users/coachstokes/.claude/mcp-servers/task-board/server.ts. Each callsite currently writes audit_log and/or invokes tmux send-keys directly. Replace each with a single call to dispatchAgentNudge() imported from nudge.ts. Remove the direct audit_log writes and direct tmux send-keys invocations from the callsites. The 5 callsites include at minimum: nudge_agent tool handler, interrupt_agent tool handler, watchdog blocked_relay nudge, watchdog stall_escalation nudge, watchdog decision_ready_to_finalize nudge. If there are additional unlisted paths found during implementation, consolidate those too."
+    },
+    {
+      "id": "A3",
+      "title": "Patch Group C — write unit + integration tests",
+      "description": "Add Bun tests covering: (1) dispatchAgentNudge with tryNudge returning suppress writes audit_log with reason='debounced', (2) dispatchAgentNudge with tryNudge returning send writes audit_log with action='agent_nudged' AND invokes tmux send-keys, (3) dispatchAgentNudge with stateless pane lookup hitting a dead tmux session writes audit_log with action='agent_nudge_failed' and does NOT throw, (4) integration test: spawn a real tmux session, call dispatchAgentNudge, observe keystrokes in the pane buffer (the test Sadie originally had that proved the bug — use the same test harness)."
+    },
+    {
+      "id": "A4",
+      "title": "Verify 11 spec gates",
+      "description": "Run each of the 11 hard spec gates from /Users/coachstokes/threadwork/sprints/2026-04-09-nudge-delivery-fix-spec.md against the ship. Gates include grep invariants (exactly one audit_log('agent_nudged') call in dispatchAgentNudge only; no direct send-keys outside dispatchAgentNudge or test files), bun test passes, bunx tsc passes, real-tmux integration test passes, debounce flow observed. Report pass/fail per gate."
+    },
+    {
+      "id": "A5",
+      "title": "Commit + update task #256",
+      "description": "Commit the changes on branch autoresearch/GOD_20260409_2229_6732. No --no-verify. Hooks must pass. Update task board #256 with final commit hash + gate results summary via complete_task."
+    }
+  ],
+  "completed": []
+}

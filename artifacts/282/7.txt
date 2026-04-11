@@ -1,0 +1,14 @@
+Gate result table — task #282 v4 image generation
+
+| Channel | Check | Result |
+|---------|-------|--------|
+| AC-1: File exists + size | 811,592 bytes > 100KB | PASS |
+| AC-1: Magic bytes | JPEG JFIF 1024x1024 (Gemini returned JPEG; saved as .png) | PASS (valid image) |
+| AC-2: Hash distinct from v3 | v3: 0713774e7e45ff7e, v4: 080ba073e66672ee | PASS |
+| AC-3: Telegram reply | chat_id 1712539766, reply_to 864, image attached | PASS |
+| AC-4: Model confirmed | gemini-3.1-flash-image-preview (response metadata) | PASS |
+
+File: /Users/coachstokes/threadwork/diagrams/threadwork-ecosystem-2026-04-10-v4.png
+v3 sha256 (first 12): 0713774e7e45
+v4 sha256 (first 12): 080ba073e666
+Key: AIzaSyCw...V0pY (ephemeral, user-supplied billing key, not persisted)

@@ -1,0 +1,47 @@
+# Retroactive Spec — Task #277: Gemini 3.1 Diagram Regen
+*Written retroactively on 2026-04-10 per Snoopy approval (Telegram msg 852) following spec-gate violation caught at msg 849.*
+
+---
+
+## Goal
+Update the nano-banana-mcp server to reference the correct Gemini 3.1 Flash Image model ID (`gemini-3.1-flash-image-preview`, brand name "Nano Banana 2"), regenerate the threadwork ecosystem diagram using that model, and persist the diagram as the canonical artifact.
+
+---
+
+## Inputs
+- nano-banana-mcp patched file: `/Users/coachstokes/.npm/_npx/42b071cd0a115f0d/node_modules/nano-banana-mcp/dist/index.js`
+- Diagram output path: `/Users/coachstokes/threadwork/diagrams/threadwork-ecosystem-2026-04-10-v3.png`
+- Canonical diagram path (overwrite): same as above (v3 replaces prior canonical)
+- Model brand: "Nano Banana 2" = `gemini-3.1-flash-image-preview`
+- Reference: ai.google.dev/gemini-api/docs/models
+
+---
+
+## Constraints
+- Must NOT leave any reference to deprecated model IDs (e.g., "Gemini 2.5") in the patched file
+- Must patch all occurrences of the old model ID (expect ≥2 lines at approx lines 190, 228, 299)
+- Memory must be saved AND promoted so all agents inherit the preference
+- Diagram file must be a valid PNG, >100 KB
+- Telegram acknowledgment required (reply to msg 847/848)
+
+---
+
+## Acceptance Criteria
+- [ ] **AC-1 Model ID confirmed** — `gemini-3.1-flash-image-preview` is listed on ai.google.dev/gemini-api/docs/models and branded Nano Banana 2
+- [ ] **AC-2 MCP file patched** — `/Users/coachstokes/.npm/_npx/.../nano-banana-mcp/dist/index.js` contains ≥2 occurrences of `gemini-3.1-flash-image-preview` and zero occurrences of `Gemini 2.5`
+- [ ] **AC-3 Diagram saved** — `/Users/coachstokes/threadwork/diagrams/threadwork-ecosystem-2026-04-10-v3.png` exists, is a valid PNG, and is >100 KB
+- [ ] **AC-4 Memory persisted** — Memory #440 saved with content about Gemini 3.1 Flash Image / nano-banana preference, and promoted to all agents
+- [ ] **AC-5 Telegram acknowledged** — Reply sent to Telegram chat 1712539766, referencing msg 847/848, confirming task completion
+
+---
+
+## Verification Channels
+*Must be DIFFERENT from implementation channels. Implementation used: MCP tool calls + sub-agent's own write_status.*
+
+| AC | Verification Channel | Method |
+|----|---------------------|--------|
+| AC-1 | **Firecrawl re-fetch** | `mcp__claude_ai_Friecrawl_Stokes__Firecrawl_Execute_Tool` scrape of `https://ai.google.dev/gemini-api/docs/models` — confirm model ID and brand name appear in page content |
+| AC-2 | **Independent grep** | Bash `grep` of the patched file — expect ≥2 matches for `gemini-3.1-flash-image-preview`, expect 0 matches for `Gemini 2.5` |
+| AC-3 | **File-system inspection** | Bash `ls -la` + `file` + `wc -c` on the diagram path — confirm existence, PNG type, size >100 KB |
+| AC-4 | **recall_memories probe** | `mcp__task-board__recall_memories(query="Gemini 3.1 Flash Image nano-banana preference")` — expect memory #440 in results |
+| AC-5 | **Task note/status log inspection** | Review task #277 send_note entries and status log for entries mentioning Telegram msg 847/848 — presence in audit log constitutes evidence |
