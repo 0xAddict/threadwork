@@ -112,39 +112,72 @@ describe('S2.1: subagent heartbeat overdue does not fault parent', () => {
     expect(after.fault_count).toBe(3)
   })
 
-  test('subagent dead session does NOT fault parent', async () => {
-    // S2.1 parity: handleDeadSession must also exempt subagents.
-    taskDb.upsertAgentSession('boss', 'session-boss', 'alive')
-    // Also insert a 'dead' session for the subagent's synthetic worker so
-    // isSessionDead returns true for it. createSubagentTask sets to_agent = parent,
-    // so we need the parent to look "dead" from the watchdog's perspective.
-    // Simpler: directly test the recordFault exemption by creating a subagent task
-    // and verifying fault_count stays 0 when handleDeadSession runs.
+  test('dead parent session with multiple subagent children does NOT multiply fault_count', async () => {
+    // S2.1 multiplier regression (flagged by Codex adversarial-review):
+    // createSubagentTask sets child.to_agent = supervisor_agent. If the parent's
+    // session dies, reconcileTask routes each subagent child through
+    // handleDeadSession, which called recordFault(child.to_agent, 'crash') BEFORE
+    // the guard — charging a crash fault to the parent for EACH open child row.
+    // A parent dying with N open subagents would take N+1 faults instead of 1
+    // (1 from the parent's own task, N from the children), inflating the
+    // circuit breaker state and causing spurious OPEN transitions.
+    //
+    // Fix: handleDeadSession now checks task.kind === 'subagent' and routes
+    // subagent child crashes through an audit-only branch without touching
+    // parent fault_count. This test proves the multiplier no longer occurs.
+
+    // Mark boss session as DEAD — isSessionDead returns true for state === 'dead'
+    taskDb.upsertAgentSession('boss', 'session-boss', 'dead')
+
+    // Create parent task (in_progress, due for reconciliation)
     const parentTask = taskDb.createTask({
-      from: 'boss', to: 'boss', description: 'Parent', priority: 'normal',
+      from: 'boss',
+      to: 'boss',
+      description: 'Parent orchestration task',
+      priority: 'normal',
     })
     taskDb.claimTask(parentTask.id, 'boss')
-    const childTask = taskDb.createSubagentTask({
-      description: 'Subagent work',
-      parent_task_id: parentTask.id,
-      supervisor_agent: 'boss',
-    })
-    expect(childTask.kind).toBe('subagent')
 
-    // Verify baseline fault_count = 0
+    // Create 3 subagent children rooted on the dead parent
+    const childIds: number[] = []
+    for (let i = 1; i <= 3; i++) {
+      const child = taskDb.createSubagentTask({
+        description: `Subagent work ${i}`,
+        parent_task_id: parentTask.id,
+        supervisor_agent: 'boss',
+      })
+      expect(child.kind).toBe('subagent')
+      expect(child.to_agent).toBe('boss')
+      childIds.push(child.id)
+    }
+
+    // Force all 4 tasks (parent + 3 children) to be due for reconciliation
+    taskDb.run(db => {
+      db.prepare(`
+        UPDATE tasks SET
+          last_heartbeat_at = datetime('now', '-600 seconds'),
+          next_check_at = datetime('now', '-10 seconds')
+        WHERE id IN (?, ?, ?, ?)
+      `).run(parentTask.id, childIds[0], childIds[1], childIds[2])
+    })
+
+    // Baseline fault_count = 0
     const before = taskDb.run(db =>
       db.prepare('SELECT fault_count FROM agent_sessions WHERE agent = ?').get('boss') as any
     )
     expect(before.fault_count ?? 0).toBe(0)
 
-    // The key assertion is structural: handleDeadSession on a subagent task
-    // must route through the audit-only branch. We can't easily force a dead
-    // session in-test without mocking tmux, but we can verify the exemption
-    // holds for the similar recordFault call path by exercising it via direct
-    // dispatch. Instead, verify via heartbeat overdue path (which was already
-    // tested above) that a subagent never charges the parent under any
-    // reconciliation branch — regression guard for future crash path drift.
-    expect(true).toBe(true)
+    // Run reconciler — processes all 4 due tasks. Each hits isSessionDead('boss')
+    // which returns true, routing each into handleDeadSession.
+    await reconciler.reconcileDueTasks()
+
+    const after = taskDb.run(db =>
+      db.prepare('SELECT fault_count FROM agent_sessions WHERE agent = ?').get('boss') as any
+    )
+
+    // Without the fix: 1 (parent) + 3 (children) = 4 faults
+    // With the fix: 1 (parent only, children exempt via kind='subagent' guard)
+    expect(after.fault_count).toBe(1)
   })
 
   test('normal task heartbeat overdue DOES increment agent fault_count', async () => {
