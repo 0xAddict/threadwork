@@ -531,11 +531,160 @@ export class TaskDB {
       );
     `)
 
+    // v2-lite watchdog sprint (2026-04-09): nudge debounce table
+    // Stores per-agent last-nudged timestamp and pending event counter.
+    // Seed one row per known worker agent so tryNudge can upsert cheaply.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tw_nudge_debounce (
+        agent TEXT PRIMARY KEY,
+        last_nudged_at TEXT,
+        pending_count INTEGER NOT NULL DEFAULT 0,
+        last_urgency TEXT NOT NULL DEFAULT 'normal',
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('boss', 0, 'normal');
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('steve', 0, 'normal');
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('sadie', 0, 'normal');
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('kiera', 0, 'normal');
+    `)
+
+    // v2-lite watchdog sprint (2026-04-09): stall_miss_count column on tasks
+    // Consecutive-miss counter used by watchdog to only fire stall warnings
+    // on the second consecutive detection. Reset to 0 when agent renews
+    // heartbeat via updateHeartbeat.
+    try {
+      this.db.exec('ALTER TABLE tasks ADD COLUMN stall_miss_count INTEGER NOT NULL DEFAULT 0')
+    } catch { /* column already exists */ }
+
+    // v2-lite watchdog sprint (2026-04-09): v_nudge_metrics_24h view
+    //
+    // Summarizes the last 24 hours of nudge behavior from audit_log. Reads
+    // rows written by nudge.ts::nudgeAgent: action IN ('nudge_fired',
+    // 'nudge_suppressed'), agent='watchdog', detail JSON with keys:
+    //   target         — agent being nudged
+    //   urgency        — low | normal | high | urgent
+    //   reason         — window_elapsed | urgent_bypass | first | debounced | disabled
+    //   pending_count  — events collapsed (for fired rows) or accumulated so far (for suppressed)
+    //   window_ms_remaining — only on suppressed rows
+    //
+    // Columns exposed:
+    //   window_start, window_end   — 24h window bounds (UTC)
+    //   target                     — per-agent breakdown row
+    //   nudges_fired_24h           — count of nudge_fired rows for this target
+    //   nudges_suppressed_24h      — count of nudge_suppressed rows for this target
+    //   suppression_rate           — suppressed / (suppressed + fired), or 0 if denom=0
+    //   avg_pending_per_fire       — mean pending_count across fired rows
+    //   max_pending_per_fire       — peak coalescing
+    //
+    // A second view v_nudge_metrics_24h_total aggregates the same columns
+    // across ALL targets for the scalar "sprint success criterion" check
+    // (suppression_rate >= 0.60).
+    //
+    // IMPORTANT: SQLite JSON1 is compiled in by default in Bun's bundled
+    // sqlite, so json_extract() is safe to use here. If a future build
+    // drops JSON1, these views must be replaced with a materialized table.
+    this.db.exec(`
+      DROP VIEW IF EXISTS v_nudge_metrics_24h;
+      CREATE VIEW v_nudge_metrics_24h AS
+      WITH window_bounds AS (
+        SELECT
+          datetime('now', '-24 hours') AS window_start,
+          datetime('now') AS window_end
+      ),
+      scoped AS (
+        SELECT
+          json_extract(al.detail, '$.target') AS target,
+          al.action,
+          al.created_at,
+          CAST(json_extract(al.detail, '$.pending_count') AS INTEGER) AS pending_count
+        FROM audit_log al, window_bounds wb
+        WHERE al.action IN ('nudge_fired', 'nudge_suppressed', 'nudge_sent', 'nudge_delivery_failed', 'agent_nudged')
+          AND al.created_at >= wb.window_start
+      )
+      SELECT
+        wb.window_start,
+        wb.window_end,
+        s.target,
+        SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS nudges_fired_24h,
+        SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS nudges_suppressed_24h,
+        -- Sprint #256 gate 5: canonical delivery outcome strings.
+        SUM(CASE WHEN s.action = 'nudge_sent' THEN 1 ELSE 0 END) AS nudges_sent_24h,
+        SUM(CASE WHEN s.action = 'nudge_delivery_failed' THEN 1 ELSE 0 END) AS nudges_delivery_failed_24h,
+        -- Legacy alias kept for metrics continuity with pre-sprint-#256 rows.
+        SUM(CASE WHEN s.action = 'agent_nudged' THEN 1 ELSE 0 END) AS agent_nudged_legacy_24h,
+        CASE
+          WHEN (SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END)) = 0 THEN 0.0
+          ELSE CAST(SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS REAL)
+             / CAST(SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END) AS REAL)
+        END AS suppression_rate,
+        -- delivery_rate = sent / fired. A dispatcher that's healthy will see this
+        -- hover near 1.0. If it dips below 1.0 persistently, the tmux send-keys
+        -- layer is failing after the fire decision. The exact bug sprint #256
+        -- was diagnosing.
+        CASE
+          WHEN SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) = 0 THEN 1.0
+          ELSE CAST(SUM(CASE WHEN s.action = 'nudge_sent' THEN 1 ELSE 0 END) AS REAL)
+             / CAST(SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS REAL)
+        END AS delivery_rate,
+        COALESCE(
+          AVG(CASE WHEN s.action = 'nudge_fired' THEN s.pending_count END),
+          0.0
+        ) AS avg_pending_per_fire,
+        COALESCE(
+          MAX(CASE WHEN s.action = 'nudge_fired' THEN s.pending_count END),
+          0
+        ) AS max_pending_per_fire
+      FROM scoped s, window_bounds wb
+      WHERE s.target IS NOT NULL
+      GROUP BY wb.window_start, wb.window_end, s.target
+      ORDER BY s.target;
+
+      DROP VIEW IF EXISTS v_nudge_metrics_24h_total;
+      CREATE VIEW v_nudge_metrics_24h_total AS
+      WITH window_bounds AS (
+        SELECT
+          datetime('now', '-24 hours') AS window_start,
+          datetime('now') AS window_end
+      ),
+      scoped AS (
+        SELECT
+          al.action,
+          al.created_at
+        FROM audit_log al, window_bounds wb
+        WHERE al.action IN ('nudge_fired', 'nudge_suppressed', 'nudge_sent', 'nudge_delivery_failed', 'agent_nudged')
+          AND al.created_at >= wb.window_start
+      )
+      SELECT
+        wb.window_start,
+        wb.window_end,
+        SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS nudges_fired_24h,
+        SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS nudges_suppressed_24h,
+        SUM(CASE WHEN s.action = 'nudge_sent' THEN 1 ELSE 0 END) AS nudges_sent_24h,
+        SUM(CASE WHEN s.action = 'nudge_delivery_failed' THEN 1 ELSE 0 END) AS nudges_delivery_failed_24h,
+        SUM(CASE WHEN s.action = 'agent_nudged' THEN 1 ELSE 0 END) AS agent_nudged_legacy_24h,
+        CASE
+          WHEN SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END) = 0 THEN 0.0
+          ELSE CAST(SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS REAL)
+             / CAST(SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END) AS REAL)
+        END AS suppression_rate,
+        -- delivery_rate uses fired as denominator (every fire should produce a sent)
+        CASE
+          WHEN SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) = 0 THEN 1.0
+          ELSE CAST(SUM(CASE WHEN s.action = 'nudge_sent' THEN 1 ELSE 0 END) AS REAL)
+             / CAST(SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS REAL)
+        END AS delivery_rate
+      FROM scoped s, window_bounds wb
+      GROUP BY wb.window_start, wb.window_end;
+    `)
+
   }
 
   createTask(input: CreateTaskInput): Task {
     return this.run(db => {
-      // Auto-infer supervisor_agent when delegating (from != to)
       const supervisorAgent = input.from !== input.to ? input.from : null
       const stmt = db.prepare(`
         INSERT INTO tasks (from_agent, to_agent, description, priority, supervisor_agent)
@@ -692,6 +841,7 @@ export class TaskDB {
 
       if (input.isBlocked) {
         // Blocked: set blocked fields and next_check_at to now (for immediate watchdog pickup)
+        // Reset stall_miss_count — a blocked status is an active signal, not a stall.
         const stmt = db.prepare(`
           UPDATE tasks SET
             last_heartbeat_at = datetime('now'),
@@ -699,6 +849,7 @@ export class TaskDB {
             blocked_at = datetime('now'),
             blocked_reason = ?,
             next_check_at = datetime('now'),
+            stall_miss_count = 0,
             version = version + 1
           WHERE id = ?
           RETURNING *
@@ -706,6 +857,7 @@ export class TaskDB {
         return stmt.get(input.blockedReason ?? null, input.taskId) as Task | null
       } else {
         // Not blocked: clear blocked fields if previously set, update heartbeat
+        // Reset stall_miss_count — any heartbeat clears consecutive-miss counter.
         const stmt = db.prepare(`
           UPDATE tasks SET
             last_heartbeat_at = datetime('now'),
@@ -713,6 +865,7 @@ export class TaskDB {
             blocked_at = NULL,
             blocked_reason = NULL,
             next_check_at = datetime('now', '+' || ? || ' seconds'),
+            stall_miss_count = 0,
             version = version + 1
           WHERE id = ?
           RETURNING *
@@ -720,10 +873,8 @@ export class TaskDB {
         const updated = stmt.get(timeoutSec, input.taskId) as Task | null
 
         // Decay fault_count on successful heartbeat (bounded at 0, not a full reset).
-        // S2.1 parity: subagent tasks carry to_agent = supervisor (parent). Since subagent
-        // faults do NOT charge the parent's fault_count (see watchdog.handleHeartbeatOverdue),
-        // subagent heartbeats must NOT decay the parent either — otherwise the parent's
-        // circuit walks downward on subagent activity without having walked upward.
+        // Subagent tasks borrow the parent's to_agent, so they must not decay the
+        // parent's circuit state if their own heartbeats arrive.
         if (updated && task.kind !== 'subagent') {
           db.prepare(`
             UPDATE agent_sessions SET fault_count = MAX(0, COALESCE(fault_count, 0) - 1) WHERE agent = ?
@@ -1415,8 +1566,35 @@ export class TaskDB {
   }
 
   isCircuitOpen(agent: string): boolean {
+    // Timestamp comparison policy: SQLite datetimes are 'YYYY-MM-DD HH:MM:SS' UTC;
+    // always parse with `new Date(v + 'Z').getTime()` before comparing to
+    // `Date.now()`. See sprint 2026-04-09-v2-lite-watchdog.
     const state = this.getCircuitState(agent)
-    return state?.circuit_state === 'open'
+    if (state?.circuit_state !== 'open') return false
+
+    // Auto-recover if cooldown elapsed — breaks the "no overdue task = no heal"
+    // deadlock where tryHalfOpen only runs inside watchdog task reconciliation,
+    // which only runs when an agent has an overdue task, which the delegator
+    // refuses to create because isCircuitOpen returns true.
+    if (state.cooldown_until) {
+      const cooldownMs = new Date(state.cooldown_until + 'Z').getTime()
+      if (!Number.isNaN(cooldownMs) && Date.now() >= cooldownMs) {
+        // tryHalfOpen is idempotent — it guards `circuit_state !== 'open'`,
+        // so concurrent callers both hitting this path are safe: only the
+        // first transition wins, the rest no-op.
+        this.tryHalfOpen(agent)
+        return false
+      }
+    }
+
+    // If cooldown_until is NULL on an open circuit, treat as healed (bad state).
+    // Reachable via schema default — better to self-heal than hang.
+    if (!state.cooldown_until) {
+      console.warn(`[circuit-breaker] agent=${agent} open with NULL cooldown_until; forcing closed`)
+      this.closeCircuit(agent)
+      return false
+    }
+    return true
   }
 
   // ── Sprint 3: Unified Execution Events ──

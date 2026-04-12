@@ -1,0 +1,48 @@
+{
+  "run_id": "GOD_20260410_0000_sa7k",
+  "task_description": "Execute the v2-lite watchdog sprint per spec at /Users/coachstokes/threadwork/sprints/2026-04-09-v2-lite-watchdog-sprint.md. Phase A: Fix 3 prerequisite bugs (decision timestamp, circuit breaker healing, timestamp audit). Phase B: Implement v2-lite debounce (schema, helpers, nudge integration, feature flag, stall counter). Phase C: Write 5 test files. Phase D: Add metrics view and rollout plan.",
+  "project_path": "/Users/coachstokes/.claude/mcp-servers/task-board",
+  "args": { "scope": "full", "depth": "thorough", "skip_phases": [] },
+  "handoff": {
+    "source": null,
+    "mode": null,
+    "prepared_prompt_path": null,
+    "approved_plan_path": null,
+    "normalized_plan_path": null,
+    "imported_at": null,
+    "start_phase": null
+  },
+  "ralph_iteration": 1,
+  "max_ralph_iterations": 5,
+  "status": "running",
+  "started_at": "2026-04-10T00:00:00Z",
+  "last_updated_at": "2026-04-10T00:00:00Z",
+  "branch": "autoresearch/GOD_20260410_0000_sa7k",
+  "phases": {
+    "spec":              { "status": "in_progress", "artifact": null, "completed_at": null },
+    "spec_research":     { "status": "pending", "artifact": null, "completed_at": null },
+    "plan":              { "status": "pending", "artifact": null, "completed_at": null },
+    "implement":         { "status": "pending", "artifact": null, "completed_at": null, "tasks_total": 0, "tasks_complete": 0, "tasks_remaining": [], "epics_total": 0, "epics_complete": 0 },
+    "verify":            { "status": "pending", "artifact": null, "completed_at": null },
+    "fix":               { "status": "pending", "artifact": null, "completed_at": null },
+    "close":             { "status": "pending", "artifact": null, "completed_at": null }
+  },
+  "monitor": {
+    "active": false,
+    "loop_id": null,
+    "last_tick": null,
+    "stall_count": 0
+  },
+  "verification_gate": {
+    "passed": false,
+    "agreement_score": null,
+    "last_run_at": null
+  },
+  "context_exhaustion_count": 0,
+  "convergence": {
+    "baseline_findings": null,
+    "final_findings": null,
+    "kept_count": 0,
+    "discarded_count": 0
+  }
+}

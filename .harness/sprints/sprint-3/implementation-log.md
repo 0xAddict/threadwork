@@ -1,48 +1,52 @@
-# Sprint 3 Implementation Log
+# Sprint 3 Implementation Log — Unified Execution Events
 
-## [2026-04-08T00:00] Starting implementation
-- Contract: APPROVED, 8 acceptance criteria
-- Baseline: 160 tests, 0 failures
-- Plan:
-  1. Fix agent-scoped open_decisions query in watchdog.ts (AC-8) -- the only code change
-  2. Add cross-nudge guard in monitorIdleAgents (AC-2) -- prevents double-nudging
-  3. Write tests/sprint3-integration.test.ts covering all 8 criteria (>= 10 tests)
-  4. Run full regression, verify compile
-- Next: implement AC-8 code fix, then write test file
+## Date: 2026-04-08
 
-## [2026-04-08T00:01] AC-8: Agent-scoped open_decisions query
-- Files changed: watchdog.ts (line ~929-934)
-- Decision: Changed the open_decisions COUNT query in monitorIdleAgents to use a SQL subquery excluding decisions where the agent already has a position in decision_positions. This is a SQL-level fix (not application-level) per the Verifier's requirement.
-- Query now: `WHERE status IN ('open','positions','critique') AND id NOT IN (SELECT decision_id FROM decision_positions WHERE agent = ?)`
-- Next: write integration tests
+## Deliverables
 
-## [2026-04-08T00:02] AC-2: Cross-nudge guard
-- Files changed: watchdog.ts (after cooldown check in monitorIdleAgents, ~line 961-978)
-- Decision: Added a cross-nudge guard that checks the audit_log for a recent `decision_position_nudge` entry within the last 60 seconds. If the agent was already targeted by a decision position nudge AND has no pending tasks, the idle board nudge is skipped. When the agent HAS pending tasks, the idle nudge still fires because it covers different work (tasks vs decisions).
-- Rationale: The guard is scoped to pendingTasks.cnt === 0 to avoid blocking legitimate idle nudges about tasks when a decision nudge also happened to fire in the same cycle.
-- Next: write all integration tests
+### 1. progress_events table (db.ts migrate())
+Created with columns:
+- event_id (INTEGER PK AUTOINCREMENT)
+- task_id (FK to tasks), attempt_id, agent_id
+- event_type TEXT with CHECK constraint: started, heartbeat, progress, finding_written, completed, failed, abandoned
+- percent INTEGER (0-100), activity TEXT
+- metrics_json TEXT
+- detail_ref (FK to findings.finding_id)
+- created_at TEXT DEFAULT datetime('now')
+Indexes: idx_progress_task, idx_progress_type, idx_progress_agent
 
-## [2026-04-08T00:03] Tests written: sprint3-integration.test.ts
-- Files changed: tests/sprint3-integration.test.ts (new file, 13 tests)
-- Tests cover all 8 acceptance criteria:
-  - AC-1: 2 tests (expired decision not counted as pending work, multiple agents)
-  - AC-2: 1 test (cross-nudge guard prevents idle nudge when decision nudge fired)
-  - AC-3: 1 test (cycle time < 5 seconds with 5 decisions, 3 tasks, 4 agents)
-  - AC-4: 1 test (cycle summary log line contains all four counter names)
-  - AC-5: 2 tests (opener in nudge target list, no infinite loop)
-  - AC-6: 2 tests (expired decisions not position-nudged, multiple)
-  - AC-7: 1 test (all four counters fire in single cycle)
-  - AC-8: 3 tests (agent-scoped query, partial participation, SQL-level filtering)
+### 2. report_progress MCP tool + DB helper
+- `reportProgress()` in db.ts with 30s throttle per task (in-memory Map cache)
+- Lifecycle events (started, completed, failed, abandoned) bypass throttle
+- Returns `{ event_id }` on success, `{ throttled, next_allowed_in_sec }` if throttled
+- Gated by progress_events_enabled feature flag
 
-## [2026-04-08T00:04] Initial test run: 12/13 pass
-- AC-2 test failed: monitorIdleAgents was not checking for cross-type nudges
-- Fixed by adding cross-nudge guard in watchdog.ts
-- Second run after fix: AC-4 and AC-7 failed because cross-nudge guard was too aggressive (blocked agents who also had pending tasks)
-- Refined guard: only skip idle nudge when pendingTasks.cnt === 0 AND recent decision_position_nudge exists
+### 3. get_progress MCP tool + DB helper
+- `getProgress()` in db.ts with task_id filter, optional event_type and limit
+- Returns events in chronological order (reverse of DESC query)
+- Gated by progress_events_enabled feature flag
 
-## [2026-04-08T00:05] All tests pass
-- Sprint 3 tests: 13/13 pass
-- Full regression: 173/173 pass, 0 fail
-- TypeScript compile: clean (no errors)
-- Target met: 173 >= 170 total tests
-- Next: set status to ready_for_evaluation
+### 4. complete_task modification
+- Added `result_finding_id` optional parameter to complete_task tool schema
+- Handler sets result_finding_id on task row when provided
+- Calls `emitCompletionEvent()` to write a 'completed' event to progress_events
+- emitCompletionEvent is fire-and-forget (try/catch, never blocks completion)
+
+### 5. write_status deprecated alias
+- write_status now also emits to progress_events when progress_events_enabled=1
+- Maps status values: blocked->heartbeat, complete->completed, idle->heartbeat, working->progress
+- Original task_status_events behavior preserved (always written)
+
+### 6. Feature flag gating
+- All new functionality gated behind progress_events_enabled flag
+- When disabled: report_progress returns error, get_progress returns empty, no completion events
+- write_status alias only emits when flag is on
+
+### 7. Throttle implementation
+- In-memory Map<taskId, lastEventTimestamp> on TaskDB instance
+- 30s window checked before insert
+- Lifecycle events always pass through (Set check)
+
+## Test Results
+- 116 pass, 16 fail (all pre-existing from trg_require_supervision)
+- Zero new failures

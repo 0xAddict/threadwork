@@ -180,7 +180,7 @@ describe('S2.1: subagent heartbeat overdue does not fault parent', () => {
     expect(after.fault_count).toBe(1)
   })
 
-  test('normal task heartbeat overdue DOES increment agent fault_count', async () => {
+  test('normal task heartbeat overdue eventually increments agent fault_count', async () => {
     // Create an agent session for the worker
     taskDb.upsertAgentSession('steve', 'session-steve', 'alive')
 
@@ -209,11 +209,27 @@ describe('S2.1: subagent heartbeat overdue does not fault parent', () => {
     )
     expect(beforeFault.fault_count ?? 0).toBe(0)
 
-    // Run the reconciler
+    // First overdue cycle: v2-lite stall suppression records the miss but does not
+    // charge fault_count yet.
     await reconciler.reconcileDueTasks()
 
-    // Check steve fault_count after — should be incremented to 1
-    const afterFault = taskDb.run(db =>
+    let afterFault = taskDb.run(db =>
+      db.prepare('SELECT fault_count FROM agent_sessions WHERE agent = ?').get('steve') as any
+    )
+    expect(afterFault.fault_count ?? 0).toBe(0)
+
+    // Force a second overdue cycle so the watchdog treats this as a consecutive miss.
+    taskDb.run(db => {
+      db.prepare(`
+        UPDATE tasks SET next_check_at = datetime('now', '-1 seconds')
+        WHERE id = ?
+      `).run(task.id)
+    })
+
+    await reconciler.reconcileDueTasks()
+
+    // Second consecutive miss should charge one fault to the normal worker.
+    afterFault = taskDb.run(db =>
       db.prepare('SELECT fault_count FROM agent_sessions WHERE agent = ?').get('steve') as any
     )
     expect(afterFault.fault_count).toBe(1)

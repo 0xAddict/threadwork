@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "start": "bun server.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "tw:debounce-metrics": "bun run bin/tw-debounce-metrics.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.82.0",

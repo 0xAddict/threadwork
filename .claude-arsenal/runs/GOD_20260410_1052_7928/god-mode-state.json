@@ -1,0 +1,110 @@
+{
+  "run_id": "GOD_20260410_1052_7928",
+  "task_description": "Nudge Delivery Fix Sprint — consolidate 5 server.ts nudge callsites into single dispatchAgentNudge() function per council spec. Boss task #256. Spec at /Users/coachstokes/threadwork/sprints/2026-04-09-nudge-delivery-fix-spec.md.",
+  "project_path": "/Users/coachstokes/.claude/mcp-servers/task-board",
+  "args": {
+    "scope": "minimal",
+    "depth": "thorough",
+    "skip_phases": ["spec", "spec-research", "visual", "ui-audit"]
+  },
+  "handoff": {
+    "source": "boss-direct",
+    "mode": "main-thread-execution",
+    "prepared_prompt_path": null,
+    "approved_plan_path": "/Users/coachstokes/threadwork/sprints/2026-04-09-nudge-delivery-fix-spec.md",
+    "normalized_plan_path": "/Users/coachstokes/.claude/mcp-servers/task-board/.claude-arsenal/runs/GOD_20260410_1052_7928/prd.md",
+    "imported_at": "2026-04-10T10:52:00Z",
+    "start_phase": "implement"
+  },
+  "ralph_iteration": 1,
+  "max_ralph_iterations": 1,
+  "status": "running",
+  "started_at": "2026-04-10T10:52:00Z",
+  "last_updated_at": "2026-04-10T10:52:00Z",
+  "branch": "autoresearch/GOD_20260409_2229_6732",
+  "phases": {
+    "spec": {
+      "status": "complete",
+      "artifact": ".claude-arsenal/runs/GOD_20260410_1052_7928/prd.md",
+      "completed_at": "2026-04-10T10:52:00Z",
+      "note": "Satisfied by approved-plan import from council-derived nudge-delivery-fix-spec.md"
+    },
+    "spec_research": {
+      "status": "skipped",
+      "artifact": null,
+      "completed_at": "2026-04-10T10:52:00Z",
+      "note": "LLM Council already completed deep research (4/5 model unanimous) before spec was written"
+    },
+    "competitive_research": {
+      "status": "skipped",
+      "artifact": null,
+      "completed_at": "2026-04-10T10:52:00Z",
+      "note": "Internal infrastructure bug fix, no competitive landscape"
+    },
+    "plan": {
+      "status": "complete",
+      "artifact": ".claude-arsenal/runs/GOD_20260410_1052_7928/prd.md",
+      "completed_at": "2026-04-10T10:52:00Z",
+      "note": "Plan is baked into the spec file. Council root cause + fix strategy + 11 hard gates + patch groups A/B/C all defined in spec."
+    },
+    "visual_baseline": {
+      "status": "skipped",
+      "artifact": null,
+      "completed_at": "2026-04-10T10:52:00Z",
+      "note": "Backend MCP server, no web app URL, no visual surface"
+    },
+    "implement": {
+      "status": "pending",
+      "artifact": null,
+      "completed_at": null,
+      "tasks_total": 0,
+      "tasks_complete": 0,
+      "tasks_remaining": [],
+      "epics_total": 0,
+      "epics_complete": 0
+    },
+    "verify": {
+      "status": "pending",
+      "artifact": null,
+      "completed_at": null
+    },
+    "fix": {
+      "status": "pending",
+      "artifact": null,
+      "completed_at": null
+    },
+    "ui-audit": {
+      "status": "skipped",
+      "artifact": null,
+      "completed_at": "2026-04-10T10:52:00Z",
+      "note": "Backend MCP server, no UI"
+    },
+    "close": {
+      "status": "pending",
+      "artifact": null,
+      "completed_at": null
+    }
+  },
+  "monitor": {
+    "active": false,
+    "loop_id": null,
+    "last_tick": null,
+    "stall_count": 0,
+    "visual_diffs_triggered": 0
+  },
+  "verification_gate": {
+    "passed": false,
+    "agreement_score": null,
+    "last_run_at": null,
+    "scanners_passed": 0,
+    "verifiers_passed": 0,
+    "cross_model_used": false
+  },
+  "context_exhaustion_count": 0,
+  "convergence": {
+    "baseline_findings": null,
+    "final_findings": null,
+    "kept_count": 0,
+    "discarded_count": 0
+  }
+}

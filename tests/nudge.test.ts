@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test'
+import { TMUX_PATH } from '../config'
 import { buildNudgeCommand, resolveSession } from '../nudge'
 import { TMUX_PATH } from '../config'
 
@@ -18,3 +19,6 @@ describe('nudge', () => {
     ])
   })
 })
+
+// Sprint #256 guardrail tests (grep-based dispatcher boundary enforcement)
+// have been moved to tests/guardrails/no-direct-nudge-paths.test.ts.

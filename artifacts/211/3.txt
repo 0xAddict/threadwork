@@ -1,0 +1,1 @@
+Sadie artifact content: smoke test round 2 passed

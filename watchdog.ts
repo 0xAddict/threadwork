@@ -9,7 +9,7 @@ import { TaskDB, type Task } from './db'
 import { MemoryDB } from './memory'
 import { DecisionDB, expireStaleDecisions, type Decision, type DecisionWithDetail } from './decision'
 import { AuditLog } from './audit'
-import { nudgeAgent } from './nudge'
+import { dispatchAgentNudge, configureNudgeDebounce } from './nudge'
 import { postToGroup, formatDecisionExpired, esc } from './notify'
 import { checkAndRunDebrief } from './debrief'
 import {
@@ -226,16 +226,13 @@ export class TaskReconciler {
    * Reconcile a single due task based on its state.
    */
   private async reconcileTask(task: Task, result: ReconcileResult): Promise<void> {
-    // (a) BLOCKED: relay to supervisor — but check TTL first
+    // (a) BLOCKED: relay to supervisor — but stop relaying if the worker went silent.
     if (task.blocked_at) {
       const blockedStale = this.isOverdue(task.blocked_at, BLOCKED_TTL_SEC)
       const heartbeatFresh = task.last_heartbeat_at
         && new Date(task.last_heartbeat_at + 'Z').getTime() > new Date(task.blocked_at + 'Z').getTime()
 
       if (blockedStale && !heartbeatFresh) {
-        // Worker reported blocked but has gone silent — clear blocked state
-        // and fall through to normal crash/heartbeat checks.
-        // Capture timestamps BEFORE clearing so the audit row preserves forensics.
         const blockedSince = task.blocked_at
         const lastHeartbeat = task.last_heartbeat_at
         log(`Blocked TTL expired for task #${task.id} (blocked ${blockedSince}, last heartbeat ${lastHeartbeat}) — clearing blocked state`)
@@ -250,10 +247,8 @@ export class TaskReconciler {
           blocked_since: blockedSince,
           last_heartbeat: lastHeartbeat,
         }, task.id)
-        // Refresh the task object so downstream checks see cleared state
         task.blocked_at = null
         task.blocked_reason = null
-        // DO NOT return — fall through to (b), (c), (d), (e), (f)
       } else {
         await this.handleBlocked(task, result)
         return
@@ -309,7 +304,7 @@ export class TaskReconciler {
     log(`Relaying blocked status for task #${task.id} to ${supervisor}`)
 
     // Nudge supervisor
-    await nudgeAgent(supervisor, msg)
+    await dispatchAgentNudge(supervisor, msg)
 
     // Post to Telegram for visibility
     await postToGroup(`\u26a0\ufe0f ${esc(msg)}`)
@@ -336,10 +331,8 @@ export class TaskReconciler {
 
     log(`Dead session detected for task #${task.id} (worker: ${task.to_agent})`)
 
-    // Sprint 4: Record crash fault.
-    // S2.1 parity: subagent tasks carry to_agent = supervisor (parent). A crashed
-    // subagent must NOT charge the parent's circuit breaker — same reasoning as the
-    // heartbeat overdue guard in handleHeartbeatOverdue.
+    // Subagent children inherit the parent's to_agent, so a dead child session
+    // must not charge the parent's circuit breaker.
     if (task.kind === 'subagent') {
       log(`Subagent task #${task.id} dead session — skipping parent fault (parent: ${task.to_agent})`)
       this.audit.log('watchdog', 'subagent_dead_session', {
@@ -377,7 +370,7 @@ export class TaskReconciler {
     })
 
     // Notify boss (do NOT nudge the dead worker)
-    await nudgeAgent('boss', `DEAD SESSION: Task #${task.id} (${task.to_agent}) \u2014 worker session is dead. Escalation task created.`)
+    await dispatchAgentNudge('boss', `DEAD SESSION: Task #${task.id} (${task.to_agent}) \u2014 worker session is dead. Escalation task created.`)
     await postToGroup(`\ud83d\udea8 DEAD SESSION: Task \\#${task.id} \\(${esc(task.to_agent)}\\) \u2014 worker session dead\\. Escalated to Boss\\.`)
 
     this.audit.log('watchdog', 'dead_session_escalation', {
@@ -395,15 +388,41 @@ export class TaskReconciler {
   // -------------------------------------------------------------------------
 
   private async handleHeartbeatOverdue(task: Task, timeoutSec: number, result: ReconcileResult): Promise<void> {
+    // v2-lite B5: consecutive-miss counter. Only escalate/nudge on the
+    // 2nd consecutive detection. On the 1st, increment the counter and
+    // reschedule a short recheck. updateHeartbeat resets stall_miss_count
+    // to 0 when the agent renews its heartbeat.
+    const currentMiss = (task as any).stall_miss_count ?? 0
+    const newMiss = currentMiss + 1
+
+    if (newMiss < 2) {
+      // First miss: increment counter, re-check in half the timeout window,
+      // do NOT fire a nudge. This is the dedup fix — one bad cycle is noise,
+      // two in a row is a real stall.
+      this.taskDb.run(db => {
+        db.prepare(`
+          UPDATE tasks SET
+            stall_miss_count = ?,
+            next_check_at = datetime('now', '+' || ? || ' seconds')
+          WHERE id = ?
+        `).run(newMiss, Math.max(30, Math.floor(timeoutSec / 2)), task.id)
+      })
+      this.audit.log('watchdog', 'stall_miss_recorded', {
+        task_id: task.id,
+        worker: task.to_agent,
+        miss_count: newMiss,
+      }, task.id)
+      log(`Heartbeat miss #${newMiss} for task #${task.id} (worker: ${task.to_agent}) — suppressing nudge until consecutive`)
+      return
+    }
+
     const level = (task.escalation_level ?? 0)
     const newLevel = level + 1
 
-    log(`Heartbeat overdue for task #${task.id} (worker: ${task.to_agent}, level ${level} -> ${newLevel})`)
+    log(`Heartbeat overdue for task #${task.id} (worker: ${task.to_agent}, level ${level} -> ${newLevel}, miss=${newMiss})`)
 
-    // Sprint 4: Record fault and check circuit breaker
-    // S2.1 fix: Do NOT charge subagent heartbeat faults to the parent's circuit breaker.
-    // Subagent tasks have to_agent = supervisor (parent), so faulting to_agent would
-    // penalize the parent for a child's timeout.
+    // Subagent tasks reuse the parent's to_agent, so timeouts must not charge
+    // the parent's circuit breaker.
     if (task.kind === 'subagent') {
       log(`Subagent task #${task.id} heartbeat overdue — skipping parent fault (parent: ${task.to_agent})`)
       this.audit.log('watchdog', 'subagent_heartbeat_overdue', {
@@ -417,7 +436,7 @@ export class TaskReconciler {
       if (faultResult.circuit_state === 'open') {
         log(`Circuit OPEN for ${task.to_agent} (${faultResult.fault_count} faults). Alerting boss.`)
         await this.taskDb.run(async () => {}) // no-op, just for type
-        await nudgeAgent('boss', `Circuit OPEN for ${task.to_agent}: ${faultResult.fault_count} consecutive faults. Agent degraded.`)
+        await dispatchAgentNudge('boss', `Circuit OPEN for ${task.to_agent}: ${faultResult.fault_count} consecutive faults. Agent degraded.`, { urgency: 'urgent' })
         await postToGroup(`\u26a0\ufe0f Circuit breaker OPEN for ${esc(task.to_agent)} \\- ${faultResult.fault_count} faults`)
       }
     }
@@ -429,7 +448,7 @@ export class TaskReconciler {
     } else {
       // Nudge the worker
       const msg = `Heartbeat overdue: Task #${task.id} has not sent a heartbeat in ${timeoutSec}s. Send a write_status update. (escalation level ${newLevel}/3)`
-      await nudgeAgent(task.to_agent, msg)
+      await dispatchAgentNudge(task.to_agent, msg)
       result.nudged++
     }
 
@@ -449,6 +468,7 @@ export class TaskReconciler {
       worker: task.to_agent,
       escalation_level: newLevel,
       timeout_sec: timeoutSec,
+      miss_count: newMiss,
     }, task.id)
   }
 
@@ -466,10 +486,10 @@ export class TaskReconciler {
     const msg = `Progress overdue: Task #${task.id} (${task.to_agent}) \u2014 worker is alive but no progress in ${timeoutSec}s. (escalation level ${newLevel})`
 
     // Nudge the supervisor
-    await nudgeAgent(supervisor, msg)
+    await dispatchAgentNudge(supervisor, msg)
 
     // Also nudge the worker
-    await nudgeAgent(task.to_agent, `Progress check: Task #${task.id} \u2014 no progress update in ${timeoutSec}s. Send write_status with progress=true.`)
+    await dispatchAgentNudge(task.to_agent, `Progress check: Task #${task.id} \u2014 no progress update in ${timeoutSec}s. Send write_status with progress=true.`)
 
     // Update escalation level
     this.taskDb.run(db => {
@@ -504,7 +524,7 @@ export class TaskReconciler {
     log(`Unclaimed task #${task.id} assigned to ${task.to_agent} (level ${newLevel})`)
 
     const msg = `Reminder: Task #${task.id} is pending and assigned to you: ${task.description}`
-    await nudgeAgent(task.to_agent, msg)
+    await dispatchAgentNudge(task.to_agent, msg)
 
     // Update escalation level and next_check_at
     this.taskDb.run(db => {
@@ -588,7 +608,7 @@ export class TaskReconciler {
       `).run(escalationDesc)
     })
 
-    await nudgeAgent('boss', `Escalation L${level}: Task #${task.id} (${task.to_agent}) \u2014 ${reason}`)
+    await dispatchAgentNudge('boss', `Escalation L${level}: Task #${task.id} (${task.to_agent}) \u2014 ${reason}`)
     await postToGroup(`\ud83d\udea8 Escalation L${level}: Task \\#${task.id} \\(${esc(task.to_agent)}\\) \\- ${esc(reason)}`)
 
     this.audit.log('watchdog', 'escalation_created', {
@@ -847,7 +867,7 @@ export class TaskReconciler {
       const agentsToNudge = [...WORKER_AGENTS]
       const nudgeMsg = `Decision #${d.id} "${d.title}" has been open for ${Math.floor(ageMs / 60000)} min with no positions. Please submit your position.`
       for (const agent of agentsToNudge) {
-        await nudgeAgent(agent, nudgeMsg)
+        await dispatchAgentNudge(agent, nudgeMsg)
       }
 
       this.audit.log('watchdog', 'decision_position_nudge', {
@@ -902,7 +922,7 @@ export class TaskReconciler {
 
       // Notify Boss
       const readyMsg = `Decision #${d.id} "${d.title}" has ${distinctAgents.size} position(s) from [${[...distinctAgents].join(', ')}] and is ready to finalize.`
-      await nudgeAgent(BOSS_AGENT, readyMsg)
+      await dispatchAgentNudge(BOSS_AGENT, readyMsg)
       await postToGroup(`\u2705 Decision \\#${d.id} ready to finalize: "${esc(d.title)}" \\- ${distinctAgents.size} positions in\\.`)
 
       this.audit.log('watchdog', 'decision_ready_to_finalize', {
@@ -1050,7 +1070,7 @@ export class TaskReconciler {
         const summary = parts.join(' and ')
         const nudgeMsg = `Board check: You have ${summary}. Run list_tasks and list_decisions to catch up.`
 
-        await nudgeAgent(agent, nudgeMsg)
+        await dispatchAgentNudge(agent, nudgeMsg)
 
         this.audit.log('watchdog', 'idle_board_nudge', {
           agent,
@@ -1146,6 +1166,7 @@ if (isMainScript) {
   const taskDb = new TaskDB(DB_PATH)
   const audit = new AuditLog(taskDb)
 
+  configureNudgeDebounce(taskDb, audit)
   const reconciler = new TaskReconciler(taskDb, audit, {
     cadenceSec: WATCHDOG_CADENCE_SEC,
     sessionTimeoutSec: SESSION_TIMEOUT_SEC,

@@ -2,7 +2,10 @@
   "mcpServers": {
     "task-board": {
       "command": "bun",
-      "args": ["run", "/Users/coachstokes/.claude/mcp-servers/task-board/server.ts"]
+      "args": ["run", "/Users/coachstokes/.claude/mcp-servers/task-board/server.ts"],
+      "env": {
+        "THREADWORK_DEBOUNCE_ENABLED": "1"
+      }
     },
     "amazon-ads-mcp": {
       "command": "node",

@@ -336,13 +336,24 @@ export class DecisionDB {
 /**
  * Expire stale decisions whose expires_at has passed.
  * Returns the number of decisions expired.
+ *
+ * Timestamp comparison policy: SQLite datetimes are 'YYYY-MM-DD HH:MM:SS' UTC;
+ * always parse with `new Date(v + 'Z').getTime()` before comparing to
+ * `Date.now()`. Lexicographic comparison between an ISO-8601 string
+ * ("2026-04-09T13:15:00.000Z") and a naked SQLite datetime
+ * ("2026-04-09 17:34:37") is broken because ' ' (0x20) sorts before 'T'
+ * (0x54), causing every same-day future expiry to read as "already past".
+ * See sprint 2026-04-09-v2-lite-watchdog.
  */
 export function expireStaleDecisions(dec: DecisionDB): number {
   let count = 0
   const open = dec.getOpenDecisions()
-  const now = new Date().toISOString()
+  const nowMs = Date.now()
   for (const d of open) {
-    if (d.expires_at && d.expires_at < now) {
+    if (!d.expires_at) continue
+    const expiresMs = new Date(d.expires_at + 'Z').getTime()
+    if (Number.isNaN(expiresMs)) continue // malformed row — skip, do not crash
+    if (expiresMs < nowMs) {
       try {
         dec.expireDecision(d.id)
         count++
