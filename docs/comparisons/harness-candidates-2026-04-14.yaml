@@ -1,0 +1,31 @@
+candidates:
+- name: hermes-agent
+  url: https://github.com/NousResearch/hermes-agent
+  commit: 16f9d0208429a16db983634dd11f62852faf329a
+  project_path: null
+  language: Python
+  notes: Nous Research self-improving agent. Fork/successor of OpenClaw.
+- name: openclaw
+  url: https://github.com/openclaw/openclaw
+  commit: 3329824eed6b0c2555bd938a61970879806e3ca6
+  project_path: null
+  language: TypeScript
+  notes: Local-first personal AI gateway. Multi-channel routing, plugin system.
+- name: crewai
+  url: https://github.com/crewAIInc/crewAI
+  commit: 0dba95e16679ca7a06ad17c557b63a0fd95254fd
+  project_path: null
+  language: Python
+  notes: Role-based multi-agent framework with explicit crew/task/process abstractions.
+- name: langgraph
+  url: https://github.com/langchain-ai/langgraph
+  commit: 2c98c59fca6c99b696988b97dfaeb885f652920c
+  project_path: libs/langgraph
+  language: Python
+  notes: LangChain's stateful graph-based agent orchestration. Monorepo.
+- name: pydantic-ai
+  url: https://github.com/pydantic/pydantic-ai
+  commit: d9eeb0b53f503fbcd185486547753c376ca31453
+  project_path: pydantic_ai_slim
+  language: Python
+  notes: Pydantic-based agent framework with type-safe tool calling.
