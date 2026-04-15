@@ -347,7 +347,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: 'Get memory system health stats: counts by classification/state, dispute rate, average quality, last consolidation run info.',
       inputSchema: {
         type: 'object' as const,
-        properties: {},
+        properties: {
+          scope: { type: 'string', description: 'Scope: all, operational, or agent:NAME', default: 'all' },
+        },
       },
     },
     {
@@ -1104,14 +1106,32 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'consolidate_memories': {
         const dryRun = args.dry_run !== false
         const maxChanges = Number(args.max_changes ?? 50)
-        const consolidator = new MemoryConsolidator(mem, db, dryRun, maxChanges)
+        // Parse scope: "all" (default) | "operational" | "agent:NAME"
+        const rawScope = args.scope != null ? String(args.scope).trim() : 'all'
+        const scope = rawScope === '' ? 'all' : rawScope
+        if (scope !== 'all' && scope !== 'operational' && !scope.startsWith('agent:')) {
+          return { content: [{ type: 'text', text: `Invalid scope '${scope}'. Must be 'all', 'operational', or 'agent:NAME'.` }] }
+        }
+        if (scope.startsWith('agent:') && scope.slice('agent:'.length).trim() === '') {
+          return { content: [{ type: 'text', text: `Invalid scope '${scope}'. agent:NAME requires a non-empty NAME.` }] }
+        }
+        const consolidator = new MemoryConsolidator(mem, db, dryRun, maxChanges, scope)
         const result = await consolidator.run(`manual trigger by ${SELF_LABEL}`)
-        audit.log(SELF_LABEL, 'consolidation_triggered', { summary: result.summary })
+        audit.log(SELF_LABEL, 'consolidation_triggered', { summary: result.summary, scope })
         return { content: [{ type: 'text', text: result.summary }] }
       }
 
       case 'get_memory_health_report': {
-        const consolidator = new MemoryConsolidator(mem, db)
+        // Respect the same scope dimension so agents can inspect just their slice.
+        const rawScope = args.scope != null ? String(args.scope).trim() : 'all'
+        const scope = rawScope === '' ? 'all' : rawScope
+        if (scope !== 'all' && scope !== 'operational' && !scope.startsWith('agent:')) {
+          return { content: [{ type: 'text', text: `Invalid scope '${scope}'. Must be 'all', 'operational', or 'agent:NAME'.` }] }
+        }
+        if (scope.startsWith('agent:') && scope.slice('agent:'.length).trim() === '') {
+          return { content: [{ type: 'text', text: `Invalid scope '${scope}'. agent:NAME requires a non-empty NAME.` }] }
+        }
+        const consolidator = new MemoryConsolidator(mem, db, true, 50, scope)
         const report = consolidator.getHealthReport()
         const lines = [
           `Total active: ${report.totalActive}`,
