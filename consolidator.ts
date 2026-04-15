@@ -10,6 +10,7 @@ export interface ConsolidationResult {
   dryRun: boolean
   summary: string
   durationMs: number
+  scope: string
 }
 
 export interface HealthReport {
@@ -60,30 +61,101 @@ const IDLE_MINUTES = 45
 const LOCK_LEASE_MINUTES = 10
 const CONFIDENCE_THRESHOLD = 0.6
 
+/**
+ * Scope of a consolidation run.
+ *   "all"         — every memory in the system (original default behavior)
+ *   "operational" — limit to classification='operational'
+ *   "agent:NAME"  — limit to memories where agent=NAME
+ */
+export type ConsolidationScope = string
+
+interface ScopeClause {
+  /** SQL fragment to append to a WHERE — always begins with " AND " or is empty. */
+  sql: string
+  /** Params for the placeholders in `sql`, in order. */
+  params: unknown[]
+}
+
+/**
+ * Returns a SQL AND-clause fragment that restricts a query to the given scope.
+ * The caller is responsible for injecting both the SQL and params into the
+ * prepared statement. Supports table-alias prefixes (e.g. "m1.").
+ */
+export function buildScopeClause(scope: ConsolidationScope | undefined, alias = ''): ScopeClause {
+  const s = (scope ?? 'all').trim()
+  const col = alias ? `${alias}.agent` : 'agent'
+  const classCol = alias ? `${alias}.classification` : 'classification'
+
+  if (!s || s === 'all') {
+    return { sql: '', params: [] }
+  }
+  if (s === 'operational') {
+    return { sql: ` AND ${classCol} = ?`, params: ['operational'] }
+  }
+  if (s.startsWith('agent:')) {
+    const name = s.slice('agent:'.length).trim()
+    if (!name) return { sql: '', params: [] }
+    return { sql: ` AND ${col} = ?`, params: [name] }
+  }
+  // Unknown scope — fall back to "all" rather than silently mis-filtering.
+  return { sql: '', params: [] }
+}
+
+/**
+ * Returns the consolidation_locks row key used by a given scope. Per-agent
+ * scopes get their own lock key so parallel agent-scoped runs don't block
+ * each other. Everything else shares the global consolidator lock.
+ */
+export function lockKeyForScope(scope: ConsolidationScope | undefined): string {
+  const s = (scope ?? 'all').trim()
+  if (s.startsWith('agent:')) {
+    const name = s.slice('agent:'.length).trim()
+    if (name) return `memory_consolidation:agent:${name}`
+  }
+  return 'consolidator'
+}
+
 export class MemoryConsolidator {
   private lockId: number | null = null
+  private readonly scope: ConsolidationScope
+  private readonly lockKey: string
 
   constructor(
     private mem: MemoryDB,
     private taskDb: TaskDB,
     private dryRun: boolean = true,
     private maxMutationsPerRun: number = 50,
-  ) {}
+    scope: ConsolidationScope = 'all',
+  ) {
+    this.scope = scope
+    this.lockKey = lockKeyForScope(scope)
+  }
+
+  /** Exposed for tests and server introspection. */
+  getScope(): ConsolidationScope {
+    return this.scope
+  }
+
+  private scopeClause(alias = ''): ScopeClause {
+    return buildScopeClause(this.scope, alias)
+  }
 
   acquireLock(): boolean {
     return this.taskDb.run(db => {
       // Clean expired locks
       db.prepare("DELETE FROM consolidation_locks WHERE expires_at < datetime('now')").run()
 
-      // Check for existing lock
-      const existing = db.prepare('SELECT id FROM consolidation_locks LIMIT 1').get()
+      // Check for existing lock with THIS scope's key. Per-agent scopes have
+      // their own key so they don't collide with other agents' runs, while
+      // all/operational continue to share the global 'consolidator' key.
+      const existing = db.prepare('SELECT id FROM consolidation_locks WHERE agent = ? LIMIT 1').get(this.lockKey)
       if (existing) return false
 
       const result = db.prepare(`
         INSERT INTO consolidation_locks (agent, expires_at, pid)
-        VALUES ('consolidator', datetime('now', '+${LOCK_LEASE_MINUTES} minutes'), ?)
+        VALUES (?, datetime('now', '+${LOCK_LEASE_MINUTES} minutes'), ?)
         RETURNING id
-      `).get(process.pid) as { id: number } | null
+      `).get(this.lockKey, process.pid) as { id: number } | null
 
       if (result) {
         this.lockId = result.id
@@ -102,21 +174,23 @@ export class MemoryConsolidator {
   }
 
   getHealthReport(): HealthReport {
+    const clause = this.scopeClause()
     return this.taskDb.run(db => {
       const byClass = db.prepare(`
-        SELECT classification, COUNT(*) as cnt FROM memories WHERE state = 'active' GROUP BY classification
-      `).all() as { classification: string, cnt: number }[]
+        SELECT classification, COUNT(*) as cnt FROM memories WHERE state = 'active'${clause.sql} GROUP BY classification
+      `).all(...clause.params) as { classification: string, cnt: number }[]
 
       const byState = db.prepare(`
-        SELECT state, COUNT(*) as cnt FROM memories GROUP BY state
-      `).all() as { state: string, cnt: number }[]
+        SELECT state, COUNT(*) as cnt FROM memories WHERE 1=1${clause.sql} GROUP BY state
+      `).all(...clause.params) as { state: string, cnt: number }[]
 
       const stats = db.prepare(`
         SELECT COUNT(*) as total, AVG(quality) as avg_q,
                SUM(CASE WHEN state = 'disputed' THEN 1 ELSE 0 END) as disputed_count
-        FROM memories WHERE state != 'superseded'
-      `).get() as { total: number, avg_q: number | null, disputed_count: number }
+        FROM memories WHERE state != 'superseded'${clause.sql}
+      `).get(...clause.params) as { total: number, avg_q: number | null, disputed_count: number }
 
+      // consolidation_runs is not scoped by agent — it's a global audit trail.
       const lastRun = db.prepare(`
         SELECT completed_at, mutations FROM consolidation_runs
         WHERE completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1
@@ -141,6 +215,7 @@ export class MemoryConsolidator {
   }
 
   checkTriggers(): TriggerGates {
+    const clause = this.scopeClause()
     return this.taskDb.run(db => {
       // Time gate: 6h since last successful run
       const lastRun = db.prepare(`
@@ -155,31 +230,31 @@ export class MemoryConsolidator {
         timeTrigger = hoursSince >= TRIGGER_INTERVAL_HOURS
       }
 
-      // Volume gate: >25 new or >15% disputed
+      // Volume gate: >25 new or >15% disputed (within scope)
       const stats = db.prepare(`
         SELECT COUNT(*) as total,
                SUM(CASE WHEN state = 'disputed' THEN 1 ELSE 0 END) as disputed
-        FROM memories WHERE state != 'superseded'
-      `).get() as { total: number, disputed: number }
+        FROM memories WHERE state != 'superseded'${clause.sql}
+      `).get(...clause.params) as { total: number, disputed: number }
 
       const recentCount = db.prepare(`
         SELECT COUNT(*) as cnt FROM memories
-        WHERE created_at > datetime('now', '-6 hours') AND state = 'active'
-      `).get() as { cnt: number }
+        WHERE created_at > datetime('now', '-6 hours') AND state = 'active'${clause.sql}
+      `).get(...clause.params) as { cnt: number }
 
       const volumeTrigger = recentCount.cnt > VOLUME_THRESHOLD ||
         (stats.total > 0 && stats.disputed / stats.total > DISPUTE_RATE_THRESHOLD)
 
-      // Idle gate: no task_status_events in 45min
+      // Idle gate: no task_status_events in 45min (not scoped to memories)
       const recentStatus = db.prepare(`
         SELECT COUNT(*) as cnt FROM task_status_events
         WHERE created_at > datetime('now', '-${IDLE_MINUTES} minutes')
       `).get() as { cnt: number }
       const idleTrigger = recentStatus.cnt === 0
 
-      // Lock gate: no unexpired lock
+      // Lock gate: no unexpired lock for THIS scope's lock key
       db.prepare("DELETE FROM consolidation_locks WHERE expires_at < datetime('now')").run()
-      const lockExists = db.prepare('SELECT id FROM consolidation_locks LIMIT 1').get()
+      const lockExists = db.prepare('SELECT id FROM consolidation_locks WHERE agent = ? LIMIT 1').get(this.lockKey)
       const lockTrigger = !lockExists
 
       return { time: timeTrigger, volume: volumeTrigger, idle: idleTrigger, lock: lockTrigger }
@@ -192,7 +267,7 @@ export class MemoryConsolidator {
     let mutations = 0
 
     if (!this.acquireLock()) {
-      return { runId: 0, triggerReason, phasesCompleted: [], mutations: 0, dryRun: this.dryRun, summary: 'Could not acquire lock', durationMs: 0 }
+      return { runId: 0, triggerReason, phasesCompleted: [], mutations: 0, dryRun: this.dryRun, summary: `Could not acquire lock (scope=${this.scope})`, durationMs: 0, scope: this.scope }
     }
 
     // Create run record
@@ -200,7 +275,7 @@ export class MemoryConsolidator {
       const r = db.prepare(`
         INSERT INTO consolidation_runs (trigger_reason, dry_run) VALUES (?, ?)
         RETURNING id
-      `).get(triggerReason, this.dryRun ? 1 : 0) as { id: number }
+      `).get(`${triggerReason} [scope=${this.scope}]`, this.dryRun ? 1 : 0) as { id: number }
       return r.id
     })
 
@@ -231,12 +306,18 @@ export class MemoryConsolidator {
       if (Date.now() - startTime > HARD_TIME_LIMIT_MS) throw new Error('Time limit exceeded')
 
       // Phase 5: Prune/Index
-      const decayed = runDecay(this.mem)
-      const archived = runArchive(this.mem)
-      const pruned = runPrune(this.mem)
+      // NOTE: decay/archive/prune currently operate globally across all memories.
+      // For scoped runs we skip them to avoid touching memories outside the
+      // requested scope. A global 'all' run still performs them.
+      let decayed = 0, archived = 0, pruned = 0
+      if (this.scope === 'all') {
+        decayed = runDecay(this.mem)
+        archived = runArchive(this.mem)
+        pruned = runPrune(this.mem)
+      }
       phasesCompleted.push('prune')
 
-      const summary = `Orient: ${health.totalActive} active, ${health.disputeRate.toFixed(2)} dispute rate. Gathered ${signals.length} signals, validated ${actions.length} actions, executed ${mutations} mutations (dry_run=${this.dryRun}). Decay: ${decayed}, Archive: ${archived}, Prune: ${pruned}.`
+      const summary = `[scope=${this.scope}] Orient: ${health.totalActive} active, ${health.disputeRate.toFixed(2)} dispute rate. Gathered ${signals.length} signals, validated ${actions.length} actions, executed ${mutations} mutations (dry_run=${this.dryRun}). Decay: ${decayed}, Archive: ${archived}, Prune: ${pruned}.`
 
       // Record completion
       this.taskDb.run(db => {
@@ -255,6 +336,7 @@ export class MemoryConsolidator {
         dryRun: this.dryRun,
         summary,
         durationMs: Date.now() - startTime,
+        scope: this.scope,
       }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err)
@@ -273,6 +355,7 @@ export class MemoryConsolidator {
         dryRun: this.dryRun,
         summary: `Error: ${errorMsg}`,
         durationMs: Date.now() - startTime,
+        scope: this.scope,
       }
     } finally {
       this.releaseLock()
@@ -280,13 +363,16 @@ export class MemoryConsolidator {
   }
 
   private gather(health: HealthReport): Signal[] {
+    const clause = this.scopeClause()
+    const clauseM1 = this.scopeClause('m1')
+    const clauseM2 = this.scopeClause('m2')
     return this.taskDb.run(db => {
       const signals: Signal[] = []
 
-      // Find stale memories past their decay window
+      // Find stale memories past their decay window (within scope)
       const allActive = db.prepare(`
-        SELECT * FROM memories WHERE state = 'active' AND pinned = 0
-      `).all() as Memory[]
+        SELECT * FROM memories WHERE state = 'active' AND pinned = 0${clause.sql}
+      `).all(...clause.params) as Memory[]
 
       for (const m of allActive) {
         const window = getDecayWindowDays(m)
@@ -298,7 +384,9 @@ export class MemoryConsolidator {
         }
       }
 
-      // Find duplicate content (same normalized content, different IDs)
+      // Find duplicate content (same normalized content, different IDs).
+      // Both sides of the self-join must respect the scope so we never
+      // pull in memories outside it.
       const dupes = db.prepare(`
         SELECT m1.id as id1, m2.id as id2
         FROM memories m1
@@ -307,19 +395,20 @@ export class MemoryConsolidator {
           AND m1.state = 'active'
           AND m2.state = 'active'
           AND LOWER(TRIM(m1.content)) = LOWER(TRIM(m2.content))
+        WHERE 1=1${clauseM1.sql}${clauseM2.sql}
         LIMIT 50
-      `).all() as { id1: number, id2: number }[]
+      `).all(...clauseM1.params, ...clauseM2.params) as { id1: number, id2: number }[]
 
       for (const d of dupes) {
         signals.push({ type: 'duplicate', memoryIds: [d.id1, d.id2], reason: 'identical normalized content' })
       }
 
-      // Find heavily disputed memories
+      // Find heavily disputed memories (within scope)
       const disputed = db.prepare(`
         SELECT id FROM memories
-        WHERE state = 'disputed' AND challenge_count > support_count + 2
+        WHERE state = 'disputed' AND challenge_count > support_count + 2${clause.sql}
         LIMIT 20
-      `).all() as { id: number }[]
+      `).all(...clause.params) as { id: number }[]
 
       for (const d of disputed) {
         signals.push({ type: 'disputed', memoryIds: [d.id], reason: 'heavily disputed, challenge_count >> support_count' })
@@ -330,16 +419,23 @@ export class MemoryConsolidator {
   }
 
   private validate(signals: Signal[]): ValidatedAction[] {
+    const clause = this.scopeClause()
     return this.taskDb.run(db => {
       const actions: ValidatedAction[] = []
-      const eligible = db.prepare("SELECT COUNT(*) as cnt FROM memories WHERE state = 'active'").get() as { cnt: number }
+      const eligible = db.prepare(
+        `SELECT COUNT(*) as cnt FROM memories WHERE state = 'active'${clause.sql}`
+      ).get(...clause.params) as { cnt: number }
       const maxActions = Math.ceil(eligible.cnt * 0.15)
 
       for (const signal of signals) {
         if (actions.length >= maxActions || actions.length >= this.maxMutationsPerRun) break
 
         if (signal.type === 'stale') {
-          const m = db.prepare('SELECT * FROM memories WHERE id = ?').get(signal.memoryIds[0]) as Memory | null
+          // Re-check scope when fetching the candidate memory so we never
+          // operate on rows that somehow slipped past the gather filter.
+          const m = db.prepare(
+            `SELECT * FROM memories WHERE id = ?${clause.sql}`
+          ).get(signal.memoryIds[0], ...clause.params) as Memory | null
           if (!m) continue
           // Block foundational and strategic
           if (m.classification === 'foundational' || m.classification === 'strategic') {
@@ -354,8 +450,12 @@ export class MemoryConsolidator {
         }
 
         if (signal.type === 'duplicate') {
-          const m1 = db.prepare('SELECT * FROM memories WHERE id = ?').get(signal.memoryIds[0]) as Memory | null
-          const m2 = db.prepare('SELECT * FROM memories WHERE id = ?').get(signal.memoryIds[1]) as Memory | null
+          const m1 = db.prepare(
+            `SELECT * FROM memories WHERE id = ?${clause.sql}`
+          ).get(signal.memoryIds[0], ...clause.params) as Memory | null
+          const m2 = db.prepare(
+            `SELECT * FROM memories WHERE id = ?${clause.sql}`
+          ).get(signal.memoryIds[1], ...clause.params) as Memory | null
           if (!m1 || !m2) continue
           if (m1.classification === 'foundational' || m1.classification === 'strategic') continue
           const survivor = m1.quality >= m2.quality ? m1 : m2
@@ -364,7 +464,9 @@ export class MemoryConsolidator {
         }
 
         if (signal.type === 'disputed') {
-          const m = db.prepare('SELECT * FROM memories WHERE id = ?').get(signal.memoryIds[0]) as Memory | null
+          const m = db.prepare(
+            `SELECT * FROM memories WHERE id = ?${clause.sql}`
+          ).get(signal.memoryIds[0], ...clause.params) as Memory | null
           if (!m) continue
           if (m.classification === 'foundational' || m.classification === 'strategic') continue
           actions.push({ type: 'challenge', targetId: m.id, confidence: 0.9, reason: signal.reason })
@@ -393,7 +495,7 @@ export class MemoryConsolidator {
         // Log proposed action but don't execute
         this.taskDb.run(db => {
           db.prepare(`INSERT INTO audit_log (agent, action, detail, memory_id) VALUES ('consolidator', 'consolidation_dry_run', ?, ?)`).run(
-            `Would ${action.type} memory ${action.targetId}: ${action.reason} (confidence=${action.confidence.toFixed(2)})`, action.targetId
+            `Would ${action.type} memory ${action.targetId}: ${action.reason} (confidence=${action.confidence.toFixed(2)}) [scope=${this.scope}]`, action.targetId
           )
         })
         mutations.push({ type: action.type, memoryId: action.targetId, before: {}, after: {}, reason: `[DRY RUN] ${action.reason}` })
@@ -402,7 +504,7 @@ export class MemoryConsolidator {
 
       if (action.type === 'challenge') {
         const before = this.mem.getMemory(action.targetId)
-        const after = this.mem.challengeMemory(action.targetId, `[consolidator run=${runId}] ${action.reason}`)
+        const after = this.mem.challengeMemory(action.targetId, `[consolidator run=${runId} scope=${this.scope}] ${action.reason}`)
         if (before && after) {
           mutations.push({
             type: 'challenge',
@@ -422,7 +524,7 @@ export class MemoryConsolidator {
             db.prepare('UPDATE memories SET support_count = support_count + 1 WHERE id = ?').run(action.survivorId)
             db.prepare("UPDATE memories SET state = 'superseded' WHERE id = ?").run(action.targetId)
             db.prepare(`INSERT INTO audit_log (agent, action, detail, memory_id) VALUES ('consolidator', 'consolidation_merge', ?, ?)`).run(
-              `Merged into ${action.survivorId}, run=${runId}`, action.targetId
+              `Merged into ${action.survivorId}, run=${runId}, scope=${this.scope}`, action.targetId
             )
           })
           mutations.push({
