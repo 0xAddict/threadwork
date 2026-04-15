@@ -1,7 +1,6 @@
 import { describe, test, expect } from 'bun:test'
 import { TMUX_PATH } from '../config'
-import { buildNudgeCommand, resolveSession } from '../nudge'
-import { TMUX_PATH } from '../config'
+import { buildNudgeCommand, buildNudgeSequence, resolveSession } from '../nudge'
 
 describe('nudge', () => {
   test('resolveSession maps agent label to tmux session name', () => {
@@ -10,13 +9,25 @@ describe('nudge', () => {
     expect(resolveSession('unknown-agent')).toBeNull()
   })
 
-  test('buildNudgeCommand creates correct tmux send-keys command', () => {
-    const cmd = buildNudgeCommand('claude-steve', 'You have a new task (#5) from boss: Update landing page')
+  test('buildNudgeCommand uses C-m (not Enter) as the submit keystroke', () => {
+    const cmd = buildNudgeCommand(
+      'claude-steve',
+      'You have a new task (#5) from boss: Update landing page',
+    )
     expect(cmd).toEqual([
       TMUX_PATH, 'send-keys', '-t', 'claude-steve',
       'You have a new task (#5) from boss: Update landing page',
-      'Enter',
+      'C-m',
     ])
+  })
+
+  test('buildNudgeSequence returns Escape + literal-paste + C-m in order', () => {
+    const [escapeCmd, literalCmd, cmCmd] = buildNudgeSequence('claude-steve', 'hello world')
+    expect(escapeCmd).toEqual([TMUX_PATH, 'send-keys', '-t', 'claude-steve', 'Escape'])
+    expect(literalCmd).toEqual([
+      TMUX_PATH, 'send-keys', '-t', 'claude-steve', '-l', 'hello world',
+    ])
+    expect(cmCmd).toEqual([TMUX_PATH, 'send-keys', '-t', 'claude-steve', 'C-m'])
   })
 })
 
