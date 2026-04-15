@@ -1,4 +1,7 @@
 import { AGENT_SESSIONS, TMUX_PATH } from './config'
+import { tryNudge, buildWakeMessage, type NudgeUrgency } from './debounce'
+import type { TaskDB } from './db'
+import type { AuditLog } from './audit'
 
 export function resolveSession(agent: string): string | null {
   const label = agent.toLowerCase()
@@ -21,10 +24,42 @@ const NUDGE_DISABLED =
   process.env.THREADWORK_NUDGE_DISABLE === '1' ||
   typeof (globalThis as any).Bun?.jest === 'function'
 
+// v2-lite debounce plumbing — module-level so every callsite goes through
+// the same debounce state. Main/server/watchdog set this once at boot via
+// configureNudgeDebounce(). If unset, nudgeAgent behaves exactly as before
+// (no debounce, no suppression).
+let _debounceDb: TaskDB | null = null
+let _debounceAudit: AuditLog | null = null
+
+export function configureNudgeDebounce(taskDb: TaskDB, audit?: AuditLog): void {
+  _debounceDb = taskDb
+  _debounceAudit = audit ?? null
+}
+
+export interface NudgeOptions {
+  /** Debounce priority hint. 'urgent' bypasses the suppression window. */
+  urgency?: NudgeUrgency
+  /** Skip debounce entirely for this call (e.g., raw test harness). */
+  bypassDebounce?: boolean
+}
+
+async function sendTmux(session: string, message: string): Promise<{ ok: boolean; error?: string }> {
+  const cmd = buildNudgeCommand(session, message)
+  const proc = Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe' })
+  const exitCode = await proc.exited
+
+  if (exitCode !== 0) {
+    const stderr = await new Response(proc.stderr).text()
+    return { ok: false, error: `tmux failed (exit ${exitCode}): ${stderr.trim()}` }
+  }
+  return { ok: true }
+}
+
 export async function nudgeAgent(
   agent: string,
   message: string,
-): Promise<{ ok: boolean; error?: string }> {
+  options?: NudgeOptions,
+): Promise<{ ok: boolean; error?: string; suppressed?: boolean; pendingCount?: number }> {
   const session = resolveSession(agent)
   if (!session) {
     return { ok: false, error: `Unknown agent: ${agent}` }
@@ -36,14 +71,48 @@ export async function nudgeAgent(
     return { ok: true }
   }
 
-  const cmd = buildNudgeCommand(session, message)
-  const proc = Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe' })
-  const exitCode = await proc.exited
+  const urgency: NudgeUrgency = options?.urgency ?? 'normal'
 
-  if (exitCode !== 0) {
-    const stderr = await new Response(proc.stderr).text()
-    return { ok: false, error: `tmux failed (exit ${exitCode}): ${stderr.trim()}` }
+  // If debounce hasn't been configured, or the caller explicitly opted out,
+  // fall back to direct send (legacy behavior).
+  if (!_debounceDb || options?.bypassDebounce) {
+    return sendTmux(session, message)
   }
 
-  return { ok: true }
+  const result = tryNudge(_debounceDb, agent, urgency)
+
+  if (!result.shouldFire) {
+    // Suppressed — audit-log for metrics (v_nudge_metrics_24h view).
+    if (_debounceAudit) {
+      try {
+        _debounceAudit.log('watchdog', 'nudge_suppressed', {
+          target: agent,
+          urgency,
+          reason: result.reason ?? 'debounced',
+          window_ms_remaining: result.windowRemainingMs ?? 0,
+          pending_count: result.pendingCount,
+        })
+      } catch { /* audit failure must never break a nudge decision */ }
+    }
+    return { ok: true, suppressed: true, pendingCount: result.pendingCount }
+  }
+
+  // Fire: use the uniform wake payload if pendingCount > 1 (batched wake).
+  // For a first-time / single-event fire, the original message is clearer
+  // and won't claim "you have 1 pending event" (redundant with the wake).
+  const payload = result.pendingCount > 1 ? buildWakeMessage(result.pendingCount) : message
+
+  if (_debounceAudit) {
+    try {
+      _debounceAudit.log('watchdog', 'nudge_fired', {
+        target: agent,
+        urgency,
+        reason: result.reason ?? 'window_elapsed',
+        pending_count: result.pendingCount,
+      })
+    } catch { /* same */ }
+  }
+
+  const sendResult = await sendTmux(session, payload)
+  return { ...sendResult, suppressed: false, pendingCount: result.pendingCount }
 }

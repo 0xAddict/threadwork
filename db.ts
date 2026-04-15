@@ -531,6 +531,125 @@ export class TaskDB {
       );
     `)
 
+    // v2-lite watchdog sprint (2026-04-09): nudge debounce table
+    // Stores per-agent last-nudged timestamp and pending event counter.
+    // Seed one row per known worker agent so tryNudge can upsert cheaply.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tw_nudge_debounce (
+        agent TEXT PRIMARY KEY,
+        last_nudged_at TEXT,
+        pending_count INTEGER NOT NULL DEFAULT 0,
+        last_urgency TEXT NOT NULL DEFAULT 'normal',
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('boss', 0, 'normal');
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('steve', 0, 'normal');
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('sadie', 0, 'normal');
+      INSERT OR IGNORE INTO tw_nudge_debounce (agent, pending_count, last_urgency)
+        VALUES ('kiera', 0, 'normal');
+    `)
+
+    // v2-lite watchdog sprint (2026-04-09): v_nudge_metrics_24h view
+    //
+    // Summarizes the last 24 hours of nudge behavior from audit_log. Reads
+    // rows written by nudge.ts::nudgeAgent: action IN ('nudge_fired',
+    // 'nudge_suppressed'), agent='watchdog', detail JSON with keys:
+    //   target         — agent being nudged
+    //   urgency        — low | normal | high | urgent
+    //   reason         — window_elapsed | urgent_bypass | first | debounced | disabled
+    //   pending_count  — events collapsed (for fired rows) or accumulated so far (for suppressed)
+    //   window_ms_remaining — only on suppressed rows
+    //
+    // Columns exposed:
+    //   window_start, window_end   — 24h window bounds (UTC)
+    //   target                     — per-agent breakdown row
+    //   nudges_fired_24h           — count of nudge_fired rows for this target
+    //   nudges_suppressed_24h      — count of nudge_suppressed rows for this target
+    //   suppression_rate           — suppressed / (suppressed + fired), or 0 if denom=0
+    //   avg_pending_per_fire       — mean pending_count across fired rows
+    //   max_pending_per_fire       — peak coalescing
+    //
+    // A second view v_nudge_metrics_24h_total aggregates the same columns
+    // across ALL targets for the scalar "sprint success criterion" check
+    // (suppression_rate >= 0.60).
+    //
+    // IMPORTANT: SQLite JSON1 is compiled in by default in Bun's bundled
+    // sqlite, so json_extract() is safe to use here. If a future build
+    // drops JSON1, these views must be replaced with a materialized table.
+    this.db.exec(`
+      DROP VIEW IF EXISTS v_nudge_metrics_24h;
+      CREATE VIEW v_nudge_metrics_24h AS
+      WITH window_bounds AS (
+        SELECT
+          datetime('now', '-24 hours') AS window_start,
+          datetime('now') AS window_end
+      ),
+      scoped AS (
+        SELECT
+          json_extract(al.detail, '$.target') AS target,
+          al.action,
+          al.created_at,
+          CAST(json_extract(al.detail, '$.pending_count') AS INTEGER) AS pending_count
+        FROM audit_log al, window_bounds wb
+        WHERE al.action IN ('nudge_fired', 'nudge_suppressed')
+          AND al.created_at >= wb.window_start
+      )
+      SELECT
+        wb.window_start,
+        wb.window_end,
+        s.target,
+        SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS nudges_fired_24h,
+        SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS nudges_suppressed_24h,
+        CASE
+          WHEN (SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END)) = 0 THEN 0.0
+          ELSE CAST(SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS REAL)
+             / CAST(SUM(CASE WHEN s.action IN ('nudge_fired', 'nudge_suppressed') THEN 1 ELSE 0 END) AS REAL)
+        END AS suppression_rate,
+        COALESCE(
+          AVG(CASE WHEN s.action = 'nudge_fired' THEN s.pending_count END),
+          0.0
+        ) AS avg_pending_per_fire,
+        COALESCE(
+          MAX(CASE WHEN s.action = 'nudge_fired' THEN s.pending_count END),
+          0
+        ) AS max_pending_per_fire
+      FROM scoped s, window_bounds wb
+      WHERE s.target IS NOT NULL
+      GROUP BY wb.window_start, wb.window_end, s.target
+      ORDER BY s.target;
+
+      DROP VIEW IF EXISTS v_nudge_metrics_24h_total;
+      CREATE VIEW v_nudge_metrics_24h_total AS
+      WITH window_bounds AS (
+        SELECT
+          datetime('now', '-24 hours') AS window_start,
+          datetime('now') AS window_end
+      ),
+      scoped AS (
+        SELECT
+          al.action,
+          al.created_at
+        FROM audit_log al, window_bounds wb
+        WHERE al.action IN ('nudge_fired', 'nudge_suppressed')
+          AND al.created_at >= wb.window_start
+      )
+      SELECT
+        wb.window_start,
+        wb.window_end,
+        SUM(CASE WHEN s.action = 'nudge_fired' THEN 1 ELSE 0 END) AS nudges_fired_24h,
+        SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS nudges_suppressed_24h,
+        CASE
+          WHEN COUNT(*) = 0 THEN 0.0
+          ELSE CAST(SUM(CASE WHEN s.action = 'nudge_suppressed' THEN 1 ELSE 0 END) AS REAL)
+             / CAST(COUNT(*) AS REAL)
+        END AS suppression_rate
+      FROM scoped s, window_bounds wb
+      GROUP BY wb.window_start, wb.window_end;
+    `)
+
   }
 
   createTask(input: CreateTaskInput): Task {
