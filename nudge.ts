@@ -10,7 +10,28 @@ export function resolveSession(agent: string): string | null {
 }
 
 export function buildNudgeCommand(session: string, message: string): string[] {
-  return [TMUX_PATH, 'send-keys', '-t', session, message, 'Enter']
+  return [TMUX_PATH, 'send-keys', '-t', session, message, 'C-m']
+}
+
+/**
+ * Build the three-step submit-verify send-keys sequence for a pane.
+ * Returns [escapeCmd, literalCmd, cmCmd] argv arrays.
+ *
+ * Per Decision #41 (2026-04-15): the Claude Code TUI does NOT reliably submit
+ * on a single 'Enter' keystroke when a paste arrives into a stale input buffer.
+ * The fix: Escape any in-progress menu/prompt, paste the payload literally with
+ * -l (no escape interpretation), then send C-m (the actual submit key, not the
+ * 'Enter' string alias tmux maps inconsistently).
+ */
+export function buildNudgeSequence(
+  session: string,
+  message: string,
+): [string[], string[], string[]] {
+  return [
+    [TMUX_PATH, 'send-keys', '-t', session, 'Escape'],
+    [TMUX_PATH, 'send-keys', '-t', session, '-l', message],
+    [TMUX_PATH, 'send-keys', '-t', session, 'C-m'],
+  ]
 }
 
 // Test-mode guard: when running under `bun test`, Bun sets process.env.NODE_ENV = 'test'
@@ -41,16 +62,69 @@ export interface NudgeOptions {
   source?: string
 }
 
-async function sendTmux(session: string, message: string): Promise<{ ok: boolean; error?: string }> {
-  const cmd = buildNudgeCommand(session, message)
-  const proc = Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe' })
-  const exitCode = await proc.exited
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
+async function runTmux(argv: string[]): Promise<{ ok: boolean; error?: string }> {
+  const proc = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' })
+  const exitCode = await proc.exited
   if (exitCode !== 0) {
     const stderr = await new Response(proc.stderr).text()
     return { ok: false, error: `tmux failed (exit ${exitCode}): ${stderr.trim()}` }
   }
   return { ok: true }
+}
+
+async function capturePane(session: string): Promise<string> {
+  const proc = Bun.spawn([TMUX_PATH, 'capture-pane', '-t', session, '-p'], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  const exitCode = await proc.exited
+  if (exitCode !== 0) return ''
+  return await new Response(proc.stdout).text()
+}
+
+/**
+ * Submit a nudge payload to a tmux pane using the Escape + literal-paste + C-m
+ * sequence (see buildNudgeSequence), then verify the payload landed via
+ * capture-pane (3 retries × 200ms, NO resubmit on failure).
+ *
+ * Per Decision #41 (2026-04-15). Replaces the old single-shot 'Enter' approach
+ * that silently failed when the Claude Code TUI consumed the key as a newline
+ * instead of submit.
+ */
+async function sendTmuxNudgeV2(
+  session: string,
+  message: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const [escapeCmd, literalCmd, cmCmd] = buildNudgeSequence(session, message)
+
+  const escapeResult = await runTmux(escapeCmd)
+  if (!escapeResult.ok) return escapeResult
+  await sleep(50)
+
+  const literalResult = await runTmux(literalCmd)
+  if (!literalResult.ok) return literalResult
+  await sleep(30)
+
+  const cmResult = await runTmux(cmCmd)
+  if (!cmResult.ok) return cmResult
+
+  // Verify-and-error loop (no resubmit). 3 retries × 200ms.
+  // Needle is a short prefix of the payload — long messages may wrap in
+  // capture-pane output, so we probe for a short unique token instead.
+  const needle = message.trimStart().slice(0, 24)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await sleep(200)
+    const pane = await capturePane(session)
+    if (pane.includes(needle)) {
+      return { ok: true }
+    }
+  }
+  return {
+    ok: false,
+    error: 'verify_failed: payload not visible in pane after 3 retries',
+  }
 }
 
 // Preflight check: does the tmux session actually exist on the running tmux server?
@@ -148,7 +222,7 @@ export async function dispatchAgentNudge(
       }
       return { ok: false, error: `no_target_pane: ${session}` }
     }
-    const sendResult = await sendTmux(session, message)
+    const sendResult = await sendTmuxNudgeV2(session, message)
     if (sendResult.ok) {
       logDelivered(source, agent, message)
     } else if (_debounceAudit) {
@@ -214,7 +288,7 @@ export async function dispatchAgentNudge(
     return { ok: false, error: `no_target_pane: ${session}`, suppressed: false, pendingCount: result.pendingCount }
   }
 
-  const sendResult = await sendTmux(session, payload)
+  const sendResult = await sendTmuxNudgeV2(session, payload)
   if (sendResult.ok) {
     // Canonical delivery audit — only on successful keystroke send.
     logDelivered(source, agent, payload)
