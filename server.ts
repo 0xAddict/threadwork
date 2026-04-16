@@ -17,6 +17,8 @@ import {
   formatDecisionOpened,
   formatDecisionFinalized,
   formatDecisionExpired,
+  formatPositionSubmitted,
+  formatCritiqueSubmitted,
 } from './notify'
 import { DB_PATH, SELF_LABEL, AGENT_SESSIONS, TMUX_PATH, TEAM_AGENTS, assertAgentIdentity } from './config'
 
@@ -262,6 +264,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           progress: { type: 'boolean', description: 'Whether real progress was made (default: true). If false, only heartbeat is updated, not progress timestamp.' },
           blocked: { type: 'boolean', description: 'Whether the task is blocked (default: false). If true, triggers immediate supervisor notification.' },
           blocked_reason: { type: 'string', description: 'Reason the task is blocked (used when blocked=true)' },
+          blocked_on: { type: 'string', enum: ['human', 'external_api', 'upstream_task', 'agent'], description: 'What is blocking this task. Determines watchdog behavior: agent/null uses short TTL (600s); human/external_api/upstream_task uses long window (eta_sec or 48h default). Use human for awaiting human decisions, external_api for third-party API calls, upstream_task for dependent tasks.' },
           eta_sec: { type: 'number', description: 'Estimated seconds until next meaningful update. Extends next_check_at accordingly.' },
         },
         required: ['agent', 'task_id', 'status', 'detail'],
@@ -974,6 +977,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const isProgress = (args.progress as boolean) ?? true
         const isBlocked = (args.blocked as boolean) ?? false
         const blockedReason = args.blocked_reason as string | undefined
+        const blockedOn = args.blocked_on as 'human' | 'external_api' | 'upstream_task' | 'agent' | undefined
         const etaSec = args.eta_sec as number | undefined
 
         // Always write to task_status_events (preserving existing behavior)
@@ -998,6 +1002,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isProgress,
           isBlocked,
           blockedReason: blockedReason ?? (isBlocked ? detail : undefined),
+          blockedOn: isBlocked ? blockedOn : undefined,
           etaSec,
         })
 
@@ -1249,6 +1254,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         try {
           const pos = dec.addPosition(decisionId, SELF_LABEL, position, rationale, evidence)
+          await postToGroup(formatPositionSubmitted(decisionId, SELF_LABEL, position, rationale))
           audit.log(SELF_LABEL, 'decision_position_submitted', { decision_id: decisionId, position_id: pos.id })
           return { content: [{ type: 'text', text: `Position #${pos.id} submitted on decision #${decisionId}.` }] }
         } catch (err: any) {
@@ -1267,6 +1273,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             positionId,
             severity: severity as import('./decision').CritiqueSeverity | undefined,
           })
+          const target = positionId ? `position #${positionId}` : 'decision overall'
+          await postToGroup(formatCritiqueSubmitted(decisionId, SELF_LABEL, target, critique))
           audit.log(SELF_LABEL, 'decision_critique_submitted', { decision_id: decisionId, critique_id: crit.id, severity: crit.severity })
           return { content: [{ type: 'text', text: `Critique #${crit.id} submitted on decision #${decisionId} (severity: ${crit.severity}).` }] }
         } catch (err: any) {

@@ -24,6 +24,7 @@ export interface Task {
   progress_timeout_sec: number
   blocked_at: string | null
   blocked_reason: string | null
+  blocked_on: string | null
   escalation_level: number
   worker_session_id: string | null
   version: number
@@ -68,6 +69,8 @@ export interface DelegateTaskInput {
   kind?: string
 }
 
+export type BlockedOn = 'human' | 'external_api' | 'upstream_task' | 'agent'
+
 export interface UpdateHeartbeatInput {
   taskId: number
   agent: string
@@ -75,6 +78,7 @@ export interface UpdateHeartbeatInput {
   isProgress?: boolean
   isBlocked?: boolean
   blockedReason?: string
+  blockedOn?: BlockedOn
   etaSec?: number
 }
 
@@ -242,6 +246,7 @@ export class TaskDB {
       "ALTER TABLE tasks ADD COLUMN progress_timeout_sec INTEGER DEFAULT 600",
       "ALTER TABLE tasks ADD COLUMN blocked_at TEXT",
       "ALTER TABLE tasks ADD COLUMN blocked_reason TEXT",
+      "ALTER TABLE tasks ADD COLUMN blocked_on TEXT",
       "ALTER TABLE tasks ADD COLUMN escalation_level INTEGER DEFAULT 0",
       "ALTER TABLE tasks ADD COLUMN worker_session_id TEXT",
       "ALTER TABLE tasks ADD COLUMN version INTEGER DEFAULT 1",
@@ -833,19 +838,32 @@ export class TaskDB {
       const timeoutSec = input.etaSec ?? task.heartbeat_timeout_sec ?? SUPERVISION_DEFAULTS.heartbeat_timeout_sec
 
       if (input.isBlocked) {
-        // Blocked: set blocked fields and next_check_at to now (for immediate watchdog pickup)
+        // blocked_on determines next_check_at behavior:
+        //   agent | null → immediate watchdog pickup (existing 600s BLOCKED_TTL)
+        //   human | external_api | upstream_task → explicit etaSec or 48h default
+        const blockedOn = input.blockedOn ?? null
+        const isLongBlock = blockedOn === 'human' || blockedOn === 'external_api' || blockedOn === 'upstream_task'
+        const DEFAULT_LONG_BLOCK_SEC = 172800 // 48h
+        const checkDelaySec = isLongBlock ? (input.etaSec ?? DEFAULT_LONG_BLOCK_SEC) : 0
+
         const stmt = db.prepare(`
           UPDATE tasks SET
             last_heartbeat_at = datetime('now'),
             ${input.isProgress !== false ? "last_progress_at = datetime('now')," : ""}
             blocked_at = datetime('now'),
             blocked_reason = ?,
-            next_check_at = datetime('now'),
+            blocked_on = ?,
+            next_check_at = datetime('now', '+' || ? || ' seconds'),
             version = version + 1
           WHERE id = ?
           RETURNING *
         `)
-        return stmt.get(input.blockedReason ?? null, input.taskId) as Task | null
+        return stmt.get(
+          input.blockedReason ?? null,
+          blockedOn,
+          checkDelaySec,
+          input.taskId,
+        ) as Task | null
       } else {
         // Not blocked: clear blocked fields if previously set, update heartbeat
         const stmt = db.prepare(`
