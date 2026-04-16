@@ -226,31 +226,58 @@ export class TaskReconciler {
    * Reconcile a single due task based on its state.
    */
   private async reconcileTask(task: Task, result: ReconcileResult): Promise<void> {
-    // (a) BLOCKED: relay to supervisor — but check TTL first
+    // (a) BLOCKED: relay to supervisor — but check TTL first.
+    // blocked_on semantics (added for #416):
+    //   human | external_api | upstream_task → long-block mode. next_check_at
+    //     was set at block time using eta_sec or 48h default. The BLOCKED_TTL_SEC
+    //     short path does NOT apply. On next_check_at expiry, re-relay to
+    //     supervisor and extend the window — do NOT clear blocked_at.
+    //   agent | null (legacy) → short-block mode. BLOCKED_TTL_SEC (600s)
+    //     applies. On expiry, clear blocked_at and fall through to escalation.
     if (task.blocked_at) {
+      const blockedOn = (task as any).blocked_on as string | null
+      const isLongBlock = blockedOn === 'human' || blockedOn === 'external_api' || blockedOn === 'upstream_task'
+
+      if (isLongBlock) {
+        // Long-block: task is waiting on something external. Do NOT apply
+        // BLOCKED_TTL_SEC and do NOT clear blocked_at. The watchdog only
+        // picks this task up again when next_check_at fires (set by the
+        // caller's eta_sec or 48h default). On re-check, relay to supervisor
+        // again and re-extend the check window.
+        const DEFAULT_LONG_BLOCK_SEC = 172800 // 48h
+        log(`Long-blocked task #${task.id} (blocked_on=${blockedOn}) — re-relaying to supervisor, extending check window by ${DEFAULT_LONG_BLOCK_SEC}s`)
+        this.taskDb.run(db => {
+          db.prepare(`
+            UPDATE tasks SET
+              next_check_at = datetime('now', '+' || ? || ' seconds')
+            WHERE id = ?
+          `).run(DEFAULT_LONG_BLOCK_SEC, task.id)
+        })
+        await this.handleBlocked(task, result)
+        return
+      }
+
+      // Short-block (blocked_on=agent or legacy/null): use BLOCKED_TTL_SEC
       const blockedStale = this.isOverdue(task.blocked_at, BLOCKED_TTL_SEC)
       const heartbeatFresh = task.last_heartbeat_at
         && new Date(task.last_heartbeat_at + 'Z').getTime() > new Date(task.blocked_at + 'Z').getTime()
 
       if (blockedStale && !heartbeatFresh) {
-        // Worker reported blocked but has gone silent — clear blocked state
-        // and fall through to normal crash/heartbeat checks.
-        // Capture timestamps BEFORE clearing so the audit row preserves forensics.
         const blockedSince = task.blocked_at
         const lastHeartbeat = task.last_heartbeat_at
-        log(`Blocked TTL expired for task #${task.id} (blocked ${blockedSince}, last heartbeat ${lastHeartbeat}) — clearing blocked state`)
+        log(`Blocked TTL expired for task #${task.id} (blocked_on=${blockedOn ?? 'null'}, blocked ${blockedSince}, last heartbeat ${lastHeartbeat}) — clearing blocked state`)
         this.taskDb.run(db => {
           db.prepare(`
-            UPDATE tasks SET blocked_at = NULL, blocked_reason = NULL WHERE id = ?
+            UPDATE tasks SET blocked_at = NULL, blocked_reason = NULL, blocked_on = NULL WHERE id = ?
           `).run(task.id)
         })
         this.audit.log('watchdog', 'blocked_ttl_expired', {
           task_id: task.id,
           agent: task.to_agent,
+          blocked_on: blockedOn,
           blocked_since: blockedSince,
           last_heartbeat: lastHeartbeat,
         }, task.id)
-        // Refresh the task object so downstream checks see cleared state
         task.blocked_at = null
         task.blocked_reason = null
         // DO NOT return — fall through to (b), (c), (d), (e), (f)
