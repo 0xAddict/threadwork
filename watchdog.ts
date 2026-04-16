@@ -46,6 +46,7 @@ export interface ReconcileResult {
   decisions_nudged: number
   decisions_ready: number
   idle_nudges: number
+  circuits_recovered: number
 }
 
 export interface WatchdogConfig {
@@ -194,6 +195,7 @@ export class TaskReconciler {
       decisions_nudged: 0,
       decisions_ready: 0,
       idle_nudges: 0,
+      circuits_recovered: 0,
     }
 
     // Query due tasks (exclude escalation tasks — they must NOT be re-escalated)
@@ -1095,7 +1097,73 @@ export class TaskReconciler {
   }
 
   // -------------------------------------------------------------------------
-  // 8. PERSISTENT LOOP
+  // 8. CIRCUIT BREAKER RECOVERY SWEEP
+  // -------------------------------------------------------------------------
+
+  /**
+   * Standalone sweep: find all circuits that are OPEN with expired cooldowns
+   * and transition them to HALF_OPEN. Runs every cycle, independent of
+   * reconcileTask (which only fires for in_progress tasks).
+   *
+   * Without this, all circuits can stay OPEN with no in_progress tasks to
+   * trigger tryHalfOpen — deadlocking delegate_task.
+   */
+  private _circuitRecoveryNotified = new Set<string>()
+
+  async recoverExpiredCircuits(result: ReconcileResult): Promise<void> {
+    const expiredOpen = this.taskDb.run(db =>
+      db.prepare(`
+        SELECT agent, circuit_state, cooldown_until
+        FROM agent_sessions
+        WHERE circuit_state = 'open'
+          AND cooldown_until IS NOT NULL
+          AND cooldown_until < datetime('now')
+      `).all() as Array<{ agent: string; circuit_state: string; cooldown_until: string }>
+    )
+
+    for (const row of expiredOpen) {
+      // Prevent flood: skip if agent is already HALF_OPEN (race with another path)
+      const current = this.taskDb.getCircuitState(row.agent)
+      if (!current || current.circuit_state !== 'open') continue
+
+      // Enforce one probe per HALF_OPEN agent: check for existing in_progress tasks
+      const existingProbe = this.taskDb.run(db =>
+        db.prepare(`
+          SELECT id FROM tasks
+          WHERE to_agent = ? AND status = 'in_progress'
+          LIMIT 1
+        `).get(row.agent) as { id: number } | null
+      )
+
+      const transitioned = this.taskDb.tryHalfOpen(row.agent)
+      if (!transitioned) continue
+
+      result.circuits_recovered++
+      log(`Circuit recovery: ${row.agent} OPEN→HALF_OPEN (cooldown expired ${row.cooldown_until})`)
+
+      // Debounce audit+telegram: emit once per agent per watchdog lifetime
+      if (!this._circuitRecoveryNotified.has(row.agent)) {
+        this._circuitRecoveryNotified.add(row.agent)
+        this.audit.log('watchdog', 'circuit_recovery', {
+          agent: row.agent,
+          cooldown_expired: row.cooldown_until,
+          had_probe_task: !!existingProbe,
+        })
+        await postToGroup(`\u26a1 Circuit recovery: ${esc(row.agent)} moved OPEN\\u2192HALF\\_OPEN \\(cooldown expired\\)`)
+      }
+    }
+
+    // Clear debounce entries for agents no longer in recovery (circuit closed)
+    for (const agent of this._circuitRecoveryNotified) {
+      const state = this.taskDb.getCircuitState(agent)
+      if (!state || state.circuit_state === 'closed') {
+        this._circuitRecoveryNotified.delete(agent)
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 9. PERSISTENT LOOP
   // -------------------------------------------------------------------------
 
   /**
@@ -1116,8 +1184,26 @@ export class TaskReconciler {
           continue
         }
 
+        // Step 1a: Recover expired open circuits (independent of in_progress tasks)
+        const reconcileResult: ReconcileResult = {
+          checked: 0, nudged: 0, escalated: 0, blocked_relayed: 0,
+          dead_sessions: 0, decisions_expired: 0, decisions_nudged: 0,
+          decisions_ready: 0, idle_nudges: 0, circuits_recovered: 0,
+        }
+        try {
+          await this.recoverExpiredCircuits(reconcileResult)
+        } catch (err) {
+          logError('Circuit recovery sweep failed', err)
+        }
+
         // Step 2: Reconcile due tasks
-        const reconcileResult = await this.reconcileDueTasks()
+        const taskResult = await this.reconcileDueTasks()
+        // Merge task reconciliation counts into the cycle result
+        reconcileResult.checked = taskResult.checked
+        reconcileResult.nudged = taskResult.nudged
+        reconcileResult.escalated = taskResult.escalated
+        reconcileResult.blocked_relayed = taskResult.blocked_relayed
+        reconcileResult.dead_sessions = taskResult.dead_sessions
 
         // Step 3: Check agent sessions
         await this.checkAgentSessions()
@@ -1150,9 +1236,9 @@ export class TaskReconciler {
 
         // Log cycle summary
         const r = reconcileResult
-        const hasActivity = r.checked > 0 || r.nudged > 0 || r.escalated > 0 || r.blocked_relayed > 0 || r.dead_sessions > 0 || r.decisions_expired > 0 || r.decisions_nudged > 0 || r.decisions_ready > 0 || r.idle_nudges > 0
+        const hasActivity = r.checked > 0 || r.nudged > 0 || r.escalated > 0 || r.blocked_relayed > 0 || r.dead_sessions > 0 || r.decisions_expired > 0 || r.decisions_nudged > 0 || r.decisions_ready > 0 || r.idle_nudges > 0 || r.circuits_recovered > 0
         if (hasActivity) {
-          log(`Cycle complete: checked=${r.checked} nudged=${r.nudged} escalated=${r.escalated} blocked_relayed=${r.blocked_relayed} dead_sessions=${r.dead_sessions} decisions_expired=${r.decisions_expired} decisions_nudged=${r.decisions_nudged} decisions_ready=${r.decisions_ready} idle_nudges=${r.idle_nudges}`)
+          log(`Cycle complete: checked=${r.checked} nudged=${r.nudged} escalated=${r.escalated} blocked_relayed=${r.blocked_relayed} dead_sessions=${r.dead_sessions} decisions_expired=${r.decisions_expired} decisions_nudged=${r.decisions_nudged} decisions_ready=${r.decisions_ready} idle_nudges=${r.idle_nudges} circuits_recovered=${r.circuits_recovered}`)
         }
       } catch (err) {
         logError('Cycle error', err)
