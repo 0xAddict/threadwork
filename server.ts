@@ -718,7 +718,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const taskId = args.task_id as number
         const result = args.result as string
 
-        // Use finalizer check: refuse if open child tasks exist
+        // Use finalizer check: refuse if open non-synthetic child tasks exist.
+        // Synthetic (sub-agent) children are auto-closed as a side effect.
         let completion = db.completeTaskWithFinalizerCheck(taskId, result, SELF_LABEL)
         if (completion.error) {
           audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: completion.error }, taskId)
@@ -726,6 +727,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         let task = completion.task
+        let autoClosedChildren = completion.autoClosedChildren
 
         // If agent-scoped completion didn't match, boss can force-complete
         if (!task && SELF_LABEL === 'boss') {
@@ -735,6 +737,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             return { content: [{ type: 'text', text: forceCompletion.error, isError: true }] }
           }
           task = forceCompletion.task
+          autoClosedChildren = forceCompletion.autoClosedChildren
         }
 
         if (!task) {
@@ -789,10 +792,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           importance: priorityToImportance[task.priority] ?? 2,
           source_task_id: task.id,
         })
-        audit.log(SELF_LABEL, 'task_completed', { task_id: taskId, result }, taskId)
+        audit.log(SELF_LABEL, 'task_completed', {
+          task_id: taskId, result,
+          auto_closed_children: autoClosedChildren ?? null,
+        }, taskId)
 
         const completeNudgeWarning = nudgeResult.ok ? '' : ` (warning: nudge to ${task.from_agent} failed — ${nudgeResult.error})`
-        return { content: [{ type: 'text', text: `Task #${task.id} completed. Result: ${result}${completeNudgeWarning}` }] }
+        const autoCloseInfo = autoClosedChildren?.length ? ` (auto-closed ${autoClosedChildren.length} sub-agent task(s): ${autoClosedChildren.map(id => '#' + id).join(', ')})` : ''
+        return { content: [{ type: 'text', text: `Task #${task.id} completed. Result: ${result}${autoCloseInfo}${completeNudgeWarning}` }] }
       }
 
       case 'list_tasks': {
