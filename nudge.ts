@@ -64,66 +64,229 @@ export interface NudgeOptions {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
-async function runTmux(argv: string[]): Promise<{ ok: boolean; error?: string }> {
-  const proc = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' })
+export type TmuxFailReason =
+  | 'tmux_missing'
+  | 'session_gone'
+  | 'send_keys_error'
+  | 'load_buffer_error'
+  | 'verify_failed'
+  | 'empty_message'
+  | 'discovery_ping_failed'
+
+function classifyTmuxStderr(stderr: string): TmuxFailReason {
+  const s = stderr.toLowerCase()
+  if (
+    s.includes("can't find session") ||
+    s.includes('no such session') ||
+    s.includes('session not found') ||
+    s.includes("can't find pane") ||
+    s.includes('no such pane')
+  ) {
+    return 'session_gone'
+  }
+  return 'send_keys_error'
+}
+
+async function runTmux(
+  argv: string[],
+): Promise<{ ok: boolean; error?: string; reason?: TmuxFailReason }> {
+  let proc
+  try {
+    proc = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' })
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/ENOENT|not found|command not found/i.test(msg)) {
+      return { ok: false, error: `tmux_missing: ${msg}`, reason: 'tmux_missing' }
+    }
+    return { ok: false, error: `spawn_failed: ${msg}`, reason: 'send_keys_error' }
+  }
   const exitCode = await proc.exited
   if (exitCode !== 0) {
     const stderr = await new Response(proc.stderr).text()
-    return { ok: false, error: `tmux failed (exit ${exitCode}): ${stderr.trim()}` }
+    const reason = classifyTmuxStderr(stderr)
+    return {
+      ok: false,
+      error: `tmux failed (exit ${exitCode}): ${stderr.trim()}`,
+      reason,
+    }
   }
   return { ok: true }
 }
 
 async function capturePane(session: string): Promise<string> {
-  const proc = Bun.spawn([TMUX_PATH, 'capture-pane', '-t', session, '-p'], {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
+  // -S -50 -E -1 → last 50 lines. Claude Code's streaming panel can be
+  // very tall, so -S -20 (council suggestion) was too shallow per external
+  // research. 50 lines covers typical streaming response panels without
+  // O(scrollback) cost.
+  const proc = Bun.spawn(
+    [TMUX_PATH, 'capture-pane', '-t', session, '-p', '-S', '-50', '-E', '-1'],
+    { stdout: 'pipe', stderr: 'pipe' },
+  )
   const exitCode = await proc.exited
   if (exitCode !== 0) return ''
   return await new Response(proc.stdout).text()
 }
 
+// Per-session serializer. Both nudge and interrupt dispatchers route through
+// withSessionLock to prevent the Ctrl-C / paste / C-m interleave race flagged
+// by the codex commit review — module state previously had only debounce/audit
+// handles, no mutex.
+const _sessionLocks: Map<string, Promise<unknown>> = new Map()
+
+async function withSessionLock<T>(
+  session: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = _sessionLocks.get(session) ?? Promise.resolve()
+  const current: Promise<T> = prev.then(
+    () => fn(),
+    () => fn(),
+  )
+  const tracked: Promise<unknown> = current.catch(() => {})
+  _sessionLocks.set(session, tracked)
+  try {
+    return await current
+  } finally {
+    if (_sessionLocks.get(session) === tracked) {
+      _sessionLocks.delete(session)
+    }
+  }
+}
+
+const NUDGE_BUFFER_PREFIX = 'threadwork-nudge-'
+
+function normalizePaneText(s: string): string {
+  return s.replace(/\s+/g, ' ').trim()
+}
+
 /**
- * Submit a nudge payload to a tmux pane using the Escape + literal-paste + C-m
- * sequence (see buildNudgeSequence), then verify the payload landed via
- * capture-pane (3 retries × 200ms, NO resubmit on failure).
+ * Submit a nudge payload to a tmux pane.
  *
- * Per Decision #41 (2026-04-15). Replaces the old single-shot 'Enter' approach
- * that silently failed when the Claude Code TUI consumed the key as a newline
- * instead of submit.
+ * Strategy (per Decision #41 + post-council codex chairman + external deep
+ * research feeding back anthropics/claude-code#31739):
+ *
+ *   1. Reject empty messages at the edge — otherwise needle='' produces
+ *      vacuous-match verify-success (codex B1).
+ *   2. Strip literal newlines from the payload — Ink's text-input treats
+ *      \n as key.enter (newline in composer) and only \r as key.return
+ *      (submit). A payload containing \n would compose multi-line input,
+ *      potentially submitting at the wrong point.
+ *   3. Capture a baseline pane snapshot BEFORE paste so we can delta-verify.
+ *   4. `load-buffer` + `paste-buffer -p -d -b` into the target pane. This
+ *      mirrors the claude_code_agent_farm / awslabs/cli-agent-orchestrator
+ *      production pattern. `-p` enables bracketed paste, `-d` deletes the
+ *      named buffer after paste, `-b` uses a unique buffer name to avoid
+ *      clobbering concurrent pastes.
+ *   5. 200ms settle delay (agent_farm's production value).
+ *   6. `send-keys C-m` to submit. C-m is the literal Ctrl-M keystroke, not
+ *      tmux's `'Enter'` alias which maps inconsistently across TUIs.
+ *   7. Delta verify: 3 retries × 400ms. Success = normalized 48-char needle
+ *      now appears at a LATER position in the pane tail than in the
+ *      baseline capture. Kills the stale-content false-positive class.
+ *
+ * Claude Code v2.1.108 (anthropics/claude-code#31739) fixed the underlying
+ * Ink + crossterm EventStream dropped-key state at the TUI level. This
+ * implementation is belt-and-suspenders for older TUIs and portability.
  */
 async function sendTmuxNudgeV2(
   session: string,
   message: string,
-): Promise<{ ok: boolean; error?: string }> {
-  const [escapeCmd, literalCmd, cmCmd] = buildNudgeSequence(session, message)
+): Promise<{ ok: boolean; error?: string; reason?: TmuxFailReason }> {
+  if (!message || !message.trim()) {
+    return {
+      ok: false,
+      error: 'empty_message: refusing to nudge with blank payload',
+      reason: 'empty_message',
+    }
+  }
 
-  const escapeResult = await runTmux(escapeCmd)
-  if (!escapeResult.ok) return escapeResult
-  await sleep(50)
+  const safeMessage = message.replace(/\r?\n/g, ' ')
+  const normalizedMessage = normalizePaneText(safeMessage)
+  const needle = normalizedMessage.slice(0, 48)
 
-  const literalResult = await runTmux(literalCmd)
-  if (!literalResult.ok) return literalResult
-  await sleep(30)
+  const baselinePane = await capturePane(session)
+  const baselineIdx = normalizePaneText(baselinePane).lastIndexOf(needle)
 
-  const cmResult = await runTmux(cmCmd)
+  const buffer = `${NUDGE_BUFFER_PREFIX}${session}-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`
+
+  let loadProc
+  try {
+    loadProc = Bun.spawn([TMUX_PATH, 'load-buffer', '-b', buffer, '-'], {
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return {
+      ok: false,
+      error: `load_buffer_spawn_failed: ${msg}`,
+      reason: /ENOENT/i.test(msg) ? 'tmux_missing' : 'load_buffer_error',
+    }
+  }
+  try {
+    loadProc.stdin.write(safeMessage)
+    loadProc.stdin.end()
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return {
+      ok: false,
+      error: `load_buffer_stdin_failed: ${msg}`,
+      reason: 'load_buffer_error',
+    }
+  }
+  const loadExit = await loadProc.exited
+  if (loadExit !== 0) {
+    const stderr = await new Response(loadProc.stderr).text()
+    return {
+      ok: false,
+      error: `load_buffer_failed (exit ${loadExit}): ${stderr.trim()}`,
+      reason: classifyTmuxStderr(stderr) === 'session_gone'
+        ? 'session_gone'
+        : 'load_buffer_error',
+    }
+  }
+
+  const pasteResult = await runTmux([
+    TMUX_PATH,
+    'paste-buffer',
+    '-p',
+    '-d',
+    '-b',
+    buffer,
+    '-t',
+    session,
+  ])
+  if (!pasteResult.ok) {
+    // On paste failure, `-d` did NOT delete the buffer — clean it up.
+    void runTmux([TMUX_PATH, 'delete-buffer', '-b', buffer])
+    return pasteResult
+  }
+
+  // 200ms settle — agent_farm's production value. Gives the TUI a beat to
+  // process the bracketed paste before we submit.
+  await sleep(200)
+
+  const cmResult = await runTmux([TMUX_PATH, 'send-keys', '-t', session, 'C-m'])
   if (!cmResult.ok) return cmResult
 
-  // Verify-and-error loop (no resubmit). 3 retries × 200ms.
-  // Needle is a short prefix of the payload — long messages may wrap in
-  // capture-pane output, so we probe for a short unique token instead.
-  const needle = message.trimStart().slice(0, 24)
+  // Delta verify: 3 retries × 400ms. Success only if the needle appears
+  // LATER in the post-send pane tail than it did in the baseline.
   for (let attempt = 0; attempt < 3; attempt++) {
-    await sleep(200)
+    await sleep(400)
     const pane = await capturePane(session)
-    if (pane.includes(needle)) {
+    const currentIdx = normalizePaneText(pane).lastIndexOf(needle)
+    if (currentIdx > baselineIdx) {
       return { ok: true }
     }
   }
   return {
     ok: false,
-    error: 'verify_failed: payload not visible in pane after 3 retries',
+    error:
+      'verify_failed: payload did not advance past baseline in pane tail after 3 × 400ms retries',
+    reason: 'verify_failed',
   }
 }
 
@@ -222,7 +385,9 @@ export async function dispatchAgentNudge(
       }
       return { ok: false, error: `no_target_pane: ${session}` }
     }
-    const sendResult = await sendTmuxNudgeV2(session, message)
+    const sendResult = await withSessionLock(session, () =>
+      sendTmuxNudgeV2(session, message),
+    )
     if (sendResult.ok) {
       logDelivered(source, agent, message)
     } else if (_debounceAudit) {
@@ -288,7 +453,9 @@ export async function dispatchAgentNudge(
     return { ok: false, error: `no_target_pane: ${session}`, suppressed: false, pendingCount: result.pendingCount }
   }
 
-  const sendResult = await sendTmuxNudgeV2(session, payload)
+  const sendResult = await withSessionLock(session, () =>
+    sendTmuxNudgeV2(session, payload),
+  )
   if (sendResult.ok) {
     // Canonical delivery audit — only on successful keystroke send.
     logDelivered(source, agent, payload)
@@ -352,25 +519,24 @@ export async function dispatchAgentInterrupt(
     return { ok: false, error: `no_target_pane: ${session}` }
   }
 
-  const proc = Bun.spawn([TMUX_PATH, 'send-keys', '-t', session, 'C-c'], {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  const exitCode = await proc.exited
+  // Serialize interrupt against concurrent nudges on the same session —
+  // prevents the Ctrl-C/paste/C-m interleave race flagged by codex review.
+  const interruptResult = await withSessionLock(session, () =>
+    runTmux([TMUX_PATH, 'send-keys', '-t', session, 'C-c']),
+  )
 
-  if (exitCode !== 0) {
-    const stderr = await new Response(proc.stderr).text()
+  if (!interruptResult.ok) {
     if (_debounceAudit) {
       try {
         _debounceAudit.log(source, NUDGE_ACTIONS.DELIVERY_FAILED, {
           target: agent,
-          reason: 'send_keys_error',
-          error: stderr.trim(),
+          reason: interruptResult.reason ?? 'send_keys_error',
+          error: interruptResult.error ?? 'unknown',
           kind: 'interrupt',
         })
       } catch {}
     }
-    return { ok: false, error: `tmux failed (exit ${exitCode}): ${stderr.trim()}` }
+    return { ok: false, error: interruptResult.error ?? 'interrupt_failed' }
   }
 
   if (_debounceAudit) {
