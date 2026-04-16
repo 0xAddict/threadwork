@@ -272,10 +272,20 @@ export class TaskDB {
         enabled INTEGER DEFAULT 0,
         created_at TEXT DEFAULT (datetime('now'))
       );
-      INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('blackboard_enabled', 0);
-      INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('progress_events_enabled', 0);
-      INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('gates_enabled', 0);
+      INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('blackboard_enabled', 1);
+      INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('progress_events_enabled', 1);
+      INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('gates_enabled', 1);
     `)
+
+    // Auto-enable required flags if they exist but are disabled (e.g., legacy DB)
+    const requiredFlags = ['blackboard_enabled', 'progress_events_enabled', 'gates_enabled']
+    for (const flag of requiredFlags) {
+      const row = this.db.prepare('SELECT enabled FROM feature_flags WHERE flag_name = ?').get(flag) as { enabled: number } | null
+      if (row && !row.enabled) {
+        this.db.prepare('UPDATE feature_flags SET enabled = 1 WHERE flag_name = ?').run(flag)
+        console.warn(`[task-board] Auto-enabled feature flag '${flag}' (was disabled)`)
+      }
+    }
 
     // Supervision indexes
     this.db.exec(`
