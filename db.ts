@@ -910,16 +910,32 @@ export class TaskDB {
    * If open children exist, returns an error object with child IDs.
    * Otherwise completes normally.
    */
-  completeTaskWithFinalizerCheck(id: number, result: string, agent: string): { task?: Task; error?: string } {
+  completeTaskWithFinalizerCheck(id: number, result: string, agent: string): { task?: Task; error?: string; autoClosedChildren?: number[] } {
     return this.run(db => {
       // Check for open children
       const openChildren = db.prepare(`
-        SELECT id FROM tasks
+        SELECT id, is_synthetic FROM tasks
         WHERE parent_task_id = ? AND status NOT IN ('completed', 'cancelled')
-      `).all(id) as { id: number }[]
+      `).all(id) as { id: number; is_synthetic: number }[]
 
-      if (openChildren.length > 0) {
-        const childIds = openChildren.map(c => `#${c.id}`).join(', ')
+      // Auto-close synthetic (sub-agent) children — the Agent tool has returned
+      const autoClosedIds: number[] = []
+      const nonSyntheticOpen: number[] = []
+      for (const child of openChildren) {
+        if (child.is_synthetic) {
+          db.prepare(`
+            UPDATE tasks SET status = 'completed', result = 'Auto-closed: parent task completed',
+              completed_at = datetime('now'), next_check_at = NULL
+            WHERE id = ? AND status = 'in_progress'
+          `).run(child.id)
+          autoClosedIds.push(child.id)
+        } else {
+          nonSyntheticOpen.push(child.id)
+        }
+      }
+
+      if (nonSyntheticOpen.length > 0) {
+        const childIds = nonSyntheticOpen.map(c => `#${c}`).join(', ')
         return {
           error: `Cannot complete task #${id}: open child tasks [${childIds}]. Complete or cancel them first.`,
         }
@@ -940,23 +956,38 @@ export class TaskDB {
       const task = stmt.get(result, id, agent) as Task | null
 
       if (!task) return { error: undefined, task: undefined }
-      return { task }
+      return { task, autoClosedChildren: autoClosedIds.length > 0 ? autoClosedIds : undefined }
     })
   }
 
   /**
    * Boss override: force complete with finalizer check.
    */
-  forceCompleteTaskWithFinalizerCheck(id: number, result: string): { task?: Task; error?: string } {
+  forceCompleteTaskWithFinalizerCheck(id: number, result: string): { task?: Task; error?: string; autoClosedChildren?: number[] } {
     return this.run(db => {
-      // Check for open children
+      // Check for open children — auto-close synthetic ones
       const openChildren = db.prepare(`
-        SELECT id FROM tasks
+        SELECT id, is_synthetic FROM tasks
         WHERE parent_task_id = ? AND status NOT IN ('completed', 'cancelled')
-      `).all(id) as { id: number }[]
+      `).all(id) as { id: number; is_synthetic: number }[]
 
-      if (openChildren.length > 0) {
-        const childIds = openChildren.map(c => `#${c.id}`).join(', ')
+      const autoClosedIds: number[] = []
+      const nonSyntheticOpen: number[] = []
+      for (const child of openChildren) {
+        if (child.is_synthetic) {
+          db.prepare(`
+            UPDATE tasks SET status = 'completed', result = 'Auto-closed: parent task completed',
+              completed_at = datetime('now'), next_check_at = NULL
+            WHERE id = ? AND status = 'in_progress'
+          `).run(child.id)
+          autoClosedIds.push(child.id)
+        } else {
+          nonSyntheticOpen.push(child.id)
+        }
+      }
+
+      if (nonSyntheticOpen.length > 0) {
+        const childIds = nonSyntheticOpen.map(c => `#${c}`).join(', ')
         return {
           error: `Cannot complete task #${id}: open child tasks [${childIds}]. Complete or cancel them first.`,
         }
@@ -975,7 +1006,7 @@ export class TaskDB {
       `)
       const task = stmt.get(result, id) as Task | null
       if (!task) return { error: undefined, task: undefined }
-      return { task }
+      return { task, autoClosedChildren: autoClosedIds.length > 0 ? autoClosedIds : undefined }
     })
   }
 
