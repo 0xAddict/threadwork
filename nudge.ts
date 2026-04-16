@@ -171,16 +171,20 @@ function normalizePaneText(s: string): string {
  *      \n as key.enter (newline in composer) and only \r as key.return
  *      (submit). A payload containing \n would compose multi-line input,
  *      potentially submitting at the wrong point.
- *   3. Capture a baseline pane snapshot BEFORE paste so we can delta-verify.
- *   4. `load-buffer` + `paste-buffer -p -d -b` into the target pane. This
+ *   3. Preamble C-m: send a no-op C-m to wake the TUI's EventBroker from
+ *      idle-dropped-keys state. On a long-idle pane, Ink's crossterm
+ *      EventStream stops processing key events; this C-m re-activates it.
+ *      Proven on steve (idle 9+ min) and sadie (controlled A/B test).
+ *   4. Capture a baseline pane snapshot BEFORE paste so we can delta-verify.
+ *   5. `load-buffer` + `paste-buffer -p -d -b` into the target pane. This
  *      mirrors the claude_code_agent_farm / awslabs/cli-agent-orchestrator
  *      production pattern. `-p` enables bracketed paste, `-d` deletes the
  *      named buffer after paste, `-b` uses a unique buffer name to avoid
  *      clobbering concurrent pastes.
- *   5. 200ms settle delay (agent_farm's production value).
- *   6. `send-keys C-m` to submit. C-m is the literal Ctrl-M keystroke, not
+ *   6. 200ms settle delay (agent_farm's production value).
+ *   7. `send-keys C-m` to submit. C-m is the literal Ctrl-M keystroke, not
  *      tmux's `'Enter'` alias which maps inconsistently across TUIs.
- *   7. Delta verify: 3 retries × 400ms. Success = normalized 48-char needle
+ *   8. Delta verify: 3 retries × 400ms. Success = normalized 48-char needle
  *      now appears at a LATER position in the pane tail than in the
  *      baseline capture. Kills the stale-content false-positive class.
  *
@@ -203,6 +207,18 @@ async function sendTmuxNudgeV2(
   const safeMessage = message.replace(/\r?\n/g, ' ')
   const normalizedMessage = normalizePaneText(safeMessage)
   const needle = normalizedMessage.slice(0, 48)
+
+  // Preamble C-m: wake the TUI's EventBroker from idle-dropped-keys state.
+  // On a long-idle Claude Code pane, the Ink crossterm EventStream stops
+  // processing key events (anthropics/claude-code#31739, Codex #12645).
+  // A no-op C-m on an empty prompt re-activates the EventStream so the
+  // real C-m after the paste registers as a submit event.
+  // If the prompt has leftover text, this submits it first — acceptable
+  // because stale input should not accumulate in a healthy agent pane.
+  // Proven on steve (idle 9+ min → C-m woke) and sadie (idle → new method
+  // with preamble C-m succeeded where old method without it failed).
+  await runTmux([TMUX_PATH, 'send-keys', '-t', session, 'C-m'])
+  await sleep(300)
 
   const baselinePane = await capturePane(session)
   const baselineIdx = normalizePaneText(baselinePane).lastIndexOf(needle)
