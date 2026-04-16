@@ -12,6 +12,7 @@ import { AuditLog } from './audit'
 import { dispatchAgentNudge, configureNudgeDebounce } from './nudge'
 import { postToGroup, formatDecisionExpired, esc } from './notify'
 import { checkAndRunDebrief } from './debrief'
+import { MemoryConsolidator } from './consolidator'
 import {
   DB_PATH,
   AGENT_SESSIONS,
@@ -23,6 +24,8 @@ import {
   WORKER_AGENTS,
   BOSS_AGENT,
   TEAM_AGENTS,
+  CONSOLIDATION_DRY_RUN,
+  CONSOLIDATION_CHECK_INTERVAL_MS,
 } from './config'
 
 // ---------------------------------------------------------------------------
@@ -1163,7 +1166,55 @@ export class TaskReconciler {
   }
 
   // -------------------------------------------------------------------------
-  // 9. PERSISTENT LOOP
+  // 9. CONSOLIDATION SCHEDULER
+  // -------------------------------------------------------------------------
+
+  private _lastConsolidationAttemptMs = 0
+
+  /**
+   * Run memory consolidation if enough time has elapsed since the last attempt.
+   * Replaces the snoopy-bot.ts standalone loop — consolidation is maintenance
+   * work that belongs in the always-on watchdog, not an interactive agent.
+   */
+  async runConsolidationIfDue(): Promise<void> {
+    const now = Date.now()
+    if (now - this._lastConsolidationAttemptMs < CONSOLIDATION_CHECK_INTERVAL_MS) return
+
+    this._lastConsolidationAttemptMs = now
+
+    const mem = new MemoryDB(this.taskDb)
+    const consolidator = new MemoryConsolidator(mem, this.taskDb, CONSOLIDATION_DRY_RUN)
+
+    const triggers = consolidator.checkTriggers()
+    const reasons: string[] = []
+    if (triggers.time) reasons.push('time')
+    if (triggers.volume) reasons.push('volume')
+    if (triggers.idle) reasons.push('idle')
+
+    if (reasons.length === 0 || !triggers.lock) return
+
+    const triggerReason = `watchdog-auto: ${reasons.join('+')}`
+    log(`Consolidation triggered: ${triggerReason}`)
+
+    const result = await consolidator.run(triggerReason)
+    log(`Consolidation complete: ${result.summary}`)
+
+    // Update last-run observability in consolidation_runs (already done by consolidator.run)
+    this.audit.log('watchdog', 'consolidation_run', {
+      run_id: result.runId,
+      mutations: result.mutations,
+      dry_run: result.dryRun,
+      trigger: triggerReason,
+      duration_ms: result.durationMs,
+    })
+
+    if (result.mutations > 0) {
+      await postToGroup(`\ud83e\udde0 Consolidation: ${result.mutations} mutation\\(s\\), ${result.durationMs}ms`)
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 10. PERSISTENT LOOP
   // -------------------------------------------------------------------------
 
   /**
@@ -1232,6 +1283,13 @@ export class TaskReconciler {
           }
         } catch (err) {
           logError('Debrief check failed', err)
+        }
+
+        // Step 3d: Scheduled memory consolidation (replaces snoopy-bot.ts loop)
+        try {
+          await this.runConsolidationIfDue()
+        } catch (err) {
+          logError('Consolidation scheduler failed', err)
         }
 
         // Log cycle summary
