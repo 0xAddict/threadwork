@@ -57,7 +57,7 @@ const mcp = new Server(
       `You are agent "${SELF_LABEL}". You have a shared task board and personal memory with other agents (boss, steve, sadie, kiera).`,
       'TASK TOOLS: create_task, delegate_task, claim_task, complete_task, list_tasks, send_note, nudge_agent, interrupt_agent',
       'DELEGATION: Use delegate_task (not create_task) when assigning work to another agent. It sets up supervision automatically.',
-      'SUB-AGENT TRACKING: Before spawning Agent tool, call spawn_subagent to create a durable record. After Agent returns, call close_subagent. Use get_children to see child tasks.',
+      'SUB-AGENT TRACKING: Before spawning Agent tool, call spawn_subagent. After Agent returns — ON SUCCESS OR FAILURE — call close_subagent. Treat this as a try/finally: if Agent throws, you are STILL responsible for close_subagent before any next action (server-side auto-close on parent complete_task is a backstop, not the primary path). Use get_children to see child tasks.',
       'STATUS TOOLS: write_status (sub-agents report progress, supports progress/blocked/eta), read_status (monitor loops check progress), clear_status (cleanup after task)',
       'MEMORY TOOLS: save_memory (store learnings), recall_memories (search your knowledge), get_boot_briefing (load context on startup)',
       'MEMORY MANAGEMENT: promote_memory (share with all agents), pin_memory (prevent decay)',
@@ -357,7 +357,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'spawn_subagent',
-      description: 'Create a durable child task row BEFORE spawning a sub-agent via the Agent tool. Records the sub-agent invocation so the watchdog can monitor it. Call this before Agent tool, then pass the returned child_task_id to the sub-agent. Does NOT actually spawn the agent — you do that with the Agent tool.',
+      description: 'Create a durable child task row BEFORE spawning a sub-agent via the Agent tool. Records the sub-agent invocation so the watchdog can monitor it. Call this before Agent tool, then pass the returned child_task_id to the sub-agent. Does NOT actually spawn the agent — you do that with the Agent tool. PAIRING REQUIREMENT: every spawn_subagent must be paired with a close_subagent call in a finally-equivalent block — call close_subagent immediately after Agent returns whether it succeeded, errored, or was interrupted.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -370,7 +370,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'close_subagent',
-      description: 'Mark a synthetic sub-agent child task as completed. Call this AFTER the Agent tool returns. Clears watchdog monitoring for this child task.',
+      description: 'Mark a synthetic sub-agent child task as completed. CALL THIS IN A FINALLY BLOCK — immediately after Agent returns on SUCCESS, and also after Agent throws/errors/is-interrupted. Pass the original error message as result if Agent failed. Clears watchdog monitoring for this child task. Server-side auto-close on parent complete_task exists as a backstop for crash/abort cases, but the explicit close after Agent returns is the primary path and the only one that runs while the parent is still alive to record the actual sub-agent outcome.',
       inputSchema: {
         type: 'object' as const,
         properties: {
