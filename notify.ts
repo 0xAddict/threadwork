@@ -30,6 +30,19 @@ export function formatDecisionOpened(decision: { id: number; title: string; open
   return `\u{1F5F3} *Decision \\#${decision.id} opened by ${esc(decision.opened_by)}*\n${esc(decision.title)}`
 }
 
+function trunc(text: string, max = 200): string {
+  return text.length > max ? text.slice(0, max) + '\u2026' : text
+}
+
+export function formatPositionSubmitted(decisionId: number, agent: string, position: string, rationale?: string | null): string {
+  const body = rationale ? `${trunc(position)}\n${trunc(rationale)}` : trunc(position)
+  return `\u{1F5E3} *Position on decision \\#${decisionId} from ${esc(agent)}*\n${esc(body)}`
+}
+
+export function formatCritiqueSubmitted(decisionId: number, agent: string, target: string, critique: string): string {
+  return `\u{1F50D} *Critique on decision \\#${decisionId} from ${esc(agent)}* \\(${esc(target)}\\)\n${esc(trunc(critique))}`
+}
+
 export function formatDecisionFinalized(decision: { id: number; title: string; finalized_by: string | null; outcome: string | null }): string {
   return `\u2705 *Decision \\#${decision.id} finalized by ${esc(decision.finalized_by ?? 'unknown')}*\n${esc(decision.title)}\nOutcome: ${esc(decision.outcome ?? '')}`
 }
