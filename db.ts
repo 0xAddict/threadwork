@@ -85,6 +85,12 @@ export interface UpdateHeartbeatInput {
 export class TaskDB {
   private db: Database
   private dbPath: string
+  /**
+   * Names of required feature flags that the operator has explicitly set to 0.
+   * Populated during migrate() so the supervisor (watchdog) can emit a loud
+   * warning over the audit + telegram channel each cycle without re-querying.
+   */
+  public operatorDisabledFlags: string[] = []
 
   constructor(dbPath: string = DB_PATH) {
     this.dbPath = dbPath
@@ -277,15 +283,23 @@ export class TaskDB {
       INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('gates_enabled', 1);
     `)
 
-    // Auto-enable required flags if they exist but are disabled (e.g., legacy DB)
+    // Respect operator intent: do NOT auto-flip explicitly-disabled flags.
+    // Fresh-deploy safety still works — the INSERT OR IGNORE above seeds new
+    // rows at 1, so only an explicit operator downgrade (UPDATE ... enabled=0)
+    // can reach this branch. We surface those names via operatorDisabledFlags
+    // so the always-on supervisor (watchdog.ts) can emit a loud warning over
+    // the same audit + telegram channel used by recoverExpiredCircuits.
     const requiredFlags = ['blackboard_enabled', 'progress_events_enabled', 'gates_enabled']
+    const disabled: string[] = []
     for (const flag of requiredFlags) {
       const row = this.db.prepare('SELECT enabled FROM feature_flags WHERE flag_name = ?').get(flag) as { enabled: number } | null
       if (row && !row.enabled) {
-        this.db.prepare('UPDATE feature_flags SET enabled = 1 WHERE flag_name = ?').run(flag)
-        console.warn(`[task-board] Auto-enabled feature flag '${flag}' (was disabled)`)
+        disabled.push(flag)
+        // Local-process breadcrumb. Loud channel emission happens in watchdog.
+        console.warn(`[task-board] Required feature flag '${flag}' is operator-disabled (enabled=0). Leaving as-is. Watchdog will surface this on the operator channel.`)
       }
     }
+    this.operatorDisabledFlags = disabled
 
     // Supervision indexes
     this.db.exec(`
