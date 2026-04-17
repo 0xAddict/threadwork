@@ -35,9 +35,14 @@ The watchdog (`watchdog.ts`) runs as a persistent process with a 30-second recon
 
 `spawn_subagent` creates a synthetic child task row (`kind = 'subagent'`, `is_synthetic = 1`) before the Agent tool runs. `close_subagent` marks it complete afterward. These rows are monitored by the watchdog identically to delegated tasks.
 
+**Close-in-finally is mandatory.** Every `spawn_subagent` MUST be paired with a `close_subagent` invocation in a finally-equivalent block — call `close_subagent` immediately after the Agent tool returns whether the call succeeded, threw an error, or was interrupted. Sub-agents share the parent's session_id and PPID, so the parent is the only context that knows the actual outcome and can record it accurately. The server-side auto-close (see Finalizer Semantics, below) is a backstop for crash/abort scenarios where the parent never reaches `complete_task`; it should not be relied on for normal cleanup. The audit history at `subagent_spawned` vs `subagent_closed` is the canonical evidence of whether agents are honoring the pairing.
+
 ### Finalizer Semantics
 
-`complete_task` queries for open child tasks before allowing completion. If any children have `status NOT IN ('completed', 'cancelled')`, completion is refused with an error listing the open child IDs. This prevents a parent from silently completing while work is still in flight.
+`complete_task` queries for open child tasks before allowing completion. Behavior splits by child kind:
+
+- **Non-synthetic children** (delegated tasks): completion is refused with an error listing the open child IDs. The parent must wait for the child to finish or cancel.
+- **Synthetic children** (sub-agent task rows): are auto-closed as a backstop with `result = 'Auto-closed: parent task completed'`. The auto-close is logged in the audit row under `auto_closed_children` so the gap (parent forgot to close-in-finally) is visible. This catches the crash/abort case but is NOT the primary path — explicit `close_subagent` after Agent returns is required and gives a richer result string.
 
 ## New MCP Tools
 
@@ -68,12 +73,28 @@ Returns the child task ID. Pass this ID to the sub-agent so it can send `write_s
 
 ### `close_subagent`
 
-Mark a synthetic sub-agent child task as completed. Call this AFTER the Agent tool returns.
+Mark a synthetic sub-agent child task as completed. **Call this in a finally block** — immediately after the Agent tool returns on SUCCESS, AND after Agent throws / errors / is interrupted. Pass the original error message as `result` if the Agent failed.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `task_id` | number | yes | The child task ID returned by `spawn_subagent` |
-| `result` | string | yes | Summary of what the sub-agent accomplished (or error if failed) |
+| `result` | string | yes | Summary of what the sub-agent accomplished (or error message if it failed) |
+
+The pseudo-pattern every caller must follow:
+
+```
+const child = spawn_subagent({...})
+let outcome
+try {
+  outcome = Agent({...})  // may throw
+  close_subagent({ task_id: child.id, result: summarize(outcome) })
+} catch (err) {
+  close_subagent({ task_id: child.id, result: `Failed: ${err.message}` })
+  throw err  // propagate after cleanup
+}
+```
+
+Server-side auto-close on parent `complete_task` exists as a backstop for crash/abort cases where the parent never gets a chance to clean up — but it cannot record the actual sub-agent outcome and runs strictly after the parent finishes. The explicit close after Agent returns is the primary path.
 
 ### `get_children`
 
