@@ -1166,6 +1166,43 @@ export class TaskReconciler {
   }
 
   // -------------------------------------------------------------------------
+  // 8b. OPERATOR-INTENT FEATURE FLAG WARNING
+  // -------------------------------------------------------------------------
+
+  /**
+   * Surface required feature flags that the operator has explicitly disabled.
+   * The startup auto-enable loop in db.ts no longer flips 0→1 (that would
+   * silently override operator intent), so the supervisor must make this
+   * visible. Same pattern as recoverExpiredCircuits: log + audit row +
+   * telegram, debounced once per flag per watchdog lifetime.
+   */
+  private _operatorDisabledNotified = new Set<string>()
+
+  async warnOperatorDisabledFlags(): Promise<void> {
+    const disabled = this.taskDb.operatorDisabledFlags
+    if (!disabled || disabled.length === 0) return
+
+    for (const flag of disabled) {
+      // Re-check current DB state — operator may have re-enabled mid-run.
+      if (this.taskDb.isFeatureEnabled(flag)) {
+        this._operatorDisabledNotified.delete(flag)
+        continue
+      }
+      if (this._operatorDisabledNotified.has(flag)) continue
+      this._operatorDisabledNotified.add(flag)
+
+      log(`Operator-disabled required flag detected: ${flag} (enabled=0). Respecting operator intent; not auto-enabling.`)
+      this.audit.log('watchdog', 'operator_disabled_flag', {
+        flag,
+        enabled: 0,
+        action: 'respected_operator_intent',
+        note: 'startup auto-enable disabled — operator must re-enable explicitly',
+      })
+      await postToGroup(`⚠️ *Operator\-disabled required flag*: \`${esc(flag)}\` is set to 0\. Watchdog is respecting operator intent and NOT auto\-enabling\. Re\-enable explicitly via \`setFeatureFlag\` if this is unintended\.`)
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // 9. CONSOLIDATION SCHEDULER
   // -------------------------------------------------------------------------
 
@@ -1245,6 +1282,14 @@ export class TaskReconciler {
           await this.recoverExpiredCircuits(reconcileResult)
         } catch (err) {
           logError('Circuit recovery sweep failed', err)
+        }
+
+        // Step 1b: Warn loudly if operator has explicitly disabled required flags.
+        // Counterpart to db.ts startup change that no longer auto-flips 0→1.
+        try {
+          await this.warnOperatorDisabledFlags()
+        } catch (err) {
+          logError('Operator-disabled flag warning failed', err)
         }
 
         // Step 2: Reconcile due tasks
