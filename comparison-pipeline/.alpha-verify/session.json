@@ -1,0 +1,14 @@
+{
+  "run_id": "AV_20260413_1847_671e1cc",
+  "status": "running",
+  "current_iteration": 1,
+  "max_iterations": 3,
+  "current_phase": "scanning",
+  "agreement_score": null,
+  "attempts": [],
+  "started_at": "2026-04-13T18:47:07Z",
+  "config": {
+    "project": "threadwork-comparison-pipeline",
+    "specs": "/tmp/pipeline-tw-comparison-v4.json"
+  }
+}
