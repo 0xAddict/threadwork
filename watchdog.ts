@@ -338,24 +338,29 @@ export class TaskReconciler {
     const reason = task.blocked_reason ?? 'No reason provided'
     const msg = `BLOCKED: Task #${task.id} (${task.to_agent}) is blocked: ${reason}`
 
-    log(`Relaying blocked status for task #${task.id} to ${supervisor}`)
+    // #615 Phase 1: dedup identical blocked_relay alerts within cooldown.
+    // State changes (different reason/supervisor) re-fire immediately because
+    // the payload hash differs.
+    if (this.taskDb.shouldAlert(task.id, 'blocked_relay', { supervisor, reason })) {
+      log(`Relaying blocked status for task #${task.id} to ${supervisor}`)
 
-    // Nudge supervisor
-    await dispatchAgentNudge(supervisor, msg)
+      // Nudge supervisor
+      await dispatchAgentNudge(supervisor, msg)
 
-    // Post to Telegram for visibility
-    await postToGroup(`\u26a0\ufe0f ${esc(msg)}`)
+      // Post to Telegram for visibility
+      await postToGroup(`\u26a0\ufe0f ${esc(msg)}`)
 
-    this.audit.log('watchdog', 'blocked_relay', {
-      task_id: task.id,
-      supervisor,
-      reason,
-    }, task.id)
+      this.audit.log('watchdog', 'blocked_relay', {
+        task_id: task.id,
+        supervisor,
+        reason,
+      }, task.id)
+
+      result.blocked_relayed++
+    }
 
     // Re-check in 60 seconds (keep relaying until unblocked — level-triggered)
     this.setNextCheck(task.id, 60)
-
-    result.blocked_relayed++
   }
 
   // -------------------------------------------------------------------------
@@ -447,10 +452,15 @@ export class TaskReconciler {
     } else {
       const faultResult = this.taskDb.recordFault(task.to_agent, 'timeout')
       if (faultResult.circuit_state === 'open') {
-        log(`Circuit OPEN for ${task.to_agent} (${faultResult.fault_count} faults). Alerting boss.`)
-        await this.taskDb.run(async () => {}) // no-op, just for type
-        await dispatchAgentNudge('boss', `Circuit OPEN for ${task.to_agent}: ${faultResult.fault_count} consecutive faults. Agent degraded.`, { urgency: 'urgent' })
-        await postToGroup(`\u26a0\ufe0f Circuit breaker OPEN for ${esc(task.to_agent)} \\- ${faultResult.fault_count} faults`)
+        // #615 Phase 1: dedup circuit_open alerts per agent. Hash on agent only
+        // (not fault_count) so once OPEN, alerts only re-fire after the cooldown
+        // window or after circuit closes/recovers.
+        if (this.taskDb.shouldAlert(0, `circuit_open:${task.to_agent}`, { agent: task.to_agent })) {
+          log(`Circuit OPEN for ${task.to_agent} (${faultResult.fault_count} faults). Alerting boss.`)
+          await this.taskDb.run(async () => {}) // no-op, just for type
+          await dispatchAgentNudge('boss', `Circuit OPEN for ${task.to_agent}: ${faultResult.fault_count} consecutive faults. Agent degraded.`, { urgency: 'urgent' })
+          await postToGroup(`\u26a0\ufe0f Circuit breaker OPEN for ${esc(task.to_agent)} \\- ${faultResult.fault_count} faults`)
+        }
       }
     }
 
