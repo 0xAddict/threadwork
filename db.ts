@@ -362,6 +362,18 @@ export class TaskDB {
       );
     `)
 
+    // Watchdog alert dedup state (#615 Phase 1 — silence repeat-spam alerts)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS watchdog_alert_state (
+        task_id INTEGER NOT NULL,
+        alert_type TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        last_alerted_at TEXT NOT NULL DEFAULT (datetime('now')),
+        fire_count INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (task_id, alert_type)
+      );
+    `)
+
     // Supervision triggers: require supervisor_agent when from_agent != to_agent
     this.db.exec(`
       CREATE TRIGGER IF NOT EXISTS trg_require_supervision
@@ -1553,6 +1565,37 @@ export class TaskDB {
       return db.prepare(
         'SELECT circuit_state, fault_count, cooldown_until FROM agent_sessions WHERE agent = ?'
       ).get(agent) as { circuit_state: string; fault_count: number; cooldown_until: string | null } | null
+    })
+  }
+
+  /**
+   * Watchdog alert dedup. Returns true if the alert should fire, false if it
+   * should be suppressed because an identical payload fired within cooldownSec.
+   * Always upserts the state row on a true return so transitions are picked up.
+   * (#615 Phase 1)
+   */
+  shouldAlert(taskId: number, alertType: string, payload: unknown, cooldownSec = 1800): boolean {
+    return this.run(db => {
+      const hash = String(Bun.hash(JSON.stringify(payload ?? null)))
+      const existing = db.prepare(
+        'SELECT payload_hash, last_alerted_at FROM watchdog_alert_state WHERE task_id = ? AND alert_type = ?'
+      ).get(taskId, alertType) as { payload_hash: string; last_alerted_at: string } | undefined
+
+      if (existing && existing.payload_hash === hash) {
+        const lastAt = new Date(existing.last_alerted_at + 'Z').getTime()
+        const ageSec = (Date.now() - lastAt) / 1000
+        if (ageSec < cooldownSec) return false
+      }
+
+      db.prepare(`
+        INSERT INTO watchdog_alert_state (task_id, alert_type, payload_hash, last_alerted_at, fire_count)
+        VALUES (?, ?, ?, datetime('now'), 1)
+        ON CONFLICT (task_id, alert_type) DO UPDATE SET
+          payload_hash = excluded.payload_hash,
+          last_alerted_at = datetime('now'),
+          fire_count = fire_count + 1
+      `).run(taskId, alertType, hash)
+      return true
     })
   }
 
