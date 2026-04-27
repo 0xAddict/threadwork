@@ -74,15 +74,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'create_task',
-      description: 'Create a task and assign it to another agent. Auto-nudges the target agent and posts to the team Telegram group.',
+      description: 'Create a task. Optionally assign to an agent via "to" (auto-nudges target + posts to Telegram). Omit "to" to place task in the backlog (unassigned).',
       inputSchema: {
         type: 'object',
         properties: {
-          to: { type: 'string', description: 'Target agent: boss, steve, sadie, or kiera' },
+          to: { type: 'string', description: 'Target agent: boss, steve, sadie, or kiera. Omit to create an unassigned backlog task.' },
           description: { type: 'string', description: 'What needs to be done' },
           priority: { type: 'string', enum: ['low', 'normal', 'high', 'urgent'], description: 'Task priority (default: normal)' },
         },
-        required: ['to', 'description'],
+        required: ['description'],
       },
     },
     {
@@ -611,25 +611,32 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     switch (req.params.name) {
       case 'create_task': {
-        const to = (args.to as string).toLowerCase()
+        const toRaw = args.to as string | undefined
+        const to = toRaw ? toRaw.toLowerCase() : null
         const description = args.description as string
         const priority = (args.priority as string) ?? 'normal'
 
-        if (!isKnownAgent(to)) {
+        if (to !== null && !isKnownAgent(to)) {
           return { content: [{ type: 'text', text: `Invalid agent "${to}". Valid agents: ${TEAM_AGENTS.join(', ')}`, isError: true }] }
         }
 
         const task = db.createTask({ from: SELF_LABEL, to, description, priority })
 
-        const nudgeMsg = `You have a new task (#${task.id}) from ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
-        const [nudgeResult] = await Promise.all([
-          dispatchAgentNudge(to, nudgeMsg, { source: SELF_LABEL }),
-          postToGroup(formatTaskCreated(task)),
-        ])
-        audit.log(SELF_LABEL, 'task_created', { to, description, priority }, task.id)
+        if (to !== null) {
+          const nudgeMsg = `You have a new task (#${task.id}) from ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
+          const [nudgeResult] = await Promise.all([
+            dispatchAgentNudge(to, nudgeMsg, { source: SELF_LABEL }),
+            postToGroup(formatTaskCreated(task)),
+          ])
+          audit.log(SELF_LABEL, 'task_created', { to, description, priority }, task.id)
 
-        const nudgeWarning = nudgeResult.ok ? '' : ` (warning: nudge failed — ${nudgeResult.error})`
-        return { content: [{ type: 'text', text: `Task #${task.id} created and assigned to ${to}. Agent nudged.${nudgeWarning}` }] }
+          const nudgeWarning = nudgeResult.ok ? '' : ` (warning: nudge failed — ${nudgeResult.error})`
+          return { content: [{ type: 'text', text: `Task #${task.id} created and assigned to ${to}. Agent nudged.${nudgeWarning}` }] }
+        } else {
+          await postToGroup(formatTaskCreated(task))
+          audit.log(SELF_LABEL, 'task_created', { to: 'backlog', description, priority }, task.id)
+          return { content: [{ type: 'text', text: `Task #${task.id} created in backlog (unassigned).` }] }
+        }
       }
 
       case 'delegate_task': {
