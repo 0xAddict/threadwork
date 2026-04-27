@@ -4,7 +4,7 @@ import { DB_PATH, SUPERVISION_DEFAULTS, UNCLAIMED_CHECK_SEC } from './config'
 export interface Task {
   id: number
   from_agent: string
-  to_agent: string
+  to_agent: string | null
   description: string
   priority: string
   status: 'pending' | 'in_progress' | 'completed' | 'cancelled'
@@ -43,7 +43,7 @@ export interface Note {
 
 export interface CreateTaskInput {
   from: string
-  to: string
+  to: string | null
   description: string
   priority: string
 }
@@ -718,8 +718,8 @@ export class TaskDB {
 
   createTask(input: CreateTaskInput): Task {
     return this.run(db => {
-      // Auto-infer supervisor_agent when delegating (from != to)
-      const supervisorAgent = input.from !== input.to ? input.from : null
+      // Auto-infer supervisor_agent when delegating (from != to, and to_agent is set)
+      const supervisorAgent = (input.to !== null && input.from !== input.to) ? input.from : null
       const stmt = db.prepare(`
         INSERT INTO tasks (from_agent, to_agent, description, priority, supervisor_agent)
         VALUES ($from, $to, $description, $priority, $supervisor_agent)
@@ -727,7 +727,7 @@ export class TaskDB {
       `)
       return stmt.get({
         $from: input.from,
-        $to: input.to,
+        $to: input.to ?? null,
         $description: input.description,
         $priority: input.priority,
         $supervisor_agent: supervisorAgent,
