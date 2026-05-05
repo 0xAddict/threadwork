@@ -271,6 +271,12 @@ export class TaskDB {
       try { this.db.exec(sql) } catch { /* column already exists */ }
     }
 
+    // #823: blocked_relay_count for long-block relay cap (watchdog spam fix).
+    // Counter is incremented by handleBlocked() each time a BLOCKED relay is
+    // sent, and reset to 0 when a heartbeat lands AFTER blocked_at. The
+    // watchdog escalates-once-and-stops once the cap is reached.
+    try { this.db.exec('ALTER TABLE tasks ADD COLUMN blocked_relay_count INTEGER NOT NULL DEFAULT 0') } catch { /* column already exists */ }
+
     // Feature flags table (Sprint 1)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS feature_flags (
@@ -337,6 +343,23 @@ export class TaskDB {
       CREATE INDEX IF NOT EXISTS idx_violations_agent ON gate_violations(agent_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_violations_type ON gate_violations(violation_type);
     `)
+
+    // State-contracts migration 0009: state-declaration columns on agent_sessions
+    const stateContractCols = [
+      'ALTER TABLE agent_sessions ADD COLUMN state_changed_at TEXT',
+      'ALTER TABLE agent_sessions ADD COLUMN state_source TEXT',
+      'ALTER TABLE agent_sessions ADD COLUMN current_task_id INTEGER',
+      'ALTER TABLE agent_sessions ADD COLUMN current_tool TEXT',
+      'ALTER TABLE agent_sessions ADD COLUMN claude_pid INTEGER',
+    ]
+    for (const sql of stateContractCols) {
+      try { this.db.exec(sql) } catch { /* column already exists */ }
+    }
+    try {
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_agent_sessions_state_changed ON agent_sessions(state_changed_at)')
+    } catch { /* index already exists */ }
+    this.db.exec("UPDATE agent_sessions SET state_changed_at = last_seen_at WHERE state_changed_at IS NULL")
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('heartbeat_v2_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
@@ -1209,6 +1232,75 @@ export class TaskDB {
     })
   }
 
+
+  /**
+   * Declare the agent's current operational state (spec §5 step 3).
+   *
+   * Priority: mcp(3) > hook(2) > heartbeat(1) > boot(0).
+   * A lower-priority source cannot overwrite a fresher higher-priority row
+   * within the same state_changed_at second. Stale rows (>1s old) can always
+   * be overwritten regardless of priority.
+   *
+   * Pass state=undefined for touch-only (refreshes state_changed_at without
+   * changing state — used by write_status to act as a keepalive).
+   */
+  declareAgentState(
+    agent: string,
+    state: string | undefined,
+    source: 'mcp' | 'hook' | 'heartbeat' | 'boot',
+    opts: { taskId?: number; tool?: string; pid?: number } = {}
+  ): void {
+    const PRIORITY: Record<string, number> = { mcp: 3, hook: 2, heartbeat: 1, boot: 0 }
+    const now = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '')
+
+    this.run(db => {
+      const existing = db.prepare(
+        'SELECT state, state_source, state_changed_at FROM agent_sessions WHERE agent = ?'
+      ).get(agent) as { state: string; state_source: string; state_changed_at: string | null } | null
+
+      if (state === undefined) {
+        // Touch-only: refresh timestamp without changing state
+        if (!existing) return
+        db.prepare(
+          "UPDATE agent_sessions SET state_changed_at = ?, last_seen_at = ? WHERE agent = ?"
+        ).run(now, now, agent)
+        return
+      }
+
+      if (existing) {
+        const incomingPriority = PRIORITY[source] ?? 0
+        const existingPriority = PRIORITY[existing.state_source] ?? 0
+        const ageMs = existing.state_changed_at
+          ? Date.now() - new Date(existing.state_changed_at.replace(' ', 'T') + 'Z').getTime()
+          : Infinity
+
+        // Lower priority cannot overwrite a fresher higher-priority row (within 1 second)
+        if (incomingPriority < existingPriority && ageMs < 1000) return
+      }
+
+      db.prepare(`
+        INSERT INTO agent_sessions (agent, state, state_changed_at, state_source, current_task_id, current_tool, claude_pid, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(agent) DO UPDATE SET
+          state            = excluded.state,
+          state_changed_at = excluded.state_changed_at,
+          state_source     = excluded.state_source,
+          current_task_id  = COALESCE(excluded.current_task_id, agent_sessions.current_task_id),
+          current_tool     = excluded.current_tool,
+          claude_pid       = COALESCE(excluded.claude_pid, agent_sessions.claude_pid),
+          last_seen_at     = excluded.last_seen_at
+      `).run(
+        agent,
+        state,
+        now,
+        source,
+        opts.taskId ?? null,
+        opts.tool ?? null,
+        opts.pid ?? null,
+        now
+      )
+    })
+  }
 
   isFeatureEnabled(flagName: string): boolean {
     const row = this.db.prepare('SELECT enabled FROM feature_flags WHERE flag_name = ?').get(flagName) as any

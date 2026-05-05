@@ -710,11 +710,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: `Cannot claim task #${taskId} — either it doesn't exist or is already claimed.`, isError: true }] }
         }
 
-        // Upsert agent session
+        // Upsert agent session and declare state
         const agentSession = AGENT_SESSIONS[SELF_LABEL]
         if (agentSession) {
           db.upsertAgentSession(SELF_LABEL, agentSession, 'alive')
         }
+        db.declareAgentState(SELF_LABEL, 'ACTIVE_THINKING', 'mcp', { taskId: task.id })
 
         await postToGroup(formatTaskClaimed(task))
         audit.log(SELF_LABEL, 'task_claimed', { task_id: taskId, session_id: sessionId ?? agentSession ?? null }, taskId)
@@ -783,6 +784,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         // Sprint 3: Emit completion event to progress_events
         db.emitCompletionEvent(task.id, SELF_LABEL, task.attempt_id)
+        db.declareAgentState(SELF_LABEL, 'COMPLETED', 'mcp', {})
 
         const nudgeMsg = `Task #${task.id} completed by ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
         const [nudgeResult] = await Promise.all([
@@ -1020,6 +1022,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           etaSec,
         })
 
+        // Touch-only state keepalive: refresh state_changed_at without changing state
+        db.declareAgentState(agent, undefined, 'mcp', {})
+
         // If blocked, attempt immediate Telegram notification to supervisor
         let blockedNotice = ''
         if (isBlocked && updatedTask?.supervisor_agent) {
@@ -1185,6 +1190,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             description: fullDescription,
             model: model ?? null,
           }, childTask.id)
+          db.declareAgentState(SELF_LABEL, 'SUBAGENT_RUNNING', 'mcp', { taskId: childTask.id })
 
           return { content: [{ type: 'text', text: `Sub-agent task #${childTask.id} created (child of #${parentTaskId}). Pass this ID to the sub-agent. Watchdog will monitor heartbeat (timeout: ${childTask.heartbeat_timeout_sec}s).` }] }
         } catch (err: any) {
@@ -1218,6 +1224,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           result,
           parent_task_id: closed.parent_task_id,
         }, taskId)
+        db.declareAgentState(SELF_LABEL, 'ACTIVE_THINKING', 'mcp', {})
 
         return { content: [{ type: 'text', text: `Sub-agent task #${taskId} completed. Parent: #${closed.parent_task_id}.` }] }
       }
