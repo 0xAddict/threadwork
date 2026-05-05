@@ -130,10 +130,15 @@ classify_with_openrouter() {
 # Initialise the heartbeat-v2 DB tables
 init_db_v2
 
+reset_hb_db() {
+  rm -f "$TEST_HB_DB" "${TEST_HB_DB}-shm" "${TEST_HB_DB}-wal"
+  init_db_v2
+}
+
 # ─── scenario 1: declared-fresh-ALIVE ────────────────────────────────────────
 
 echo "Scenario 1: declared-fresh-ALIVE"
-> "$TG_LOG"
+reset_hb_db; > "$TG_LOG"
 set_agent "$AGENT" "ACTIVE_THINKING" "mcp" "30"
 
 result=$(classify_agent_v2 "$AGENT" "fake-api-key")
@@ -145,7 +150,7 @@ assert_not_contains "compact: no Source: line"    "Source:"   "$tg1"
 # ─── scenario 2: declared-fresh-TOOL-stuck-10min ─────────────────────────────
 
 echo "Scenario 2: declared-fresh-TOOL-stuck-10min"
-> "$TG_LOG"
+reset_hb_db; > "$TG_LOG"
 set_agent "$AGENT" "TOOL_IN_FLIGHT" "hook" "650"  # 650 > TOOL_IN_FLIGHT_HUNG_SEC=600
 
 result=$(classify_agent_v2 "$AGENT" "fake-api-key")
@@ -158,7 +163,7 @@ assert_contains "STUCK alert has Source: line"    "Source:"   "$tg2"
 # state_changed_at stale (400s) but last_seen_at recent (60s) + PID alive
 
 echo "Scenario 3: declared-stale-PID-alive"
-> "$TG_LOG"
+reset_hb_db; > "$TG_LOG"
 ALIVE_PID="$$"   # test script PID — guaranteed alive for duration of test
 set_agent "$AGENT" "ACTIVE_THINKING" "mcp" "400" "60" "$ALIVE_PID"
 
@@ -171,7 +176,7 @@ assert_not_contains "compact: no Source: line"    "Source:"   "$tg3"
 # ─── scenario 4: declared-stale-PID-dead → LLM fallback ─────────────────────
 
 echo "Scenario 4: declared-stale-PID-dead"
-> "$TG_LOG"; > "$LLM_LOG"
+reset_hb_db; > "$TG_LOG"; > "$LLM_LOG"
 LLM_STUB_RESPONSE="ALIVE stub-alive response"
 set_agent "$AGENT" "ACTIVE_THINKING" "hook" "400" "400" "999999"  # PID 999999 = dead
 
@@ -183,7 +188,7 @@ assert_eq       "result matches LLM stub"               "ALIVE"         "$result
 # ─── scenario 5: ambiguous-Gemma (enriched prompt, STUCK result) ─────────────
 
 echo "Scenario 5: ambiguous→Gemma"
-> "$TG_LOG"; > "$LLM_LOG"
+reset_hb_db; > "$TG_LOG"; > "$LLM_LOG"
 LLM_STUB_RESPONSE="STUCK hanging on API call"
 set_agent "$AGENT" "UNKNOWN" "heartbeat" "400" "400" "NULL"
 
