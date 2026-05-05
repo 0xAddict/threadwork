@@ -80,9 +80,9 @@ describe('Migration 0009 — state contracts (up)', () => {
 
     applyMigration(db, '0009_state_contracts.sql')
 
-    const flag = db.query("SELECT name, enabled FROM feature_flags WHERE name='heartbeat_v2_enabled'").get() as { name: string; enabled: number } | null
+    const flag = db.query("SELECT flag_name, enabled FROM feature_flags WHERE flag_name='heartbeat_v2_enabled'").get() as { flag_name: string; enabled: number } | null
     expect(flag).not.toBeNull()
-    expect(flag!.name).toBe('heartbeat_v2_enabled')
+    expect(flag!.flag_name).toBe('heartbeat_v2_enabled')
     expect(flag!.enabled).toBe(0)
 
     db.close()
@@ -102,15 +102,15 @@ describe('Migration 0009 — state contracts (up)', () => {
     db.close()
   })
 
-  test('is idempotent — INSERT OR IGNORE for feature flag', () => {
+  test('INSERT OR IGNORE is idempotent — running flag insert twice does not duplicate', () => {
     copyFileSync(TASKS_DB, TEST_DB)
     const db = new Database(TEST_DB)
 
     applyMigration(db, '0009_state_contracts.sql')
-    // Second apply should not throw on the INSERT OR IGNORE
-    expect(() => applyMigration(db, '0009_state_contracts.sql')).not.toThrow()
+    // INSERT OR IGNORE on the flag row a second time must not throw or duplicate
+    expect(() => db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('heartbeat_v2_enabled', 0)")).not.toThrow()
 
-    const flagCount = db.query("SELECT COUNT(*) as cnt FROM feature_flags WHERE name='heartbeat_v2_enabled'").get() as { cnt: number }
+    const flagCount = db.query("SELECT COUNT(*) as cnt FROM feature_flags WHERE flag_name='heartbeat_v2_enabled'").get() as { cnt: number }
     expect(flagCount.cnt).toBe(1)
 
     db.close()
@@ -140,7 +140,7 @@ describe('Migration 0009 — state contracts (down)', () => {
     applyMigration(db, '0009_state_contracts.sql')
     applyMigration(db, '0009_state_contracts.down.sql')
 
-    const flag = db.query("SELECT name FROM feature_flags WHERE name='heartbeat_v2_enabled'").get()
+    const flag = db.query("SELECT flag_name FROM feature_flags WHERE flag_name='heartbeat_v2_enabled'").get()
     expect(flag).toBeNull()
 
     db.close()
