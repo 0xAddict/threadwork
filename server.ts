@@ -33,6 +33,13 @@ const mem = new MemoryDB(db)
 const dec = new DecisionDB(db, mem)
 const audit = new AuditLog(db)
 
+// Wire the nudge debounce module to our live db + audit instances so that
+// logDelivered() can emit nudge_sent + agent_nudged audit rows on every
+// successful nudge. Without this, _debounceAudit stays null and the audit
+// trail goes silent (regression introduced by 93f6511 making audit param
+// optional; #921).
+configureNudgeDebounce(db, audit)
+
 function normalizeScore(raw: unknown): number {
   const n = Number(raw)
   if (isNaN(n)) return 0.5
@@ -47,6 +54,29 @@ function parseAgentList(raw: string): string[] {
 
 function isKnownAgent(agent: string): boolean {
   return agent in AGENT_SESSIONS
+}
+
+/**
+ * Safe wrapper around db.declareAgentState — emit failures must NEVER block the
+ * underlying tool's primary effect (e.g. claim_task must still claim even if
+ * the state-contracts emit row write fails). Spec: state-contracts-redesign §5
+ * step 3 + §3 conflict resolution (source='mcp', priority 3).
+ *
+ * Pass state=undefined for touch-only keepalive (refreshes state_changed_at
+ * without changing state — used by write_status).
+ */
+function safeEmitState(
+  agent: string,
+  state: string | undefined,
+  opts: { taskId?: number; tool?: string; pid?: number } = {},
+): void {
+  try {
+    db.declareAgentState(agent, state, 'mcp', opts)
+  } catch (err) {
+    // Silent — emit failure is non-fatal. Hook-side emit (emit-state.sh) and
+    // heartbeat-daemon-v2 stale-state fallback both provide redundancy.
+    console.error('[task-board] safeEmitState failed:', (err as Error).message)
+  }
 }
 
 const mcp = new Server(
@@ -715,7 +745,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (agentSession) {
           db.upsertAgentSession(SELF_LABEL, agentSession, 'alive')
         }
-        db.declareAgentState(SELF_LABEL, 'ACTIVE_THINKING', 'mcp', { taskId: task.id })
+        safeEmitState(SELF_LABEL, 'ACTIVE_THINKING', { taskId: task.id, tool: 'claim_task' })
 
         await postToGroup(formatTaskClaimed(task))
         audit.log(SELF_LABEL, 'task_claimed', { task_id: taskId, session_id: sessionId ?? agentSession ?? null }, taskId)
@@ -784,7 +814,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         // Sprint 3: Emit completion event to progress_events
         db.emitCompletionEvent(task.id, SELF_LABEL, task.attempt_id)
-        db.declareAgentState(SELF_LABEL, 'COMPLETED', 'mcp', {})
+        safeEmitState(SELF_LABEL, 'COMPLETED', { tool: 'complete_task' })
 
         const nudgeMsg = `Task #${task.id} completed by ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
         const [nudgeResult] = await Promise.all([
@@ -1023,7 +1053,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         })
 
         // Touch-only state keepalive: refresh state_changed_at without changing state
-        db.declareAgentState(agent, undefined, 'mcp', {})
+        safeEmitState(agent, undefined, { taskId, tool: 'write_status' })
 
         // If blocked, attempt immediate Telegram notification to supervisor
         let blockedNotice = ''
@@ -1190,7 +1220,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             description: fullDescription,
             model: model ?? null,
           }, childTask.id)
-          db.declareAgentState(SELF_LABEL, 'SUBAGENT_RUNNING', 'mcp', { taskId: childTask.id })
+          safeEmitState(SELF_LABEL, 'SUBAGENT_RUNNING', { taskId: childTask.id, tool: 'spawn_subagent' })
 
           return { content: [{ type: 'text', text: `Sub-agent task #${childTask.id} created (child of #${parentTaskId}). Pass this ID to the sub-agent. Watchdog will monitor heartbeat (timeout: ${childTask.heartbeat_timeout_sec}s).` }] }
         } catch (err: any) {
@@ -1224,7 +1254,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           result,
           parent_task_id: closed.parent_task_id,
         }, taskId)
-        db.declareAgentState(SELF_LABEL, 'ACTIVE_THINKING', 'mcp', {})
+        safeEmitState(SELF_LABEL, 'ACTIVE_THINKING', { tool: 'close_subagent' })
 
         return { content: [{ type: 'text', text: `Sub-agent task #${taskId} completed. Parent: #${closed.parent_task_id}.` }] }
       }

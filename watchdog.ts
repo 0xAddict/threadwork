@@ -35,6 +35,11 @@ import {
 
 const BLOCKED_TTL_SEC = 600 // 10 minutes
 
+// #823: cap on long-block (`human` / `external_api` / `upstream_task`) relays
+// without an intervening heartbeat. After this many relays, escalate once and
+// stop scheduling re-checks. A heartbeat after `blocked_at` resets the counter.
+const LONG_BLOCK_RELAY_CAP = 3
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -239,6 +244,45 @@ export class TaskReconciler {
     //     supervisor and extend the window — do NOT clear blocked_at.
     //   agent | null (legacy) → short-block mode. BLOCKED_TTL_SEC (600s)
     //     applies. On expiry, clear blocked_at and fall through to escalation.
+    //
+    // (#823) Before either branch fires, check the SIBLING-COMPLETION
+    // short-circuit: if this task is blocked AND has a parent AND a sibling
+    // task completed AFTER the block began, the work shipped via the sibling.
+    // Auto-resolve so we stop re-relaying every 48h forever.
+    if (task.blocked_at && task.parent_task_id) {
+      const sib = this.taskDb.run(db =>
+        db.prepare(`
+          SELECT 1 FROM tasks
+          WHERE parent_task_id = ?
+            AND id != ?
+            AND status = 'completed'
+            AND completed_at > ?
+          LIMIT 1
+        `).get(task.parent_task_id, task.id, task.blocked_at)
+      )
+      if (sib) {
+        this.taskDb.run(db => {
+          db.prepare(`
+            UPDATE tasks SET
+              status = 'completed',
+              result = COALESCE(result, '') || ' [auto: superseded by sibling]',
+              completed_at = COALESCE(completed_at, datetime('now')),
+              blocked_at = NULL,
+              blocked_reason = NULL,
+              blocked_on = NULL,
+              next_check_at = NULL
+            WHERE id = ?
+          `).run(task.id)
+        })
+        this.audit.log('watchdog', 'auto_resolved_via_sibling', {
+          task_id: task.id,
+          parent_task_id: task.parent_task_id,
+        }, task.id)
+        log(`Auto-resolved task #${task.id} via sibling completion (parent=${task.parent_task_id})`)
+        return
+      }
+    }
+
     if (task.blocked_at) {
       const blockedOn = (task as any).blocked_on as string | null
       const isLongBlock = blockedOn === 'human' || blockedOn === 'external_api' || blockedOn === 'upstream_task'
@@ -249,12 +293,45 @@ export class TaskReconciler {
         // picks this task up again when next_check_at fires (set by the
         // caller's eta_sec or 48h default). On re-check, relay to supervisor
         // again and re-extend the check window.
+        //
+        // (#823) Cap the number of relays without an intervening heartbeat.
+        // Reset the counter if last_heartbeat_at is newer than blocked_at
+        // (worker is alive and producing progress despite still being marked
+        // blocked). Once the cap is reached, escalate-once-and-stop: drop
+        // next_check_at so the watchdog stops picking the task back up.
+
+        const heartbeatFresh = task.last_heartbeat_at
+          && new Date(task.last_heartbeat_at + 'Z').getTime() > new Date(task.blocked_at + 'Z').getTime()
+        if (heartbeatFresh) {
+          this.taskDb.run(db => {
+            db.prepare('UPDATE tasks SET blocked_relay_count = 0 WHERE id = ?').run(task.id)
+          })
+          ;(task as any).blocked_relay_count = 0
+        }
+
+        const relayCount = ((task as any).blocked_relay_count as number | null) ?? 0
+
+        if (relayCount >= LONG_BLOCK_RELAY_CAP) {
+          log(`Long-block relay cap reached for task #${task.id} (count=${relayCount}, cap=${LONG_BLOCK_RELAY_CAP}) — escalating once and halting relays`)
+          this.taskDb.run(db => {
+            db.prepare('UPDATE tasks SET next_check_at = NULL WHERE id = ?').run(task.id)
+          })
+          this.audit.log('watchdog', 'blocked_relay_cap_reached', {
+            task_id: task.id,
+            blocked_on: blockedOn,
+            relay_count: relayCount,
+            cap: LONG_BLOCK_RELAY_CAP,
+          }, task.id)
+          return
+        }
+
         const DEFAULT_LONG_BLOCK_SEC = 172800 // 48h
-        log(`Long-blocked task #${task.id} (blocked_on=${blockedOn}) — re-relaying to supervisor, extending check window by ${DEFAULT_LONG_BLOCK_SEC}s`)
+        log(`Long-blocked task #${task.id} (blocked_on=${blockedOn}, relay ${relayCount + 1}/${LONG_BLOCK_RELAY_CAP}) — re-relaying to supervisor, extending check window by ${DEFAULT_LONG_BLOCK_SEC}s`)
         this.taskDb.run(db => {
           db.prepare(`
             UPDATE tasks SET
-              next_check_at = datetime('now', '+' || ? || ' seconds')
+              next_check_at = datetime('now', '+' || ? || ' seconds'),
+              blocked_relay_count = COALESCE(blocked_relay_count, 0) + 1
             WHERE id = ?
           `).run(DEFAULT_LONG_BLOCK_SEC, task.id)
         })
@@ -1371,6 +1448,10 @@ const isMainScript = process.argv[1]?.endsWith('watchdog.ts')
 if (isMainScript) {
   const taskDb = new TaskDB(DB_PATH)
   const audit = new AuditLog(taskDb)
+
+  // Wire nudge debounce module so logDelivered() can emit nudge_sent +
+  // agent_nudged audit rows. Mirrors server.ts boot. See #921.
+  configureNudgeDebounce(taskDb, audit)
 
   const reconciler = new TaskReconciler(taskDb, audit, {
     cadenceSec: WATCHDOG_CADENCE_SEC,
