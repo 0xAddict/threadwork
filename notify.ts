@@ -2,7 +2,8 @@ import type { Task } from './db'
 import { TELEGRAM_GROUP_ID, getTelegramToken } from './config'
 
 /** Escape special characters for Telegram MarkdownV2 */
-export function esc(text: string): string {
+export function esc(text: string | null | undefined): string {
+  if (text == null) return ''
   return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1')
 }
 
