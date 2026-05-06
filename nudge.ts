@@ -192,13 +192,37 @@ function normalizePaneText(s: string): string {
  * Ink + crossterm EventStream dropped-key state at the TUI level. This
  * implementation is belt-and-suspenders for older TUIs and portability.
  */
+/**
+ * Result of sendTmuxNudgeV2 — split contract per #929 Fix-C.
+ *
+ * `sentOk` reflects whether the send-keys/load-buffer/paste/C-m sequence
+ * completed without throwing. `verifyOk` reflects whether the post-submit
+ * delta-verify loop saw the needle advance past baseline. `ok` is an alias
+ * for `sentOk` retained for backward compatibility with internal callers.
+ *
+ * The verify check is structurally false-prone on busy/streaming panes
+ * (lastIndexOf over last-50-lines pane tail returns -1 when the streaming
+ * response rolls the needle off-tail), so callers MUST gate audit/delivery
+ * decisions on `sentOk`, not on `verifyOk`. `verifyOk=false` should surface
+ * as a soft observability signal (nudge_verify_warn), not a delivery failure.
+ */
+export interface SendTmuxNudgeResult {
+  ok: boolean
+  sentOk: boolean
+  verifyOk: boolean
+  error?: string
+  reason?: TmuxFailReason
+}
+
 async function sendTmuxNudgeV2(
   session: string,
   message: string,
-): Promise<{ ok: boolean; error?: string; reason?: TmuxFailReason }> {
+): Promise<SendTmuxNudgeResult> {
   if (!message || !message.trim()) {
     return {
       ok: false,
+      sentOk: false,
+      verifyOk: false,
       error: 'empty_message: refusing to nudge with blank payload',
       reason: 'empty_message',
     }
@@ -238,6 +262,8 @@ async function sendTmuxNudgeV2(
     const msg = e instanceof Error ? e.message : String(e)
     return {
       ok: false,
+      sentOk: false,
+      verifyOk: false,
       error: `load_buffer_spawn_failed: ${msg}`,
       reason: /ENOENT/i.test(msg) ? 'tmux_missing' : 'load_buffer_error',
     }
@@ -249,6 +275,8 @@ async function sendTmuxNudgeV2(
     const msg = e instanceof Error ? e.message : String(e)
     return {
       ok: false,
+      sentOk: false,
+      verifyOk: false,
       error: `load_buffer_stdin_failed: ${msg}`,
       reason: 'load_buffer_error',
     }
@@ -258,6 +286,8 @@ async function sendTmuxNudgeV2(
     const stderr = await new Response(loadProc.stderr).text()
     return {
       ok: false,
+      sentOk: false,
+      verifyOk: false,
       error: `load_buffer_failed (exit ${loadExit}): ${stderr.trim()}`,
       reason: classifyTmuxStderr(stderr) === 'session_gone'
         ? 'session_gone'
@@ -278,7 +308,13 @@ async function sendTmuxNudgeV2(
   if (!pasteResult.ok) {
     // On paste failure, `-d` did NOT delete the buffer — clean it up.
     void runTmux([TMUX_PATH, 'delete-buffer', '-b', buffer])
-    return pasteResult
+    return {
+      ok: false,
+      sentOk: false,
+      verifyOk: false,
+      error: pasteResult.error,
+      reason: pasteResult.reason,
+    }
   }
 
   // 200ms settle — agent_farm's production value. Gives the TUI a beat to
@@ -286,20 +322,34 @@ async function sendTmuxNudgeV2(
   await sleep(200)
 
   const cmResult = await runTmux([TMUX_PATH, 'send-keys', '-t', session, 'C-m'])
-  if (!cmResult.ok) return cmResult
+  if (!cmResult.ok) {
+    return {
+      ok: false,
+      sentOk: false,
+      verifyOk: false,
+      error: cmResult.error,
+      reason: cmResult.reason,
+    }
+  }
 
-  // Delta verify: 3 retries × 400ms. Success only if the needle appears
-  // LATER in the post-send pane tail than it did in the baseline.
+  // SEND-KEYS PATH SUCCEEDED — past this point sentOk is unconditionally true.
+  // The delta-verify loop is best-effort observability ONLY. Per #929 Fix-C,
+  // a verify-fail no longer fails the nudge: on a busy/streaming pane,
+  // `lastIndexOf` over the last-50-lines pane tail returns -1 once the
+  // streaming response rolls the needle off-tail, producing false negatives.
+  // Callers gate audit on sentOk; verifyOk surfaces as nudge_verify_warn.
   for (let attempt = 0; attempt < 3; attempt++) {
     await sleep(400)
     const pane = await capturePane(session)
     const currentIdx = normalizePaneText(pane).lastIndexOf(needle)
     if (currentIdx > baselineIdx) {
-      return { ok: true }
+      return { ok: true, sentOk: true, verifyOk: true }
     }
   }
   return {
-    ok: false,
+    ok: true,
+    sentOk: true,
+    verifyOk: false,
     error:
       'verify_failed: payload did not advance past baseline in pane tail after 3 × 400ms retries',
     reason: 'verify_failed',
@@ -404,8 +454,19 @@ export async function dispatchAgentNudge(
     const sendResult = await withSessionLock(session, () =>
       sendTmuxNudgeV2(session, message),
     )
-    if (sendResult.ok) {
+    if (sendResult.sentOk) {
+      // #929 Fix-C: audit on send-keys success regardless of verify outcome.
       logDelivered(source, agent, message)
+      if (!sendResult.verifyOk && _debounceAudit) {
+        try {
+          _debounceAudit.log(source, NUDGE_ACTIONS.VERIFY_WARN, {
+            target: agent,
+            reason: sendResult.reason ?? 'verify_failed',
+            error: sendResult.error ?? 'unknown',
+            message: message.slice(0, 200),
+          })
+        } catch {}
+      }
     } else if (_debounceAudit) {
       try {
         _debounceAudit.log(source, NUDGE_ACTIONS.DELIVERY_FAILED, {
@@ -415,7 +476,9 @@ export async function dispatchAgentNudge(
         })
       } catch {}
     }
-    return sendResult
+    return sendResult.ok
+      ? { ok: true }
+      : { ok: false, error: sendResult.error }
   }
 
   const result = tryNudge(_debounceDb, agent, urgency)
@@ -472,9 +535,21 @@ export async function dispatchAgentNudge(
   const sendResult = await withSessionLock(session, () =>
     sendTmuxNudgeV2(session, payload),
   )
-  if (sendResult.ok) {
-    // Canonical delivery audit — only on successful keystroke send.
+  if (sendResult.sentOk) {
+    // #929 Fix-C: audit on send-keys success regardless of verify outcome.
+    // Canonical delivery audit — emitted whenever the keystroke sequence
+    // reached tmux without throwing. Verify-fail is a soft warn, not a fail.
     logDelivered(source, agent, payload)
+    if (!sendResult.verifyOk && _debounceAudit) {
+      try {
+        _debounceAudit.log(source, NUDGE_ACTIONS.VERIFY_WARN, {
+          target: agent,
+          reason: sendResult.reason ?? 'verify_failed',
+          error: sendResult.error ?? 'unknown',
+          message: payload.slice(0, 200),
+        })
+      } catch {}
+    }
   } else if (_debounceAudit) {
     try {
       _debounceAudit.log(source, NUDGE_ACTIONS.DELIVERY_FAILED, {
@@ -484,7 +559,14 @@ export async function dispatchAgentNudge(
       })
     } catch {}
   }
-  return { ...sendResult, suppressed: false, pendingCount: result.pendingCount }
+  return sendResult.ok
+    ? { ok: true, suppressed: false, pendingCount: result.pendingCount }
+    : {
+        ok: false,
+        error: sendResult.error,
+        suppressed: false,
+        pendingCount: result.pendingCount,
+      }
 }
 
 /**
