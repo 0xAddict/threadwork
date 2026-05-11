@@ -5,6 +5,9 @@
 // Acquires a watchdog lease, reconciles due tasks every WATCHDOG_CADENCE_SEC,
 // checks agent sessions for liveness, and handles escalation idempotently.
 
+import { statSync } from 'fs'
+import { homedir } from 'os'
+import { join } from 'path'
 import { TaskDB, type Task } from './db'
 import { MemoryDB } from './memory'
 import { DecisionDB, expireStaleDecisions, type Decision, type DecisionWithDetail } from './decision'
@@ -39,6 +42,34 @@ const BLOCKED_TTL_SEC = 600 // 10 minutes
 // without an intervening heartbeat. After this many relays, escalate once and
 // stop scheduling re-checks. A heartbeat after `blocked_at` resets the counter.
 const LONG_BLOCK_RELAY_CAP = 3
+
+// ---------------------------------------------------------------------------
+// Restart-window suppression (TG #5371 / task #1134)
+// ---------------------------------------------------------------------------
+// When an agent restarts (SessionStart hook fires), its main thread goes silent
+// for 60–300s while the new session boots. During this window the watchdog was
+// firing false-positive heartbeat-overdue nudges and circuit-open Telegram
+// pages to GweiSprayer. session-boot.sh now touches a per-agent flag file in
+// ~/.claude/state/restart-window/{agent}.flag at session start. The watchdog
+// reads the flag's mtime and suppresses the two restart-driven alert types
+// while the flag is fresh (< 300s old). Self-expires via mtime so a stalled
+// restart resumes alerting after the TTL — we don't silently lose visibility
+// on a real outage. Subagent-stall-watcher.sh (40-min stall detector) and
+// level-3 boss-escalation are NOT gated by this — only the worker-level
+// heartbeat-overdue nudge and the circuit-open page.
+const RESTART_WINDOW_TTL_SEC = 300 // 5 minutes
+const RESTART_WINDOW_DIR = join(homedir(), '.claude', 'state', 'restart-window')
+
+function isRestartWindowActive(agent: string): { active: boolean; ageSec: number | null } {
+  try {
+    const flagPath = join(RESTART_WINDOW_DIR, `${agent}.flag`)
+    const stat = statSync(flagPath)
+    const ageSec = (Date.now() - stat.mtimeMs) / 1000
+    return { active: ageSec < RESTART_WINDOW_TTL_SEC, ageSec }
+  } catch {
+    return { active: false, ageSec: null }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -514,6 +545,13 @@ export class TaskReconciler {
 
     log(`Heartbeat overdue for task #${task.id} (worker: ${task.to_agent}, level ${level} -> ${newLevel})`)
 
+    // Restart-window gate (task #1134). If the worker's session just restarted,
+    // silence is expected — suppress the worker-level nudge and skip recording
+    // a fault (which would prematurely open the circuit). Boss escalation at
+    // level >= 3 is NOT suppressed: if the restart never recovers, the TTL
+    // (5 min) expires and normal alerting resumes.
+    const restartWindow = isRestartWindowActive(task.to_agent)
+
     // Sprint 4: Record fault and check circuit breaker
     // S2.1 fix: Do NOT charge subagent heartbeat faults to the parent's circuit breaker.
     // Subagent tasks have to_agent = supervisor (parent), so faulting to_agent would
@@ -525,6 +563,18 @@ export class TaskReconciler {
         parent_agent: task.to_agent,
         timeout_sec: timeoutSec,
         escalation_level: newLevel,
+      }, task.id)
+    } else if (restartWindow.active) {
+      // Suppress fault recording during a restart window. Without this, three
+      // watchdog ticks across a 90-300s restart can climb the fault counter to
+      // 3 and trip the circuit breaker on a healthy agent.
+      log(`Fault recording for ${task.to_agent} task #${task.id} suppressed — restart window active (flag age ${restartWindow.ageSec?.toFixed(1)}s)`)
+      this.audit.log('watchdog', 'restart_window_suppressed', {
+        task_id: task.id,
+        agent: task.to_agent,
+        flag_age_sec: restartWindow.ageSec,
+        suppressed: 'fault_record',
+        timeout_sec: timeoutSec,
       }, task.id)
     } else {
       const faultResult = this.taskDb.recordFault(task.to_agent, 'timeout')
@@ -542,9 +592,24 @@ export class TaskReconciler {
     }
 
     if (newLevel >= 3) {
-      // Escalate to boss
+      // Escalate to boss (intentionally NOT gated by restart window — if a
+      // restart genuinely never recovers, the level-3 page is our last line of
+      // visibility on the agent and must still fire).
       await this.escalateToBoss(task, newLevel, `heartbeat overdue (${timeoutSec}s timeout, level ${newLevel})`)
       result.escalated++
+    } else if (restartWindow.active) {
+      // Suppress the worker-facing nudge during the restart window. We still
+      // bump escalation_level / next_check_at below so a never-recovering
+      // restart will eventually hit level 3 and escalate to boss.
+      log(`Heartbeat-overdue nudge to ${task.to_agent} (task #${task.id}) suppressed — restart window active`)
+      this.audit.log('watchdog', 'restart_window_suppressed', {
+        task_id: task.id,
+        agent: task.to_agent,
+        flag_age_sec: restartWindow.ageSec,
+        suppressed: 'heartbeat_overdue_nudge',
+        timeout_sec: timeoutSec,
+        escalation_level: newLevel,
+      }, task.id)
     } else {
       // Nudge the worker
       const msg = `Heartbeat overdue: Task #${task.id} has not sent a heartbeat in ${timeoutSec}s. Send a write_status update. (escalation level ${newLevel}/3)`
