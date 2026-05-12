@@ -116,12 +116,46 @@ else
   echo "  run:    launchctl load $PLIST_DST"
 fi
 
+# ─── Hooks ───────────────────────────────────────────────────────────────────
+echo ""
+echo "Hooks:"
+mkdir -p "$CLAUDE_DIR/hooks"
+if [[ -d "$REPO_DIR/hooks" ]]; then
+  for f in "$REPO_DIR"/hooks/*.sh "$REPO_DIR"/hooks/*.py "$REPO_DIR"/hooks/*.json "$REPO_DIR"/hooks/*.txt; do
+    [[ -f "$f" ]] || continue
+    name="$(basename "$f")"
+    [[ "$name" == *.bak-* ]] && continue
+    link "$f" "$CLAUDE_DIR/hooks/$name"
+  done
+fi
+
+# ─── Bin (heartbeat daemons + helpers) ───────────────────────────────────────
+echo ""
+echo "Bin:"
+mkdir -p "$HOME/bin"
+if [[ -d "$REPO_DIR/bin" ]]; then
+  for f in "$REPO_DIR"/bin/heartbeat-daemon*.sh; do
+    [[ -f "$f" ]] || continue
+    name="$(basename "$f")"
+    [[ "$name" == *.bak-* ]] && continue
+    chmod +x "$f"
+    link "$f" "$HOME/bin/$name"
+  done
+fi
+
 # ─── Done ────────────────────────────────────────────────────────────────────
 echo ""
 echo "Install complete."
+echo ""
+echo "Required env vars (set in your shell rc before running daemons/hooks):"
+echo "  TELEGRAM_BOT_TOKEN     — bot token for thinking-to-telegram hook"
+echo "  TELEGRAM_TOKEN         — bot token for heartbeat daemons"
+echo "  SUPABASE_SERVICE_KEY   — Supabase service-role key (heartbeat daemons)"
+echo "  OPENROUTER_API_KEY     — optional, for heartbeat LLM classification"
 echo ""
 echo "Next steps:"
 echo "  1. Edit scripts/telegram-pool.sh with your bot tokens"
 echo "  2. Edit ~/.claude/channels/telegram/access.json with your Telegram user IDs"
 echo "  3. Set TELEGRAM_GROUP_ID in mcp-servers/task-board/config.ts"
-echo "  4. launchctl load ~/Library/LaunchAgents/com.threadwork.agents.plist"
+echo "  4. Export the required env vars listed above (heartbeat daemons + hooks will hard-fail without them)"
+echo "  5. launchctl load ~/Library/LaunchAgents/com.threadwork.agents.plist"

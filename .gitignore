@@ -35,3 +35,7 @@ briefings/*.json
 inbox/
 logs/
 .claude/scheduled_tasks.lock
+
+# Hook + bin backups (created by install.sh when overwriting existing files)
+hooks/*.bak-*
+bin/*.bak-*
