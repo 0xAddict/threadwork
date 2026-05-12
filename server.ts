@@ -1421,8 +1421,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case 'force_debrief': {
-        if (SELF_LABEL !== 'boss') {
-          return { content: [{ type: 'text', text: 'Only boss can force a debrief.', isError: true }] }
+        if (SELF_LABEL !== 'boss' && SELF_LABEL !== 'snoopy') {
+          return { content: [{ type: 'text', text: 'Only boss or snoopy can force a debrief.', isError: true }] }
         }
         const result = await forceDebrief(db, mem, dec, audit)
         if (result.error) {
