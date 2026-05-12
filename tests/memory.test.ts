@@ -408,6 +408,57 @@ describe('recallMemories agent scoping (S3.3)', () => {
   })
 })
 
+describe('getDecayCandidate — foundational no longer hardcoded-exempt (task #823)', () => {
+  const TEST_DB_DECAY = '/tmp/memory-test-decay.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(TEST_DB_DECAY + suffix) } catch {}
+    }
+    taskDb = new TaskDB(TEST_DB_DECAY)
+    mem = new MemoryDB(taskDb)
+  })
+
+  test('foundational + unpinned + idle: IS a decay candidate', () => {
+    // Seed a foundational row directly with last_accessed in the past so it
+    // satisfies the "-1 days" idle clause in getDecayCandidate.
+    const m = mem.saveMemory({
+      agent: 'sadie',
+      content: 'unpinned foundational claim',
+      category: 'role',
+      classification: 'foundational',
+      source_type: 'human',
+    })
+    taskDb.run(db => db.prepare(
+      "UPDATE memories SET last_accessed = datetime('now', '-3 days') WHERE id = ?"
+    ).run(m.id))
+
+    const candidates = mem.getDecayCandidate()
+    const ids = candidates.map(c => c.id)
+    expect(ids).toContain(m.id)
+  })
+
+  test('foundational + pinned=true: NOT a decay candidate (pin is the durability signal)', () => {
+    const m = mem.saveMemory({
+      agent: 'sadie',
+      content: 'pinned foundational claim',
+      category: 'role',
+      classification: 'foundational',
+      source_type: 'human',
+      pinned: true,
+    })
+    taskDb.run(db => db.prepare(
+      "UPDATE memories SET last_accessed = datetime('now', '-3 days') WHERE id = ?"
+    ).run(m.id))
+
+    const candidates = mem.getDecayCandidate()
+    const ids = candidates.map(c => c.id)
+    expect(ids).not.toContain(m.id)
+  })
+})
+
 describe('saveMemory dedup', () => {
   let taskDb7: TaskDB
   let mem7: MemoryDB

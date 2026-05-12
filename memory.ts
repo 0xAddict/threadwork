@@ -275,12 +275,16 @@ export class MemoryDB {
   }
 
   getDecayCandidate(): Memory[] {
+    // Durability is governed by `pinned`, not by `classification`. Foundational
+    // rows are no longer hardcoded-exempt — they decay normally subject to the
+    // foundational-window in getDecayWindowDays. Pin to make a row survive.
+    // See task #823 (revert of #804): the saveMemory coercion gate was the
+    // wrong layer; removing this exemption is the simpler fix.
     return this.taskDb.run(db => db.prepare(`
       SELECT * FROM memories
       WHERE pinned = 0
         AND last_accessed < datetime('now', '-1 days')
         AND importance > 0
-        AND classification != 'foundational'
         AND state != 'superseded'
     `).all() as Memory[])
   }

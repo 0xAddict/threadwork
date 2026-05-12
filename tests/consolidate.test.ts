@@ -87,9 +87,12 @@ import { getDecayWindowDays } from '../consolidate'
 const TEST_DB_CONSOL = '/tmp/test-autodream-consolidate.db'
 
 describe('getDecayWindowDays', () => {
-  test('foundational returns Infinity', () => {
+  test('foundational returns 28 (finite, longest window — durability via pin, not classification)', () => {
+    // Per task #823 (revert of #804): foundational is no longer decay-exempt.
+    // It gets the longest finite window; rows that must survive should be
+    // pinned (pinned=1 excludes from getDecayCandidate entirely).
     const m = { classification: 'foundational', state: 'active', quality: 0.5, challenge_count: 0, support_count: 0 } as any
-    expect(getDecayWindowDays(m)).toBe(Infinity)
+    expect(getDecayWindowDays(m)).toBe(28)
   })
 
   test('strategic returns 14', () => {

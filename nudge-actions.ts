@@ -26,6 +26,15 @@ export const NUDGE_ACTIONS = {
   AGENT_NUDGED_LEGACY: 'agent_nudged',
   /** Ctrl+C interrupt delivered to agent pane via dispatchAgentInterrupt. */
   INTERRUPTED: 'agent_interrupted',
+  /**
+   * Send-keys succeeded but post-submit delta-verify did not see the needle
+   * advance past baseline (#929). Soft signal — nudge IS considered delivered
+   * for audit purposes (nudge_sent + agent_nudged still emitted) because the
+   * verify loop false-negatives on busy/streaming panes (lastIndexOf returns
+   * -1 once the pane tail rolls past the needle). Use this row to spot panes
+   * that may have actually missed delivery vs ones that just rolled fast.
+   */
+  VERIFY_WARN: 'nudge_verify_warn',
 } as const
 
 export type NudgeAction = typeof NUDGE_ACTIONS[keyof typeof NUDGE_ACTIONS]

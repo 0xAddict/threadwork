@@ -16,8 +16,11 @@ const BRIEFING_DIR = join(
 )
 
 export function getDecayWindowDays(memory: Pick<Memory, 'classification' | 'state' | 'quality' | 'challenge_count' | 'support_count'>): number {
+  // Durability is governed by `pinned`, not by `classification`. Foundational
+  // gets the longest finite window (28 days, 2x strategic) but is no longer
+  // exempt from decay — pin a row to truly opt out. See #823 (revert of #804).
   const BASE_WINDOWS: Record<string, number> = {
-    foundational: Infinity,
+    foundational: 28,
     strategic: 14,
     operational: 7,
     observational: 3,
