@@ -4,7 +4,8 @@ import type { TaskDB } from './db'
 import type { AuditLog } from './audit'
 import { NUDGE_ACTIONS } from './nudge-actions'
 
-export function resolveSession(agent: string): string | null {
+export function resolveSession(agent: string | null | undefined): string | null {
+  if (!agent) return null
   const label = agent.toLowerCase()
   return AGENT_SESSIONS[label] ?? null
 }

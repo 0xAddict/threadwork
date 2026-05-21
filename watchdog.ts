@@ -682,6 +682,14 @@ export class TaskReconciler {
   // -------------------------------------------------------------------------
 
   private async handleUnclaimed(task: Task, result: ReconcileResult): Promise<void> {
+    // Backlog/unassigned tasks (migration 0007: to_agent nullable) have nobody
+    // to nudge. Skip cleanly rather than passing null into dispatchAgentNudge,
+    // which would crash resolveSession (#832).
+    if (!task.to_agent) {
+      log(`Unclaimed task #${task.id} has no assignee — skipping nudge`)
+      return
+    }
+
     const level = (task.escalation_level ?? 0)
     const newLevel = level + 1
 
