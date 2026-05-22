@@ -112,6 +112,8 @@ New decision order in `classify_agent_v2`:
 - Scenario 5b → AC#5 (absent declaration + recent last_seen → ALIVE)
 
 ### Files in this sprint's commit
+Commit: **9107d5b** — "sprint-2: daemon boot-recovery OS-facts fallback (#1269)"
+on branch `feat/v2-cutover-runbook`. 5 files changed.
 - `bin/heartbeat-daemon-v2.sh` (modified — D1/D2 fix, +156/-26 lines)
 - `tests/heartbeat/heartbeat-v2-fallback.test.sh` (new)
 - `.harness/sprints/sprint-2/{proposed-contract.md,status.txt,implementation-log.md}`
