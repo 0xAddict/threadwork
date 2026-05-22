@@ -64,6 +64,24 @@
 - harness bookkeeping: `.harness/sprints/sprint-1/{status.txt,implementation-log.md}`.
 
 ## Commit
-- Commit hash: see git log on branch `feat/v2-cutover-runbook` (recorded below
-  after commit).
+- Commit hash: `d7952c20c1ab644296f7d859b45042efcaa1c560` (`d7952c2`) on branch
+  `feat/v2-cutover-runbook`.
+- Commit message: "sprint-1: V2 heartbeat cutover runbook (#1267)".
+- 5 files changed; `docs/v2-heartbeat-cutover-runbook.md` created.
 - status.txt -> ready_for_evaluation.
+
+## Handoff to Verifier
+Deliverable ready for evaluation. Suggested test commands (contract C1-C10):
+- C1: `test -f docs/v2-heartbeat-cutover-runbook.md && git -C
+  /Users/coachstokes/.claude/mcp-servers/task-board log --oneline --
+  docs/v2-heartbeat-cutover-runbook.md` (on branch feat/v2-cutover-runbook).
+- C2: `grep -nE '^## [0-4]\.' docs/v2-heartbeat-cutover-runbook.md` -> 5 sections;
+  `grep -c '^### Commands' ...` etc -> 5 each for all 4 sub-parts.
+- C3/C4: dry-run the Step 1 PlistBuddy edits on a copy of the real plist, then
+  `plutil -lint` (passes), confirm ProgramArguments resolves to the real daemon
+  (`test -x`).
+- C5: `grep -c 'StartInterval\|KeepAlive\|TELEGRAM_TOKEN\|SUPABASE_SERVICE_KEY'`.
+- C6: extract verification blocks, run `bash -n` (all 26 blocks pass).
+- C7: Rollback sub-part non-empty for Steps 1/3/4 (and 0/2).
+- C8/C9/C10: `50%` soak gate present; `#842`/`#843` referenced (5x); `STAGED`
+  markers on Steps 3 & 4 (5x).
