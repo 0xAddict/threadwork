@@ -1,76 +1,79 @@
-# Sprint 1 Approved Contract
+# Sprint 1 Approved Contract — V2 Heartbeat Cutover Runbook
 
-status: APPROVED
+Status: APPROVED
+Verifier: harness-verifier
+Date: 2026-05-22
 
-## Reviewer Notes
+## Decision
 
-All 7 criteria are objective, measurable, and verifiable via code inspection and `bun test`. The proposed contract closely mirrors the roadmap scope. Baseline confirmed at 132 passing tests.
+APPROVED — proceed to implementation.
 
-One clarification added to Criterion 3: "at least 2 distinct agents" is an explicitly acknowledged heuristic — acceptable for this sprint. No structural changes to the criteria were required.
+## Contract Assessment
 
-One constraint added (Criterion 7 supplement): the cycle summary log line must include `decisions_expired=`, `decisions_nudged=`, and `decisions_ready=` — the exact field names match the interface extension in Criterion 5.
+All 10 acceptance criteria are objective, measurable, and testable by code/doc
+inspection without a browser. Each has corresponding test commands (C1–C10).
+Ground-truth anchoring has been verified:
 
----
+- `/Users/coachstokes/bin/heartbeat-daemon-v2.sh` confirmed as 3-line stub.
+- `/Users/coachstokes/Library/LaunchAgents/com.threadwork.heartbeat-v2.plist`
+  confirmed to point `ProgramArguments` at the stub path, with `StartInterval=300`
+  and NO `TELEGRAM_TOKEN`/`SUPABASE_SERVICE_KEY` env vars.
+- `heartbeat_v2_enabled` flag confirmed as `1` in `tasks.db`.
+- Real 489-line daemon confirmed at `bin/heartbeat-daemon-v2.sh`.
+- `~/bin/heartbeat-v2.db` and `~/bin/heartbeat-v2.log` confirmed to exist.
 
-## Acceptance Criteria (Approved)
+Gaps G1 and G2 are genuine, accurately diagnosed, and correctly required by
+AC#5. A runbook that does not address them would produce a daemon that either
+double-loops or crashes on boot. Good catch.
 
-### AC-1: expireStaleDecisions() called every watchdog cycle
-- `expireStaleDecisions(dec)` is called in the `run()` loop each cycle.
-- Call site must be after `reconcileDueTasks()` and `checkAgentSessions()`, and before (or alongside) the debrief gate.
-- Expired decisions are logged to the audit trail AND posted to the Telegram group via `postToGroup(formatDecisionExpired(...))`.
-- Verifiable by: code inspection of `watchdog.ts` run() loop; test asserting `expireStaleDecisions` is called and audit entry exists.
+## Open Questions — Resolutions
 
-### AC-2: Position nudge for stale open decisions
-- Decisions with `status = 'open'` that were created more than 10 minutes ago with zero positions trigger agent nudges.
-- The nudge must reference the decision ID and title.
-- Nudge target: the decision's `opened_by` agent and all team agents (since any may need to weigh in).
-- Verifiable by: test creating an 'open' decision with `created_at` backdated 11+ minutes, confirming nudge is issued with correct content.
+Q1 (launchctl syntax): The Generator's proposal — `bootout`/`bootstrap` as
+primary, `unload`/`load` as noted fallback — is accepted. Darwin 25.5.0 is
+the current platform; `bootout`/`bootstrap` is the correct modern form.
 
-### AC-3: Ready-to-finalize detection
-- Decisions in `'positions'` or `'critique'` status where positions from >= 2 distinct agents exist trigger a notification to Boss.
-- Notification message must identify the decision ID and title.
-- Verifiable by: test creating a decision with 2 positions from distinct agents, confirming Boss notification fires.
+Q2 (G2 remediation): The Generator's proposal — document adding env vars
+directly to the plist `EnvironmentVariables` dict as primary, secrets-file
+as noted alternative — is accepted. This is the straightforward operator
+path and matches how the daemon consumes the vars.
 
-### AC-4: Telegram group notifications for state changes
-- Expired decision: `postToGroup(formatDecisionExpired(...))` called — uses the existing `formatDecisionExpired` function from `notify.ts`.
-- Ready-to-finalize: a distinct formatted message posted to the group (new formatter or inline string acceptable).
-- Verifiable by: tests mock/spy `postToGroup` and assert it is called with correctly formatted strings.
+## Rubric Thresholds (reminder)
 
-### AC-5: Decision monitoring stats in cycle summary
-- `ReconcileResult` interface extended with three new optional or required numeric fields: `decisions_expired`, `decisions_nudged`, `decisions_ready`.
-- Cycle summary log line includes these counters (e.g., `decisions_expired=0 decisions_nudged=1 decisions_ready=0`).
-- Verifiable by: TypeScript compilation succeeds; log output contains the three counter names.
+Per decision-log.md adapted rubric:
+- Functionality (40%) hard threshold >= 9 for PASS.
+- "Design Quality" → Completeness & structure (25%).
+- "Craft" → Executability & correctness (20%).
+- "Originality" → de-emphasised, baseline 7-8 (15%).
+- Overall >= 78 required for PASS.
 
-### AC-6: All decision actions logged to audit trail
-- Every watchdog decision action (expire, nudge-for-position, ready-to-finalize) calls `this.audit.log(...)`.
-- Action types should be distinct strings (e.g., `'decision_expired'`, `'decision_position_nudge'`, `'decision_ready_to_finalize'`).
-- Verifiable by: tests assert `audit.getLogs()` or equivalent contains entries with the expected action strings after triggering each path.
+## What Will Fail This Sprint
 
-### AC-7: No regressions
-- All 132 existing tests continue to pass after the implementation.
-- `bun test` exits with 0 failures.
-- Verifiable by: running `bun test` and confirming 132+ tests pass, 0 fail.
+The Verifier will fail this sprint if ANY of the following:
 
----
+- `docs/v2-heartbeat-cutover-runbook.md` does not exist or is not committed on
+  `feat/v2-cutover-runbook`.
+- Any of the 5 steps (0–4) is missing its section or any of the 4 sub-parts
+  (Commands, File paths, Verification, Rollback).
+- Any absolute path in the runbook does not resolve to a real file/directory
+  on this machine.
+- The Step 1 section does not explicitly name the stub, give the corrected
+  `ProgramArguments` value pointing at the real daemon, and give reload commands.
+- G1 (StartInterval double-loop) and G2 (missing env vars) are not addressed
+  with concrete remediations in the Step 1 section.
+- Any Verification sub-part is prose only with no runnable command.
+- Rollback is missing or empty for Steps 1, 3, or 4.
+- The soak pass criterion (v2 FP rate <= 50% of v1) is not stated.
+- Steps 3 and 4 are not explicitly marked STAGED.
+- The file references task #842 or #843 for the soak bug or omits the
+  forward-reference to Sprint 2 / Step 2b.
 
-## Definition of Done
+## Notes for Implementation
 
-- New `monitorDecisions()` method (or equivalent private methods) on `TaskReconciler` handling all three paths: expire, nudge, ready-to-finalize.
-- Method called in the `run()` loop alongside `reconcileDueTasks` and `checkAgentSessions`.
-- `ReconcileResult` interface extended with `decisions_expired`, `decisions_nudged`, `decisions_ready`.
-- At least 5 new tests covering: expiry calling, position nudge timing, ready-to-finalize detection, audit logging, and no-double-notification.
-- All 132+ existing tests pass.
-- TypeScript compiles without errors: `bun build watchdog.ts --no-bundle --target=bun` exits cleanly.
-
-## Test Commands
-
-```bash
-# Regression check
-bun test
-
-# TypeScript compile check
-bun build watchdog.ts --no-bundle --target=bun 2>&1 | head -5
-
-# Decision monitoring tests specifically
-bun test tests/watchdog.test.ts
-```
+- Do not execute Steps 1, 3, or 4. Write only.
+- `plutil -lint` should pass on a copy of the plist after the documented edit.
+- The test command `test -x /Users/coachstokes/.claude/mcp-servers/task-board/bin/heartbeat-daemon-v2.sh`
+  must pass (it does today — the Verifier will re-check after the runbook is written
+  to confirm no accidental path divergence).
+- C1 placeholder `<PROJECT>` should be replaced with the real path in the
+  implementation-log's test-command examples; the runbook itself should use
+  the real path.

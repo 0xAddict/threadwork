@@ -1,43 +1,69 @@
-# Sprint 1 Implementation Log
+# Sprint 1 Implementation Log — V2 Heartbeat Cutover Runbook
 
-## [2026-04-08T00:00] Initial Analysis
-- Read all key files: watchdog.ts, decision.ts, nudge.ts, notify.ts, db.ts, config.ts, audit.ts
-- Confirmed 132 existing tests all pass
-- Identified integration points in watchdog.ts run() loop (between checkAgentSessions and debrief)
-- Proposed contract written and status set to negotiating
-- Next: Await contract approval, then implement
+## [2026-05-22] Contract approved, implementation started
+- Verifier APPROVED all 10 acceptance criteria; both open questions resolved as
+  proposed (Q1: bootout/bootstrap primary + unload/load fallback; Q2: env vars
+  in plist EnvironmentVariables primary + secrets-file alternative).
+- Branch `feat/v2-cutover-runbook` created off `main`.
+- status.txt -> implementing.
 
-## [2026-04-08T23:10] Implementation — Core Changes
+## [2026-05-22] Ground-truth re-verification before writing
+- Confirmed real v2 daemon: `bin/heartbeat-daemon-v2.sh`, 489 lines, executable.
+- Confirmed stub: `~/bin/heartbeat-daemon-v2.sh`, 3-line threadwork-v1.0.0 placeholder.
+- Confirmed v2 plist points ProgramArguments at the stub, StartInterval=300, no
+  TELEGRAM_TOKEN / SUPABASE_SERVICE_KEY env vars.
+- Confirmed v1 daemon `~/bin/heartbeat-daemon.sh`: LOG=`~/bin/heartbeat.log`,
+  DB=`~/bin/heartbeat.db` table `heartbeats` (cols: timestamp, agent, status,
+  reason, consecutive_stuck).
+- Confirmed v2 DB `~/bin/heartbeat-v2.db` table `heartbeats_v2` (12108 rows from
+  prior soak; cols: timestamp, agent, declared_state, declared_source,
+  state_age_sec, external_status, classification_method, reason,
+  consecutive_stuck).
+- Confirmed launchd stdout/stderr dir `~/.threadwork/logs/` (heartbeat-v2 logs
+  currently 0 bytes — proves the stub emits nothing).
+- Read task bodies #826 (state-contracts spec), #842/#843 (soak bug root cause),
+  #829/#830 (harness build) from the task board.
 
-### Files changed:
-- **watchdog.ts**: Added decision monitoring to the watchdog cycle
-- **tests/decision-monitor.test.ts**: New test file with 15 tests
+## [2026-05-22] Runbook written
+- File: `docs/v2-heartbeat-cutover-runbook.md`.
+- Structure: 5 step sections (0-4), each with 4 labelled sub-parts —
+  Commands / File paths / Verification / Rollback (verified 5x each via grep).
+- Step 1: explicit stub-vs-real-daemon naming; PlistBuddy `Set :ProgramArguments:0`
+  to the real daemon path; reload via `launchctl bootout`/`bootstrap`
+  (gui/$(id -u)) with `unload`/`load` fallback noted.
+- G1 (launch-model mismatch): documented + remediated — delete `StartInterval`,
+  add `KeepAlive bool true` (matches v1 plist's launch model). Verification:
+  `pgrep -fl heartbeat-daemon-v2.sh` must show exactly one process.
+- G2 (missing env vars): documented + remediated — add TELEGRAM_TOKEN and
+  SUPABASE_SERVICE_KEY to plist EnvironmentVariables (primary) or source from
+  `~/.threadwork/secrets.env` (alternative). Verification: `heartbeat-v2.err.log`
+  must be empty (no ":? env var required" crash). Cited daemon line numbers
+  (18, 31, 66-90).
+- Step 2: stages the Sprint 2 boot-recovery fallback; references #843 root cause;
+  no operator commands (code change lands in Sprint 2).
+- Step 3: marked STAGED; pass gate stated (v2 FP rate <= 50% of v1 FP rate);
+  SQL queries over both DBs to compute rates; fix-(a) pre-soak `/clear` step for
+  the #842/#843 stale-declaration artefact.
+- Step 4: marked STAGED; flip (v1 off, v2 on), DB collapse via ATTACH into the
+  canonical `~/bin/heartbeat.db`, 14-day decommission timer, full rollback
+  retaining the v1 plist for the whole window.
 
-### Changes to watchdog.ts:
+## [2026-05-22] Self-check (not self-grading)
+- All 12 absolute paths in the runbook resolve on disk (`test -e`) — 0 missing.
+- Real daemon `test -x` passes; 489 lines confirmed.
+- Step 1 plist edits dry-run on a COPY of the real plist: `plutil -lint` -> OK;
+  ProgramArguments repointed to real daemon; KeepAlive added; StartInterval gone.
+- All 26 fenced `bash` blocks pass `bash -n` syntax check.
+- Verification SQL queries executed against the real `heartbeat-v2.db` and
+  `heartbeat.db` — columns confirmed, queries return real data.
+- G1/G2 keyword coverage, `#842/#843` references (5), `STAGED` markers (5),
+  `50%` soak gate — all present.
 
-1. **Imports**: Added `expireStaleDecisions`, `Decision`, `DecisionWithDetail` from decision.ts; `formatDecisionExpired` from notify.ts; `WORKER_AGENTS`, `BOSS_AGENT` from config.ts
+## Files changed
+- ADDED: `docs/v2-heartbeat-cutover-runbook.md` (the deliverable).
+- harness bookkeeping: `.harness/sprints/sprint-1/{status.txt,implementation-log.md}`.
 
-2. **ReconcileResult extended**: Added `decisions_expired`, `decisions_nudged`, `decisions_ready` counters (initialized to 0 in reconcileDueTasks)
-
-3. **New method `monitorDecisions(result)`**: Implements three decision monitoring tasks:
-   - (a) Calls `expireStaleDecisions()` and posts Telegram notifications via `formatDecisionExpired()` for each expired decision. Logs to audit trail.
-   - (b) Detects open decisions older than 10 minutes with no positions. Nudges all WORKER_AGENTS. Uses audit trail deduplication to prevent re-nudging within 10 minutes.
-   - (c) Detects decisions in 'positions' or 'critique' status with >= 2 distinct agent positions (quorum). Notifies Boss via nudge and Telegram. Uses audit trail deduplication.
-
-4. **Wired into run() loop**: `monitorDecisions()` called as Step 3a, between checkAgentSessions and debrief check, wrapped in try/catch.
-
-5. **Cycle summary updated**: Log line now includes `decisions_expired`, `decisions_nudged`, `decisions_ready` counters.
-
-### Key design decisions:
-- **SQLite datetime format**: Discovered that audit `created_at` uses `datetime('now')` format (YYYY-MM-DD HH:MM:SS) while JS `toISOString()` uses ISO 8601 (with T and Z). Created `sqliteDatetime()` helper to format dates consistently for string comparison in audit queries.
-- **Deduplication via audit trail**: Rather than adding in-memory state, uses existing audit log queries to check if a nudge/notification was already sent for a given decision within the last 10 minutes. This survives process restarts.
-- **Position quorum = 2**: Since we cannot know exactly which agents were invited to a decision, we use >= 2 distinct position submitters as the threshold for "ready to finalize."
-- **MemoryDB/DecisionDB instantiation**: Created fresh instances inside monitorDecisions() to match the pattern used by debrief check in the same loop.
-
-## [2026-04-08T23:12] Tests — All Passing
-
-- 15 new tests in tests/decision-monitor.test.ts
-- 132 original tests unchanged
-- Total: 147 pass, 0 fail
-- Test coverage includes: expiry, non-expiry edge cases, audit logging, position nudge timing, no-nudge-when-positions-exist, deduplication, ready-to-finalize detection, quorum threshold, no-double-notify, finalized-decision exclusion, expired-decisions-dont-trigger-nudges, ReconcileResult shape, multiple-decisions-per-cycle
-- Next: Set status to ready_for_evaluation
+## Commit
+- Commit hash: see git log on branch `feat/v2-cutover-runbook` (recorded below
+  after commit).
+- status.txt -> ready_for_evaluation.
