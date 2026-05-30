@@ -8,6 +8,15 @@
 import { statSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+
+// ---------------------------------------------------------------------------
+// Sprint 1 / DEL-1: Canonical label schema validation (C0.4)
+// Fail-hard on schema mismatch to prevent silent label drift (premortem DD1/DD12)
+// ---------------------------------------------------------------------------
+import { validateLabels, schemaCheck, isReadyForDispatch } from './inhibit-engine'
+
+// Re-export for cross-module access
+export { validateLabels, schemaCheck, isReadyForDispatch }
 import { TaskDB, type Task } from './db'
 import { MemoryDB } from './memory'
 import { DecisionDB, expireStaleDecisions, type Decision, type DecisionWithDetail } from './decision'
