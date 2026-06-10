@@ -15,7 +15,11 @@ TMUX_BIN="/Users/coachstokes/.local/bin/tmux"
 TASKS_DB_PATH="$HOME/.claude/mcp-servers/task-board/tasks.db"
 HEARTBEAT_DB_PATH="/Users/coachstokes/bin/heartbeat-v2.db"
 LOG="/Users/coachstokes/bin/heartbeat-v2.log"
-TELEGRAM_TOKEN="${TELEGRAM_TOKEN:?TELEGRAM_TOKEN env var required}"
+# Sprint 2: env-var checks moved out of source-time. The `:?` form aborts
+# `source heartbeat-daemon-v2.sh` in test harnesses (which deliberately do not
+# export secrets). Defaults keep sourcing safe; require_env() enforces them
+# only on the real run path (called from main()).
+TELEGRAM_TOKEN="${TELEGRAM_TOKEN:-}"
 TELEGRAM_CHAT_ID="1712539766"
 AGENTS=("boss" "steve" "sadie" "kiera")
 CHECK_INTERVAL=300
@@ -25,10 +29,11 @@ HOURLY_INTERVAL=3600
 STATE_FRESHNESS_SEC=360
 TOOL_IN_FLIGHT_HUNG_SEC=600
 SUBAGENT_HUNG_SEC=2400
-LAST_SEEN_ALIVE_SEC=120   # last_seen_at within this window → agent is keeping alive
+LAST_SEEN_ALIVE_SEC=120     # last_seen_at within this window → agent is keeping alive
+TASK_PROGRESS_FRESH_SEC=900 # tasks.last_progress_at within this window → task is progressing
 
 SUPABASE_URL="https://nblnapyfcuotnmkmqvec.supabase.co"
-SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:?SUPABASE_SERVICE_KEY env var required}"
+SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
 
 OR_MODELS=(
   "google/gemma-3-12b-it"
@@ -61,6 +66,21 @@ log() {
   local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"
   printf '[%s] %s\n' "$ts" "$*" >> "$LOG" 2>/dev/null || true
   printf '[%s] %s\n' "$ts" "$*" >&2 || true
+}
+
+# Sprint 2: enforce required secrets only on the real run path (main()).
+# Sourcing the daemon for tests must NOT abort; require_env is never called
+# from the sourced/test path.
+require_env() {
+  local missing=0
+  if [[ -z "${TELEGRAM_TOKEN:-}" ]]; then
+    echo "FATAL: TELEGRAM_TOKEN env var required" >&2; missing=1
+  fi
+  if [[ -z "${SUPABASE_SERVICE_KEY:-}" ]]; then
+    echo "FATAL: SUPABASE_SERVICE_KEY env var required" >&2; missing=1
+  fi
+  (( missing )) && exit 1
+  return 0
 }
 
 load_api_key() {
@@ -265,6 +285,89 @@ alert_v2() {
 }
 
 # =============================================================================
+# Sprint 2 — OS-facts liveness helper (D1 + D2 fix)
+#
+# Decides whether an agent is alive purely from OS facts, independent of its
+# (possibly stale or absent) state declaration. This is the #843 boot-recovery
+# fix: an agent that was already running when the emit-state.sh hooks were
+# installed never wires PreToolUse, so every declaration goes stale — yet the
+# agent is perfectly healthy. OS facts are the ground truth.
+#
+# OR-s exactly three signals (child-PID descoped per Sprint 2 RM-1 Option B):
+#   1. pid_alive          — declared claude_pid responds to `kill -0`
+#   2. seen_alive         — agent_sessions.last_seen_at within LAST_SEEN_ALIVE_SEC
+#   3. task_progress_alive — the agent's current task (agent_sessions.current_task_id
+#                            → tasks.id) has tasks.last_progress_at within
+#                            TASK_PROGRESS_FRESH_SEC; falls back to
+#                            tasks.last_heartbeat_at when last_progress_at is NULL.
+#
+# Args: $1=agent  $2=declared_pid  $3=last_seen_age_sec  $4=current_task_id
+# Returns: 0 (alive) / 1 (not alive). Sets global OS_FACTS_REASON describing
+# which signal fired, so callers can build an auditable classification_method.
+# =============================================================================
+
+OS_FACTS_REASON=""
+
+# Compute the freshest task-progress age (seconds) for a task id.
+# Echoes an integer age; 999999 when unavailable. last_progress_at preferred,
+# last_heartbeat_at used as fallback when last_progress_at is NULL/empty.
+task_progress_age_sec() {
+  local task_id="$1"
+  [[ -z "$task_id" || "$task_id" == "NULL" || "$task_id" == "0" ]] && { echo 999999; return; }
+  [[ "$task_id" =~ ^[0-9]+$ ]] || { echo 999999; return; }
+
+  local trow
+  trow="$(sqlite3 "$TASKS_DB_PATH" \
+    "SELECT COALESCE(last_progress_at,''), COALESCE(last_heartbeat_at,'') FROM tasks WHERE id=$task_id LIMIT 1;" \
+    2>/dev/null || echo "")"
+  local prog_at hb_at chosen
+  prog_at="$(echo "$trow" | cut -d'|' -f1)"
+  hb_at="$(echo "$trow" | cut -d'|' -f2)"
+  if [[ -n "$prog_at" ]]; then
+    chosen="$prog_at"
+  elif [[ -n "$hb_at" ]]; then
+    chosen="$hb_at"
+  else
+    echo 999999; return
+  fi
+
+  python3 -c "
+from datetime import datetime, timezone
+import time
+s='$chosen'
+try:
+    dt=datetime.strptime(s.replace('T',' ').rstrip('Z'),'%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+    print(int(time.time()-dt.timestamp()))
+except Exception:
+    print(999999)
+" 2>/dev/null || echo 999999
+}
+
+os_facts_alive() {
+  local agent="$1" declared_pid="$2" last_seen_age_sec="$3" current_task_id="$4"
+  OS_FACTS_REASON=""
+
+  local pid_alive=0 seen_alive=0 task_progress_alive=0
+
+  if [[ -n "$declared_pid" ]] && [[ "$declared_pid" != "NULL" ]] && [[ "$declared_pid" -gt 0 ]] 2>/dev/null; then
+    kill -0 "$declared_pid" 2>/dev/null && pid_alive=1 || pid_alive=0
+  fi
+
+  (( last_seen_age_sec < LAST_SEEN_ALIVE_SEC )) && seen_alive=1 || seen_alive=0
+
+  local task_age_sec
+  task_age_sec="$(task_progress_age_sec "$current_task_id")"
+  (( task_age_sec < TASK_PROGRESS_FRESH_SEC )) && task_progress_alive=1 || task_progress_alive=0
+
+  OS_FACTS_REASON="pid_alive=${pid_alive} seen_alive=${seen_alive} task_progress_alive=${task_progress_alive} (task_age=${task_age_sec}s)"
+
+  if (( pid_alive || seen_alive || task_progress_alive )); then
+    return 0
+  fi
+  return 1
+}
+
+# =============================================================================
 # Core: classify a single agent
 # Returns external status on stdout (ALIVE / STUCK / CRASHED / IDLE / UNKNOWN)
 # =============================================================================
@@ -286,17 +389,19 @@ classify_agent_v2() {
   fi
 
   # Step 2: read declared state from agent_sessions
+  # Sprint 2: also read current_task_id for the last-task-progress OS signal.
   local row
   row="$(sqlite3 "$TASKS_DB_PATH" \
-    "SELECT state, state_source, state_changed_at, last_seen_at, claude_pid FROM agent_sessions WHERE agent='$agent' LIMIT 1;" \
+    "SELECT state, state_source, state_changed_at, last_seen_at, claude_pid, COALESCE(current_task_id,'') FROM agent_sessions WHERE agent='$agent' LIMIT 1;" \
     2>/dev/null || echo "")"
 
-  local declared_state declared_source state_changed_at last_seen_at declared_pid
+  local declared_state declared_source state_changed_at last_seen_at declared_pid current_task_id
   declared_state="$(echo "$row" | cut -d'|' -f1)"
   declared_source="$(echo "$row" | cut -d'|' -f2)"
   state_changed_at="$(echo "$row" | cut -d'|' -f3)"
   last_seen_at="$(echo "$row" | cut -d'|' -f4)"
   declared_pid="$(echo "$row" | cut -d'|' -f5)"
+  current_task_id="$(echo "$row" | cut -d'|' -f6)"
 
   [[ -z "$declared_state" ]] && declared_state="UNKNOWN"
   [[ -z "$declared_source" ]] && declared_source="none"
@@ -339,15 +444,38 @@ except Exception:
   local reason=""
   local method=""
 
-  # Step 3: deterministic hung checks (regardless of freshness threshold)
+  # Step 3: deterministic hung checks.
+  #
+  # Sprint 2 (Defect D1): the deterministic-hung check must consult OS facts
+  # BEFORE emitting STUCK. A stale TOOL_IN_FLIGHT / SUBAGENT_RUNNING row whose
+  # claude_pid is alive / last_seen_at is recent / current task is progressing
+  # is the #843 boot-recovery symptom — a healthy already-running agent that
+  # simply never wired the emit-state.sh PreToolUse hook. Classify ALIVE via
+  # os-facts-hung-override; only emit STUCK when ALL OS signals are negative
+  # (a genuine hang).
+  local is_hung_declared=0
+  local hung_reason=""
   if [[ "$declared_state" == "TOOL_IN_FLIGHT" ]] && (( state_age_sec > TOOL_IN_FLIGHT_HUNG_SEC )); then
-    ext_status="STUCK"
-    reason="TOOL_IN_FLIGHT for ${state_age_sec}s (threshold ${TOOL_IN_FLIGHT_HUNG_SEC}s)"
-    method="deterministic-hung-tool"
+    is_hung_declared=1
+    hung_reason="TOOL_IN_FLIGHT for ${state_age_sec}s (threshold ${TOOL_IN_FLIGHT_HUNG_SEC}s)"
   elif [[ "$declared_state" == "SUBAGENT_RUNNING" ]] && (( state_age_sec > SUBAGENT_HUNG_SEC )); then
-    ext_status="STUCK"
-    reason="SUBAGENT_RUNNING for ${state_age_sec}s (threshold ${SUBAGENT_HUNG_SEC}s)"
-    method="deterministic-hung-subagent"
+    is_hung_declared=1
+    hung_reason="SUBAGENT_RUNNING for ${state_age_sec}s (threshold ${SUBAGENT_HUNG_SEC}s)"
+  fi
+
+  if (( is_hung_declared )); then
+    if os_facts_alive "$agent" "$declared_pid" "$last_seen_age_sec" "$current_task_id"; then
+      # D1 fix: stale hung-tool declaration overridden by live OS facts.
+      ext_status="ALIVE"
+      reason="hung-state suppressed ($hung_reason) — OS alive: ${OS_FACTS_REASON}"
+      method="os-facts-hung-override"
+    else
+      # Genuine hang: declared hung AND every OS signal negative.
+      ext_status="STUCK"
+      reason="$hung_reason; OS facts confirm hung: ${OS_FACTS_REASON}"
+      method="deterministic-hung-tool"
+      [[ "$declared_state" == "SUBAGENT_RUNNING" ]] && method="deterministic-hung-subagent"
+    fi
 
   # Step 4: state fresh → trust declared state
   elif (( state_age_sec < STATE_FRESHNESS_SEC )); then
@@ -356,29 +484,30 @@ except Exception:
     reason="declared $declared_state fresh (${state_age_sec}s old)"
     method="deterministic-fresh"
   else
-    # Step 4: state stale → OS facts
-    local pid_alive=0
-    local seen_alive=0
-
-    if [[ -n "$declared_pid" ]] && [[ "$declared_pid" != "NULL" ]] && [[ "$declared_pid" -gt 0 ]] 2>/dev/null; then
-      kill -0 "$declared_pid" 2>/dev/null && pid_alive=1 || pid_alive=0
-    fi
-
-    (( last_seen_age_sec < LAST_SEEN_ALIVE_SEC )) && seen_alive=1 || seen_alive=0
-
-    if (( pid_alive || seen_alive )); then
+    # Step 4: state stale (or absent) → OS facts.
+    # Sprint 2 (Defect D2): the stale-state branch is refactored to reuse the
+    # shared os_facts_alive helper, so the last-task-progress signal applies
+    # here too and scenario 3 of heartbeat-v2.test.sh stays green.
+    if os_facts_alive "$agent" "$declared_pid" "$last_seen_age_sec" "$current_task_id"; then
       ext_status="ALIVE"
-      reason="stale state (${state_age_sec}s) but OS alive: pid_alive=${pid_alive} seen_alive=${seen_alive}"
+      reason="stale state (${state_age_sec}s) but OS alive: ${OS_FACTS_REASON}"
       method="os-facts"
     else
       # Step 5: ambiguous → LLM with enriched input
       local pane_output
       pane_output="$("$TMUX_BIN" capture-pane -t "$session" -p -S -50 2>/dev/null || echo "")"
 
+      # Re-derive pid_alive for the enriched prompt (cheap; OS_FACTS_REASON
+      # already encodes it but the prompt wants a clean integer).
+      local pid_alive=0
+      if [[ -n "$declared_pid" ]] && [[ "$declared_pid" != "NULL" ]] && [[ "$declared_pid" -gt 0 ]] 2>/dev/null; then
+        kill -0 "$declared_pid" 2>/dev/null && pid_alive=1 || pid_alive=0
+      fi
+
       local enriched_input
-      enriched_input="$(printf 'Agent: %s\nDeclared state: %s (source: %s, age: %ds)\nPID alive: %d  Last-seen age: %ds\nLast 50 pane lines:\n%s' \
+      enriched_input="$(printf 'Agent: %s\nDeclared state: %s (source: %s, age: %ds)\nPID alive: %d  Last-seen age: %ds\nOS facts: %s\nLast 50 pane lines:\n%s' \
         "$session" "$declared_state" "$declared_source" "$state_age_sec" \
-        "$pid_alive" "$last_seen_age_sec" "$pane_output")"
+        "$pid_alive" "$last_seen_age_sec" "$OS_FACTS_REASON" "$pane_output")"
 
       if [[ -z "$api_key" ]]; then
         ext_status="UNKNOWN"
@@ -420,6 +549,7 @@ except Exception:
 # =============================================================================
 
 main() {
+  require_env
   log "========================================"
   log "heartbeat-daemon-v2 starting"
   log "Agents: ${AGENTS[*]}"

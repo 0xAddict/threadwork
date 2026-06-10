@@ -8,6 +8,15 @@
 import { statSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+
+// ---------------------------------------------------------------------------
+// Sprint 1 / DEL-1: Canonical label schema validation (C0.4)
+// Fail-hard on schema mismatch to prevent silent label drift (premortem DD1/DD12)
+// ---------------------------------------------------------------------------
+import { validateLabels, schemaCheck, isReadyForDispatch } from './inhibit-engine'
+
+// Re-export for cross-module access
+export { validateLabels, schemaCheck, isReadyForDispatch }
 import { TaskDB, type Task } from './db'
 import { MemoryDB } from './memory'
 import { DecisionDB, expireStaleDecisions, type Decision, type DecisionWithDetail } from './decision'
@@ -540,6 +549,26 @@ export class TaskReconciler {
   // -------------------------------------------------------------------------
 
   private async handleHeartbeatOverdue(task: Task, timeoutSec: number, result: ReconcileResult): Promise<void> {
+    // (#850 Layer 1) Terminal-status guard. The batch query excludes
+    // completed/cancelled tasks, but rows are snapshotted once per cycle then
+    // iterated with awaits — a task completed mid-cycle still carries a stale
+    // in_progress status on the in-memory snapshot (TOCTOU race, observed on
+    // #842 → L5-L8). Re-read live status by id (cheap, inside the run wrapper
+    // for WAL/lease discipline). If terminal, disarm watchdog re-pickup by
+    // nulling next_check_at (mirrors the #823 escalate-once-and-stop) and
+    // return WITHOUT escalating.
+    const live = this.taskDb.run(db =>
+      db.prepare('SELECT status FROM tasks WHERE id = ?').get(task.id)) as { status: string } | undefined
+    if (!live || live.status === 'completed' || live.status === 'cancelled') {
+      this.taskDb.run(db => db.prepare('UPDATE tasks SET next_check_at = NULL WHERE id = ?').run(task.id))
+      this.audit.log('watchdog', 'heartbeat_overdue_skipped_terminal', {
+        task_id: task.id,
+        worker: task.to_agent,
+        status: live?.status ?? 'missing',
+      }, task.id)
+      return
+    }
+
     const level = (task.escalation_level ?? 0)
     const newLevel = level + 1
 
@@ -591,12 +620,21 @@ export class TaskReconciler {
       }
     }
 
+    // (#850 Layer 2) Dedup the heartbeat-overdue alerts within the shouldAlert
+    // cooldown, mirroring the blocked_relay path (#615 Phase 1). The payload
+    // includes `level`, so a genuine level transition re-fires immediately
+    // (state-change semantics) while a stuck-at-same-level loop is suppressed
+    // for 1800s. Wraps BOTH the boss escalation and the worker nudge.
+    const hbAlertOk = this.taskDb.shouldAlert(task.id, 'heartbeat_overdue', { agent: task.to_agent, level: newLevel })
+
     if (newLevel >= 3) {
       // Escalate to boss (intentionally NOT gated by restart window — if a
       // restart genuinely never recovers, the level-3 page is our last line of
       // visibility on the agent and must still fire).
-      await this.escalateToBoss(task, newLevel, `heartbeat overdue (${timeoutSec}s timeout, level ${newLevel})`)
-      result.escalated++
+      if (hbAlertOk) {
+        await this.escalateToBoss(task, newLevel, `heartbeat overdue (${timeoutSec}s timeout, level ${newLevel})`)
+        result.escalated++
+      }
     } else if (restartWindow.active) {
       // Suppress the worker-facing nudge during the restart window. We still
       // bump escalation_level / next_check_at below so a never-recovering
@@ -610,8 +648,8 @@ export class TaskReconciler {
         timeout_sec: timeoutSec,
         escalation_level: newLevel,
       }, task.id)
-    } else {
-      // Nudge the worker
+    } else if (hbAlertOk) {
+      // Nudge the worker (gated by shouldAlert — see #850 Layer 2 above)
       const msg = `Heartbeat overdue: Task #${task.id} has not sent a heartbeat in ${timeoutSec}s. Send a write_status update. (escalation level ${newLevel}/3)`
       await dispatchAgentNudge(task.to_agent, msg)
       result.nudged++

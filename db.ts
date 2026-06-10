@@ -277,6 +277,114 @@ export class TaskDB {
     // watchdog escalates-once-and-stops once the cap is reached.
     try { this.db.exec('ALTER TABLE tasks ADD COLUMN blocked_relay_count INTEGER NOT NULL DEFAULT 0') } catch { /* column already exists */ }
 
+    // Migration 0010: Autonomous Board P1-WS1 card schema additions (PRD §6).
+    // Idempotent ALTERs (mirror the 0008/0009 pattern). See
+    // migrations/0010_autonomous_board_p1.sql for the documentation artifact.
+    const autonomousBoardColumns = [
+      'ALTER TABLE tasks ADD COLUMN complexity_user TEXT',            // EASY|MEDIUM|COMPLEX, user pick
+      'ALTER TABLE tasks ADD COLUMN complexity_final TEXT',           // post-classification (escalate-only)
+      'ALTER TABLE tasks ADD COLUMN classification_score TEXT',       // JSON {"S1":bool..."S5":bool,"total":int}
+      'ALTER TABLE tasks ADD COLUMN classification_rationale TEXT',   // cheap-LLM paragraph
+      'ALTER TABLE tasks ADD COLUMN tags TEXT',                       // JSON array of type tags
+      'ALTER TABLE tasks ADD COLUMN snoozed_until TEXT',              // ISO8601; NULL = not snoozed
+      'ALTER TABLE tasks ADD COLUMN reject_count INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE tasks ADD COLUMN owner TEXT',                      // sticky worker assignment
+    ]
+    for (const sql of autonomousBoardColumns) {
+      try { this.db.exec(sql) } catch { /* column already exists */ }
+    }
+
+    // Migration 0010: tasks.updated_at + AFTER UPDATE trigger so the sync daemon
+    // can detect ANY row mutation — including writes that touch ONLY the new card
+    // fields (owner, reject_count, complexity_final, tags, ...), which move no
+    // other timestamp. Without this, a field-only UPDATE is invisible to the
+    // outbound high-water-mark selector and never mirrors to Supabase.
+    try { this.db.exec("ALTER TABLE tasks ADD COLUMN updated_at TEXT") } catch { /* exists */ }
+    // Backfill existing rows so the column is non-null going forward.
+    // NOTE: updated_at MUST be lexically comparable to the daemon's watermark
+    // (new Date().toISOString(), e.g. 2026-06-10T23:02:12.459Z). SQLite's
+    // datetime('now') yields a SPACE-separated value ("2026-06-10 23:02:12")
+    // whose space (0x20) sorts BEFORE 'T' (0x54), breaking `updated_at > $ts`
+    // string comparison. We therefore write strict ISO8601 via strftime.
+    try { this.db.exec("UPDATE tasks SET updated_at = COALESCE(updated_at, strftime('%Y-%m-%dT%H:%M:%fZ', created_at), strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE updated_at IS NULL") } catch { /* ignore */ }
+    // Trigger bumps updated_at (ISO8601) on every UPDATE. The WHEN guard prevents
+    // infinite recursion: the trigger's own UPDATE sets updated_at to a new
+    // value, so NEW.updated_at DISTINCT FROM OLD.updated_at and it does not re-fire.
+    try {
+      this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_updated_at
+        AFTER UPDATE ON tasks
+        FOR EACH ROW
+        WHEN NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at
+        BEGIN
+          UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
+        END;
+      `)
+    } catch { /* trigger exists */ }
+    // AFTER INSERT companion (Codex red-team round-2): a freshly inserted row has
+    // updated_at = NULL and created_at in SQLite's space-separated format
+    // ("2026-06-10 23:06:18"), whose space sorts BEFORE 'T' — so neither column
+    // is lexically > the daemon's ISO8601 watermark, and a new task inserted
+    // after the watermark advances is INVISIBLE to outbound sync. Stamp every
+    // INSERT with an ISO8601 updated_at so new rows always mirror.
+    try {
+      this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_updated_at_insert
+        AFTER INSERT ON tasks
+        FOR EACH ROW
+        WHEN NEW.updated_at IS NULL
+        BEGIN
+          UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
+        END;
+      `)
+    } catch { /* trigger exists */ }
+
+    // Migration 0010: Autonomous Board P1-WS1 supporting tables.
+    // watcher heartbeat row (FR-3), Telegram conversation-state (callback state
+    // machine), and soak prediction log (FR-20, §12). CREATE ... IF NOT EXISTS
+    // is inherently idempotent.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS watcher_heartbeat (
+        watcher_name   TEXT PRIMARY KEY,
+        last_beat_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        status         TEXT NOT NULL DEFAULT 'idle',
+        cycle_count    INTEGER NOT NULL DEFAULT 0,
+        detail         TEXT,
+        metadata       TEXT,
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS telegram_conversation_state (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id        INTEGER NOT NULL REFERENCES tasks(id),
+        chat_id        TEXT NOT NULL,
+        message_id     TEXT,
+        context_kind   TEXT NOT NULL,
+        pending_action TEXT,
+        card_revision  INTEGER,
+        status         TEXT NOT NULL DEFAULT 'pending',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at     TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_tg_convstate_task   ON telegram_conversation_state(task_id);
+      CREATE INDEX IF NOT EXISTS idx_tg_convstate_status ON telegram_conversation_state(status);
+      CREATE TABLE IF NOT EXISTS soak_prediction_log (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id              INTEGER NOT NULL REFERENCES tasks(id),
+        predicted_complexity TEXT,
+        actual_complexity    TEXT,
+        classification_score TEXT,
+        execution_path       TEXT,
+        rework_count         INTEGER NOT NULL DEFAULT 0,
+        wall_time_sec        INTEGER,
+        predicted_at         TEXT NOT NULL DEFAULT (datetime('now')),
+        resolved_at          TEXT,
+        notes                TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_soak_pred_task ON soak_prediction_log(task_id);
+    `)
+
     // Feature flags table (Sprint 1)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS feature_flags (

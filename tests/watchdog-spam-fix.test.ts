@@ -246,3 +246,145 @@ describe('watchdog spam fix (#823)', () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// Task #850: heartbeat-overdue terminal-status guard (Layer 1) + shouldAlert
+// dedup (Layer 2). Mirrors the #823/#615 hardening already on the blocked_relay
+// path. Layer 3 (heartbeat_relay_count column) is intentionally NOT implemented.
+// ---------------------------------------------------------------------------
+
+function emptyResult() {
+  return {
+    checked: 0, nudged: 0, escalated: 0, blocked_relayed: 0,
+    dead_sessions: 0, decisions_expired: 0, decisions_nudged: 0,
+    decisions_ready: 0, idle_nudges: 0, circuits_recovered: 0,
+  }
+}
+
+// Create an in_progress task with a stale heartbeat and a due next_check_at so
+// reconcileTask routes it into handleHeartbeatOverdue.
+function createHeartbeatStaleTask(taskDb: TaskDB, opts: {
+  toAgent?: string
+  heartbeatStaleSec?: number
+  escalationLevel?: number
+} = {}): number {
+  const db = rawDb(taskDb)
+  const toAgent = opts.toAgent ?? 'steve'
+  const stale = opts.heartbeatStaleSec ?? 200
+  const level = opts.escalationLevel ?? 0
+  const result = db.prepare(`
+    INSERT INTO tasks (from_agent, to_agent, description, priority, status,
+      supervisor_agent, claimed_at, last_heartbeat_at, heartbeat_timeout_sec,
+      escalation_level, next_check_at)
+    VALUES ('boss', ?, 'hb stale task', 'normal', 'in_progress',
+      'boss', datetime('now', '-600 seconds'),
+      datetime('now', ?), 60, ?, datetime('now', '-1 second'))
+  `).run(toAgent, `-${stale} seconds`, level)
+  return Number(result.lastInsertRowid)
+}
+
+describe('watchdog heartbeat-overdue hardening (#850)', () => {
+  function makeRunner(taskDb: TaskDB, reconciler: TaskReconciler, taskId: number) {
+    return async () => {
+      const result = emptyResult()
+      const task = rawDb(taskDb).prepare('SELECT * FROM tasks WHERE id = ?').get(taskId)
+      await (reconciler as any).reconcileTask(task, result)
+      return { result, task }
+    }
+  }
+
+  test('T-hb-completed-no-escalation: task completed mid-cycle is skipped, no escalation', async () => {
+    const { taskDb, audit, reconciler } = freshDb()
+    const id = createHeartbeatStaleTask(taskDb)
+
+    // Snapshot the task as the batch query would (status still in_progress)...
+    const task = rawDb(taskDb).prepare('SELECT * FROM tasks WHERE id = ?').get(id)
+    // ...then complete it AFTER the snapshot but BEFORE reconcile (TOCTOU race).
+    rawDb(taskDb).prepare(`UPDATE tasks SET status = 'completed' WHERE id = ?`).run(id)
+
+    const result = emptyResult()
+    await (reconciler as any).reconcileTask(task, result)
+
+    expect(result.nudged).toBe(0)
+    expect(result.escalated).toBe(0)
+
+    const updated = rawDb(taskDb).prepare('SELECT escalation_level, next_check_at FROM tasks WHERE id = ?').get(id) as any
+    expect(updated.escalation_level).toBe(0) // unchanged
+    expect(updated.next_check_at).toBeNull() // disarmed
+
+    const skip = audit.query({ taskId: id, action: 'heartbeat_overdue_skipped_terminal' })
+    expect(skip.length).toBe(1)
+
+    // No heartbeat nudge/escalation audit rows.
+    expect(audit.query({ taskId: id, action: 'heartbeat_nudge' }).length).toBe(0)
+    expect(audit.query({ taskId: id, action: 'heartbeat_escalation' }).length).toBe(0)
+  })
+
+  test('T-hb-cancelled-no-escalation: cancelled task is skipped, no escalation', async () => {
+    const { taskDb, audit, reconciler } = freshDb()
+    const id = createHeartbeatStaleTask(taskDb)
+
+    const task = rawDb(taskDb).prepare('SELECT * FROM tasks WHERE id = ?').get(id)
+    rawDb(taskDb).prepare(`UPDATE tasks SET status = 'cancelled' WHERE id = ?`).run(id)
+
+    const result = emptyResult()
+    await (reconciler as any).reconcileTask(task, result)
+
+    expect(result.nudged).toBe(0)
+    expect(result.escalated).toBe(0)
+
+    const updated = rawDb(taskDb).prepare('SELECT escalation_level, next_check_at FROM tasks WHERE id = ?').get(id) as any
+    expect(updated.escalation_level).toBe(0)
+    expect(updated.next_check_at).toBeNull()
+
+    const skip = audit.query({ taskId: id, action: 'heartbeat_overdue_skipped_terminal' })
+    expect(skip.length).toBe(1)
+  })
+
+  test('T-hb-live-in-progress-still-escalates: live stale task still nudges (no over-suppression)', async () => {
+    const { taskDb, audit, reconciler } = freshDb()
+    const id = createHeartbeatStaleTask(taskDb) // stays in_progress
+    const run = makeRunner(taskDb, reconciler, id)
+
+    const { result } = await run()
+
+    // level 1 → worker nudge fires (no restart window), level bumps to 1
+    expect(result.nudged).toBe(1)
+    expect(result.escalated).toBe(0)
+
+    const updated = rawDb(taskDb).prepare('SELECT escalation_level, next_check_at FROM tasks WHERE id = ?').get(id) as any
+    expect(updated.escalation_level).toBe(1)
+    expect(updated.next_check_at).not.toBeNull() // re-armed, NOT disarmed
+
+    expect(audit.query({ taskId: id, action: 'heartbeat_overdue_skipped_terminal' }).length).toBe(0)
+    expect(audit.query({ taskId: id, action: 'heartbeat_nudge' }).length).toBe(1)
+  })
+
+  test('T-hb-dedup-cooldown: repeat heartbeat-overdue at same level within cooldown is suppressed', async () => {
+    const { taskDb, audit, reconciler } = freshDb()
+    const id = createHeartbeatStaleTask(taskDb)
+    const run = makeRunner(taskDb, reconciler, id)
+
+    // Cycle 1: nudge fires (level 1)
+    const r1 = await run()
+    expect(r1.result.nudged).toBe(1)
+
+    // Force the task back to level 0 and re-arm next_check_at so cycle 2 lands
+    // at the SAME newLevel=1 with the SAME shouldAlert payload, inside cooldown.
+    rawDb(taskDb).prepare(`
+      UPDATE tasks SET escalation_level = 0,
+        last_heartbeat_at = datetime('now', '-200 seconds'),
+        next_check_at = datetime('now', '-1 second')
+      WHERE id = ?
+    `).run(id)
+
+    // Cycle 2: same payload {agent, level:1} within 1800s → suppressed.
+    const r2 = await run()
+    expect(r2.result.nudged).toBe(0)
+
+    const state = rawDb(taskDb).prepare(
+      `SELECT fire_count FROM watchdog_alert_state WHERE task_id = ? AND alert_type = 'heartbeat_overdue'`
+    ).get(id) as any
+    expect(state.fire_count).toBe(1) // fired once, not twice
+  })
+})
