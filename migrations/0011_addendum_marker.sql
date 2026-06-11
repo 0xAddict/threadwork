@@ -1,0 +1,27 @@
+-- Migration 0011: is_addendum marker for post-acceptance addenda (#1624)
+--
+-- A synthetic sub-agent row (kind='subagent', is_synthetic=1) is normally
+-- refused when its parent task is not in_progress. That blocked post-acceptance
+-- addenda — a fix shipped AFTER a card was accepted/completed ran with NO
+-- synthetic child row, a structural audit blind spot (bit twice 2026-06-10/11).
+--
+-- spawn_subagent(addendum:true) now permits a COMPLETED/CANCELLED parent and
+-- flags the row is_addendum=1. Addendum rows are:
+--   (a) excluded from the parent's open-children completion gate
+--       (completeTaskWithFinalizerCheck / forceCompleteTaskWithFinalizerCheck),
+--   (b) excluded from the watchdog escalation sweep (reconcileDueTasks selector,
+--       plus createSubagentTask leaves next_check_at NULL for them), so a
+--       terminal-parent addendum never climbs escalation_level or pages boss
+--       (L-escalation false-positive prevention; aligns with #1608 hardening,
+--       kept self-contained so it does not depend on #1608 landing),
+--   (c) labeled "[addendum to #N]" in the description and shown as [addendum]
+--       in get_children.
+--
+-- close_subagent works unchanged on addendum rows (matches WHERE is_synthetic=1).
+--
+-- Idempotent ALTER mirroring the 0008/0009/0010 pattern. db.ts also performs the
+-- equivalent ADD COLUMN inside its in-process migrate() loop (try/exec, column-
+-- exists swallowed), so a running server self-heals on boot. This .sql file is
+-- the documentation/parity artifact. See 0011_addendum_marker.down.sql to reverse.
+
+ALTER TABLE tasks ADD COLUMN is_addendum INTEGER NOT NULL DEFAULT 0;

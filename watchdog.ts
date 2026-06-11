@@ -247,12 +247,20 @@ export class TaskReconciler {
     }
 
     // Query due tasks (exclude escalation tasks — they must NOT be re-escalated)
+    // #1624: also exclude is_addendum=1 rows. A post-acceptance addendum runs
+    // under an already-terminal parent; createSubagentTask leaves next_check_at
+    // NULL for addenda so they shouldn't surface here anyway, but this predicate
+    // is a belt-and-suspenders guard so a manual/legacy next_check_at on an
+    // addendum row can never climb escalation_level or page boss (L-escalation
+    // false-positive prevention, per #1608 hardening — kept self-contained here
+    // so it does not depend on #1608 landing).
     const dueTasks = this.taskDb.run(db =>
       db.prepare(`
         SELECT * FROM tasks
         WHERE next_check_at <= datetime('now')
         AND status NOT IN ('completed', 'cancelled')
         AND description NOT LIKE 'ESCALATION%'
+        AND COALESCE(is_addendum, 0) = 0
         ORDER BY next_check_at ASC
       `).all() as Task[]
     )

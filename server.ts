@@ -387,13 +387,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'spawn_subagent',
-      description: 'Create a durable child task row BEFORE spawning a sub-agent via the Agent tool. Records the sub-agent invocation so the watchdog can monitor it. Call this before Agent tool, then pass the returned child_task_id to the sub-agent. Does NOT actually spawn the agent — you do that with the Agent tool. PAIRING REQUIREMENT: every spawn_subagent must be paired with a close_subagent call in a finally-equivalent block — call close_subagent immediately after Agent returns whether it succeeded, errored, or was interrupted.',
+      description: 'Create a durable child task row BEFORE spawning a sub-agent via the Agent tool. Records the sub-agent invocation so the watchdog can monitor it. Call this before Agent tool, then pass the returned child_task_id to the sub-agent. Does NOT actually spawn the agent — you do that with the Agent tool. PAIRING REQUIREMENT: every spawn_subagent must be paired with a close_subagent call in a finally-equivalent block — call close_subagent immediately after Agent returns whether it succeeded, errored, or was interrupted. ADDENDUM: by default the parent task MUST be in_progress. To record a post-acceptance addendum (a fix shipped AFTER the card was accepted/completed), pass addendum:true — this allows a completed/cancelled parent, labels the row "[addendum to #N]", and excludes it from the parent completion gate and the watchdog escalation sweep.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           description: { type: 'string', description: 'What the sub-agent will work on' },
           parent_task_id: { type: 'number', description: 'The task ID this sub-agent is working under' },
           model: { type: 'string', description: 'Optional model hint (e.g., "haiku", "sonnet"). Stored in description for reference only.' },
+          addendum: { type: 'boolean', description: 'Set true to record a post-acceptance addendum under a COMPLETED/CANCELLED parent. Default false (parent must be in_progress — current refusal behavior preserved).' },
         },
         required: ['description', 'parent_task_id'],
       },
@@ -1202,6 +1203,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const description = args.description as string
         const parentTaskId = args.parent_task_id as number
         const model = args.model as string | undefined
+        const isAddendum = (args.addendum as boolean) === true
 
         const fullDescription = model
           ? `[subagent:${model}] ${description}`
@@ -1212,17 +1214,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             description: fullDescription,
             parent_task_id: parentTaskId,
             supervisor_agent: SELF_LABEL,
+            is_addendum: isAddendum,
           })
 
           audit.log(SELF_LABEL, 'subagent_spawned', {
             parent_task_id: parentTaskId,
             child_task_id: childTask.id,
-            description: fullDescription,
+            description: childTask.description,
             model: model ?? null,
+            is_addendum: isAddendum ? 1 : 0,
           }, childTask.id)
-          safeEmitState(SELF_LABEL, 'SUBAGENT_RUNNING', { taskId: childTask.id, tool: 'spawn_subagent' })
+          safeEmitState(SELF_LABEL, 'SUBAGENT_RUNNING', { taskId: childTask.id, tool: 'spawn_subagent', addendum: isAddendum })
 
-          return { content: [{ type: 'text', text: `Sub-agent task #${childTask.id} created (child of #${parentTaskId}). Pass this ID to the sub-agent. Watchdog will monitor heartbeat (timeout: ${childTask.heartbeat_timeout_sec}s).` }] }
+          // #1624: addendum rows carry next_check_at=NULL (watchdog excluded);
+          // surface that in the reply so callers know the row is durably tracked
+          // but not heartbeat-supervised.
+          const supervisionNote = isAddendum
+            ? `Addendum to #${parentTaskId} — labeled "[addendum to #${parentTaskId}]", excluded from watchdog escalation and from the parent completion gate.`
+            : `Watchdog will monitor heartbeat (timeout: ${childTask.heartbeat_timeout_sec}s).`
+          return { content: [{ type: 'text', text: `Sub-agent task #${childTask.id} created (child of #${parentTaskId}). Pass this ID to the sub-agent. ${supervisionNote}` }] }
         } catch (err: any) {
           return { content: [{ type: 'text', text: `spawn_subagent failed: ${err.message}`, isError: true }] }
         }
@@ -1270,7 +1280,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         const lines = children.map(c => {
-          const kindTag = c.is_synthetic ? '[subagent]' : '[task]'
+          // #1624: label addendum rows explicitly so get_children makes the
+          // post-acceptance-fix lineage visible at a glance.
+          const kindTag = c.is_addendum ? '[addendum]' : (c.is_synthetic ? '[subagent]' : '[task]')
           const resultInfo = c.result ? ` | Result: ${c.result}` : ''
           return `#${c.id} ${kindTag} [${c.status}] ${c.description}${resultInfo}`
         })

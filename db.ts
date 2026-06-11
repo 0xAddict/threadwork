@@ -29,6 +29,12 @@ export interface Task {
   worker_session_id: string | null
   version: number
   is_synthetic: number
+  // #1624: post-acceptance addendum marker. 1 = this synthetic sub-agent row
+  // was spawned under a completed/cancelled parent (a fix shipped after a card
+  // was accepted). Addendum rows are excluded from the parent's open-children
+  // completion gate and from the watchdog escalation sweep so they never trip
+  // L-escalation false positives. Default 0 (normal subagent / task row).
+  is_addendum: number
   attempt_id: number
   result_finding_id: number | null
 }
@@ -276,6 +282,16 @@ export class TaskDB {
     // sent, and reset to 0 when a heartbeat lands AFTER blocked_at. The
     // watchdog escalates-once-and-stops once the cap is reached.
     try { this.db.exec('ALTER TABLE tasks ADD COLUMN blocked_relay_count INTEGER NOT NULL DEFAULT 0') } catch { /* column already exists */ }
+
+    // Migration 0011 (#1624): is_addendum marker for post-acceptance addenda.
+    // A synthetic sub-agent row spawned under a COMPLETED/CANCELLED parent (a
+    // fix shipped after the card was accepted) is flagged is_addendum=1 so it is
+    // (a) excluded from the parent's open-children completion gate, and
+    // (b) excluded from the watchdog escalation sweep — an addendum's parent is
+    // already terminal, so a missing heartbeat must NOT page boss. Idempotent
+    // ALTER mirroring the 0008/0009/0010 pattern; see
+    // migrations/0011_addendum_marker.sql for the documentation/parity artifact.
+    try { this.db.exec('ALTER TABLE tasks ADD COLUMN is_addendum INTEGER NOT NULL DEFAULT 0') } catch { /* column already exists */ }
 
     // Migration 0010: Autonomous Board P1-WS1 card schema additions (PRD §6).
     // Idempotent ALTERs (mirror the 0008/0009 pattern). See
@@ -1070,9 +1086,13 @@ export class TaskDB {
   completeTaskWithFinalizerCheck(id: number, result: string, agent: string): { task?: Task; error?: string; autoClosedChildren?: number[] } {
     return this.run(db => {
       // Check for open children
+      // #1624: exclude is_addendum=1 rows. A post-acceptance addendum runs under
+      // an already-terminal parent and must NOT block any (re-)completion path —
+      // an open addendum is not a blocking child.
       const openChildren = db.prepare(`
         SELECT id, is_synthetic FROM tasks
         WHERE parent_task_id = ? AND status NOT IN ('completed', 'cancelled')
+        AND is_addendum = 0
       `).all(id) as { id: number; is_synthetic: number }[]
 
       // Auto-close synthetic (sub-agent) children — the Agent tool has returned
@@ -1123,9 +1143,13 @@ export class TaskDB {
   forceCompleteTaskWithFinalizerCheck(id: number, result: string): { task?: Task; error?: string; autoClosedChildren?: number[] } {
     return this.run(db => {
       // Check for open children — auto-close synthetic ones
+      // #1624: exclude is_addendum=1 rows. A post-acceptance addendum runs under
+      // an already-terminal parent and must NOT block any (re-)completion path —
+      // an open addendum is not a blocking child.
       const openChildren = db.prepare(`
         SELECT id, is_synthetic FROM tasks
         WHERE parent_task_id = ? AND status NOT IN ('completed', 'cancelled')
+        AND is_addendum = 0
       `).all(id) as { id: number; is_synthetic: number }[]
 
       const autoClosedIds: number[] = []
@@ -1230,6 +1254,14 @@ export class TaskDB {
    * Create a synthetic sub-agent child task.
    * Used to track Agent tool invocations as durable task rows.
    * The task is immediately set to in_progress (sub-agents start working right away).
+   *
+   * #1624 — post-acceptance addenda: when `is_addendum` is true, the parent may
+   * be COMPLETED or CANCELLED (a fix shipped after the card was accepted). The
+   * row is flagged is_addendum=1, the description is prefixed `[addendum to #N]`,
+   * and next_check_at is left NULL so the watchdog never picks it up (its parent
+   * is already terminal — a missing heartbeat must not page boss). When
+   * `is_addendum` is false (default) the in_progress-parent requirement is
+   * UNCHANGED, preserving the current refusal behavior for completed parents.
    */
   createSubagentTask(input: {
     description: string
@@ -1237,20 +1269,36 @@ export class TaskDB {
     supervisor_agent: string
     heartbeat_timeout_sec?: number
     progress_timeout_sec?: number
+    is_addendum?: boolean
   }): Task {
     return this.run(db => {
       const hbTimeout = input.heartbeat_timeout_sec ?? 180 // Sub-agents get longer heartbeat default
       const progTimeout = input.progress_timeout_sec ?? SUPERVISION_DEFAULTS.progress_timeout_sec
+      const isAddendum = input.is_addendum === true
 
-      // Validate parent exists and is in_progress
+      // Validate parent exists. For a normal subagent the parent must be
+      // in_progress (unchanged). For an addendum the parent must be terminal
+      // (completed|cancelled) — addenda only make sense AFTER acceptance; a
+      // still-running parent should use a normal subagent row.
       const parent = db.prepare('SELECT id, status FROM tasks WHERE id = ?').get(input.parent_task_id) as { id: number; status: string } | null
       if (!parent) {
         throw new Error(`Parent task #${input.parent_task_id} not found`)
       }
-      if (parent.status !== 'in_progress') {
+      if (isAddendum) {
+        if (parent.status !== 'completed' && parent.status !== 'cancelled') {
+          throw new Error(`Addendum parent #${input.parent_task_id} is ${parent.status}, not completed/cancelled. Use a normal subagent row (addendum:false) for an in-progress parent.`)
+        }
+      } else if (parent.status !== 'in_progress') {
         throw new Error(`Parent task #${input.parent_task_id} is not in_progress (status: ${parent.status})`)
       }
 
+      // Telegram/team-group + get_children visibility: label addenda explicitly.
+      const description = isAddendum
+        ? `[addendum to #${input.parent_task_id}] ${input.description}`
+        : input.description
+
+      // Addendum rows: next_check_at = NULL (watchdog never re-picks them; parent
+      // is terminal). Normal subagent rows: armed for heartbeat supervision.
       const stmt = db.prepare(`
         INSERT INTO tasks (
           from_agent, to_agent, description, priority,
@@ -1259,26 +1307,27 @@ export class TaskDB {
           status, claimed_at,
           last_heartbeat_at, last_progress_at,
           next_check_at,
-          is_synthetic
+          is_synthetic, is_addendum
         ) VALUES (
           $from, $to, $description, 'normal',
           $supervisor_agent, 'subagent', $parent_task_id,
           $heartbeat_timeout_sec, $progress_timeout_sec,
           'in_progress', datetime('now'),
           datetime('now'), datetime('now'),
-          datetime('now', '+' || $heartbeat_timeout_sec || ' seconds'),
-          1
+          ${isAddendum ? 'NULL' : "datetime('now', '+' || $heartbeat_timeout_sec || ' seconds')"},
+          1, $is_addendum
         )
         RETURNING *
       `)
       return stmt.get({
         $from: input.supervisor_agent,
         $to: input.supervisor_agent,
-        $description: input.description,
+        $description: description,
         $supervisor_agent: input.supervisor_agent,
         $parent_task_id: input.parent_task_id,
         $heartbeat_timeout_sec: hbTimeout,
         $progress_timeout_sec: progTimeout,
+        $is_addendum: isAddendum ? 1 : 0,
       }) as Task
     })
   }
