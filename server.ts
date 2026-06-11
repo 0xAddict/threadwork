@@ -9,6 +9,8 @@ import { TaskDB } from './db'
 import { dispatchAgentNudge, dispatchAgentInterrupt, configureNudgeDebounce } from './nudge'
 import {
   postToGroup,
+  postToGroupThreaded,
+  postNudgeToGroup,
   formatTaskCreated,
   formatTaskClaimed,
   formatTaskCompleted,
@@ -657,14 +659,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           const nudgeMsg = `You have a new task (#${task.id}) from ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
           const [nudgeResult] = await Promise.all([
             dispatchAgentNudge(to, nudgeMsg, { source: SELF_LABEL }),
-            postToGroup(formatTaskCreated(task)),
+            postToGroupThreaded(formatTaskCreated(task), task.id, { spine: true }),
           ])
           audit.log(SELF_LABEL, 'task_created', { to, description, priority }, task.id)
 
           const nudgeWarning = nudgeResult.ok ? '' : ` (warning: nudge failed — ${nudgeResult.error})`
           return { content: [{ type: 'text', text: `Task #${task.id} created and assigned to ${to}. Agent nudged.${nudgeWarning}` }] }
         } else {
-          await postToGroup(formatTaskCreated(task))
+          await postToGroupThreaded(formatTaskCreated(task), task.id, { spine: true })
           audit.log(SELF_LABEL, 'task_created', { to: 'backlog', description, priority }, task.id)
           return { content: [{ type: 'text', text: `Task #${task.id} created in backlog (unassigned).` }] }
         }
@@ -748,7 +750,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         safeEmitState(SELF_LABEL, 'ACTIVE_THINKING', { taskId: task.id, tool: 'claim_task' })
 
-        await postToGroup(formatTaskClaimed(task))
+        await postToGroupThreaded(formatTaskClaimed(task), task.id)
         audit.log(SELF_LABEL, 'task_claimed', { task_id: taskId, session_id: sessionId ?? agentSession ?? null }, taskId)
         return { content: [{ type: 'text', text: `Claimed task #${task.id}: ${task.description}` }] }
       }
@@ -820,7 +822,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const nudgeMsg = `Task #${task.id} completed by ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
         const [nudgeResult] = await Promise.all([
           dispatchAgentNudge(task.from_agent, nudgeMsg, { source: SELF_LABEL }),
-          postToGroup(formatTaskCompleted(task)),
+          postToGroupThreaded(formatTaskCompleted(task), task.id),
         ])
 
         // Auto-extract task summary as memory
@@ -874,7 +876,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         db.addNote(taskId, SELF_LABEL, message)
-        await postToGroup(formatNote(taskId, SELF_LABEL, message))
+        await postToGroupThreaded(formatNote(taskId, SELF_LABEL, message), taskId)
         audit.log(SELF_LABEL, 'note_added', { task_id: taskId, message }, taskId)
 
         return { content: [{ type: 'text', text: `Note added to task #${taskId}.` }] }
@@ -889,7 +891,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: `Nudge failed: ${result.error}`, isError: true }] }
         }
 
-        await postToGroup(formatNudge(SELF_LABEL, agent, message))
+        // #1785: GROUP-CHAT nudge noise control — digest/throttle rapid repeat
+        // nudges to the same target. Delivery to the agent already happened above
+        // via dispatchAgentNudge (untouched); this only tames the group spine.
+        // 'urgent'/'high' priority nudges bypass the throttle so escalations surface.
+        const nudgeUrgency = (args.urgency as string | undefined)?.toLowerCase()
+        await postNudgeToGroup(SELF_LABEL, agent, message, {
+          urgent: nudgeUrgency === 'urgent' || nudgeUrgency === 'high',
+        })
         // audit_log('agent_nudged') is emitted inside dispatchAgentNudge() on the
         // successful sendTmux path only — this is the single canonical write site
         // (sprint #256 gate 3). Do NOT re-add a direct write here.

@@ -10,6 +10,21 @@ export const DB_PATH = join(
 
 export const TELEGRAM_GROUP_ID = '-1003790554582'
 
+/**
+ * Dashboard deep-link template for a board card. `<id>` is replaced with the
+ * task id. SINGLE configurable constant (task #1785) — to change the link shape
+ * (e.g. if Kiera #1601 finalizes a different route), edit ONLY this line.
+ * Default proposed to Kiera #1601: /board?card=<id>.
+ * Overridable at runtime via THREADWORK_CARD_URL_TEMPLATE env.
+ */
+export const DASHBOARD_CARD_URL_TEMPLATE =
+  process.env.THREADWORK_CARD_URL_TEMPLATE ??
+  'https://threadwork-dashboard.netlify.app/board?card=<id>'
+
+/** Build the dashboard deep-link for a given card/task id. */
+export const cardDeepLink = (taskId: number | string): string =>
+  DASHBOARD_CARD_URL_TEMPLATE.replace('<id>', String(taskId))
+
 // Bot token is passed via env var TELEGRAM_BOT_TOKEN by the pool script
 export const getTelegramToken = (): string | undefined =>
   process.env.TELEGRAM_BOT_TOKEN
