@@ -1,6 +1,77 @@
 import { Database } from 'bun:sqlite'
+import { existsSync, readFileSync } from 'fs'
+import { join } from 'path'
 import type { Task } from './db'
-import { TELEGRAM_GROUP_ID, getTelegramToken, DB_PATH, cardDeepLink } from './config'
+import { TELEGRAM_GROUP_ID, DB_PATH, cardDeepLink } from './config'
+
+// ---------------------------------------------------------------------------
+// Board WATCHER bot token for GROUP lifecycle posts (#1855)
+//
+// All GROUP lifecycle events (create/claim/complete/note/decision/nudge digest)
+// now speak with ONE voice — the board watcher bot (@Iceproncessfinancebot,
+// id 8761954986) — instead of inheriting each agent's per-session
+// TELEGRAM_BOT_TOKEN. This is the PROCESS half of the bot split: PROCESS (board
+// state-changes → group) = watcher bot; DIALOGUE (DM/nudge-to-agent) = agent
+// bots. Group messages still NAME their agent in the text (e.g. "sadie
+// completed #1785"); only the SENDING bot identity changes.
+//
+// The DM/agent path is unaffected — dispatchAgentNudge() in nudge.ts delivers
+// inter-agent nudges via tmux send-keys, never through this token or
+// sendToGroup(), so it keeps its agent-bot/per-pane identity untouched.
+//
+// 🔒 The token VALUE is never logged or embedded here — it is read at call time
+// from ~/.secrets/watcher-bot-token (overridable for tests via
+// WATCHER_BOT_TOKEN env / WATCHER_BOT_TOKEN_FILE path), mirroring the step-1
+// daemon's resolveBotToken(). Fail-loud per #2198: a missing/empty token throws
+// a visible error rather than silently no-op'ing.
+// ---------------------------------------------------------------------------
+
+const WATCHER_BOT_TOKEN_FILE =
+  process.env.WATCHER_BOT_TOKEN_FILE ??
+  join(process.env.HOME ?? '/tmp', '.secrets', 'watcher-bot-token')
+
+let _watcherTokenCache: string | null = null
+
+/**
+ * Resolve the board watcher bot token for GROUP lifecycle posts.
+ *
+ * Precedence (mirrors the step-1 daemon's resolveBotToken):
+ *   1. WATCHER_BOT_TOKEN env var (tests / explicit override)
+ *   2. WATCHER_BOT_TOKEN_FILE (default ~/.secrets/watcher-bot-token), read +
+ *      cached at first use.
+ *
+ * Fail-loud (#2198): throws if no token can be resolved — never returns a falsy
+ * value that would make the caller silently skip the post.
+ */
+export function getWatcherToken(): string {
+  const fromEnv = process.env.WATCHER_BOT_TOKEN
+  if (fromEnv && fromEnv.trim() !== '') return fromEnv.trim()
+
+  if (_watcherTokenCache) return _watcherTokenCache
+
+  try {
+    if (existsSync(WATCHER_BOT_TOKEN_FILE)) {
+      const contents = readFileSync(WATCHER_BOT_TOKEN_FILE, 'utf8').trim()
+      if (contents !== '') {
+        _watcherTokenCache = contents
+        return contents
+      }
+    }
+  } catch (err) {
+    throw new Error(
+      `[notify] FATAL: watcher bot token unreadable at ${WATCHER_BOT_TOKEN_FILE}: ${err}`,
+    )
+  }
+
+  throw new Error(
+    `[notify] FATAL: watcher bot token missing — set WATCHER_BOT_TOKEN env or create ${WATCHER_BOT_TOKEN_FILE}. Refusing to post group lifecycle events with no board-bot identity (#1855/#2198).`,
+  )
+}
+
+/** Test hook: clear the cached watcher token (so a changed env/file re-reads). */
+export function __resetWatcherToken(): void {
+  _watcherTokenCache = null
+}
 
 /** Escape special characters for Telegram MarkdownV2 */
 export function esc(text: string | null | undefined): string {
@@ -174,8 +245,11 @@ async function sendToGroup(
   replyToMessageId?: string | null,
 ): Promise<string | null> {
   if (POST_DISABLED) return null
-  const token = getTelegramToken()
-  if (!token) return null
+  // GROUP lifecycle posts speak as the board watcher bot (#1855). Fail-loud per
+  // #2198: getWatcherToken() throws (visible error) if the token is absent,
+  // rather than silently dropping the post the way the old `if (!token) return`
+  // per-agent path did.
+  const token = getWatcherToken()
 
   const basePayload: Record<string, unknown> = { chat_id: TELEGRAM_GROUP_ID, text }
   if (replyToMessageId) basePayload.reply_to_message_id = replyToMessageId
