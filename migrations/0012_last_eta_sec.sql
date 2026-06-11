@@ -1,0 +1,27 @@
+-- Migration 0012: last_eta_sec — persisted ETA for heartbeat-window inheritance (#13012 Sub-Sprint B)
+--
+-- PROBLEM (the exact bug that fired heartbeat-overdue L3 storms on #13012 itself
+-- and all session): updateHeartbeat (the write path for write_status / progress)
+-- recomputed next_check_at from `input.etaSec ?? heartbeat_timeout_sec ?? 120`.
+-- An eta-less mid-build status snapped the window back to the flat 120s default,
+-- so a long-running task that had earlier declared eta_sec=900 was treated as
+-- overdue ~120s later → false L3 escalation storm.
+--
+-- FIX: persist the last non-null eta on the task so a subsequent eta-LESS
+-- write_status can INHERIT it instead of snapping to 120s. db.ts updateHeartbeat:
+--   1. explicit input.etaSec wins (and is persisted into last_eta_sec);
+--   2. else inherit task.last_eta_sec if non-null (the long window survives);
+--   3. else fall back to a kind-aware default (long for human/external_api/
+--      upstream_task blocks, short for agent/null) rather than a flat 120s.
+--
+-- Idempotent ALTER mirroring the 0008/0009/0010/0011 pattern. db.ts also performs
+-- the equivalent ADD COLUMN inside its in-process migrate() loop (try/exec,
+-- column-exists swallowed), so a running server self-heals on boot. This .sql
+-- file is the documentation/parity artifact. See 0012_last_eta_sec.down.sql to
+-- reverse.
+--
+-- DEPLOYMENT: no manual run required on prod. The column is added by db.ts
+-- migrate() at the next server boot (Boss's deploy-window restart). Running this
+-- file manually is only for the /tmp copy-db test harness.
+
+ALTER TABLE tasks ADD COLUMN last_eta_sec INTEGER;

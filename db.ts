@@ -37,6 +37,11 @@ export interface Task {
   is_addendum: number
   attempt_id: number
   result_finding_id: number | null
+  // #13012 Sub-Sprint B: last non-null eta_sec persisted from write_status.
+  // An eta-LESS heartbeat inherits this value for next_check_at instead of
+  // snapping to the flat 120s default (false-L3-storm fix). NULL = no eta ever
+  // declared (use kind-aware default).
+  last_eta_sec: number | null
 }
 
 export interface Note {
@@ -292,6 +297,16 @@ export class TaskDB {
     // ALTER mirroring the 0008/0009/0010 pattern; see
     // migrations/0011_addendum_marker.sql for the documentation/parity artifact.
     try { this.db.exec('ALTER TABLE tasks ADD COLUMN is_addendum INTEGER NOT NULL DEFAULT 0') } catch { /* column already exists */ }
+
+    // Migration 0012 (#13012 Sub-Sprint B): last_eta_sec — persisted last non-null
+    // eta so an eta-LESS write_status can INHERIT the prior window instead of
+    // snapping next_check_at back to the flat 120s default (the exact bug that
+    // fired heartbeat-overdue L3 storms on #13012 itself + all session). Set by
+    // updateHeartbeat whenever an explicit etaSec is supplied; read back when a
+    // later heartbeat omits etaSec. Idempotent ALTER mirroring the
+    // 0008/0009/0010/0011 pattern; see migrations/0012_last_eta_sec.sql for the
+    // documentation/parity artifact.
+    try { this.db.exec('ALTER TABLE tasks ADD COLUMN last_eta_sec INTEGER') } catch { /* column already exists */ }
 
     // Migration 0010: Autonomous Board P1-WS1 card schema additions (PRD §6).
     // Idempotent ALTERs (mirror the 0008/0009 pattern). See
@@ -1017,8 +1032,38 @@ export class TaskDB {
       const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(input.taskId) as Task | null
       if (!task) return null
 
-      // Determine the timeout for next_check_at
-      const timeoutSec = input.etaSec ?? task.heartbeat_timeout_sec ?? SUPERVISION_DEFAULTS.heartbeat_timeout_sec
+      // #13012 Sub-Sprint B / Item 1 — eta_sec INHERITANCE + kind-aware default.
+      //
+      // BUG being fixed: previously this snapped to
+      //   input.etaSec ?? task.heartbeat_timeout_sec ?? 120
+      // so an eta-LESS mid-build write_status reset next_check_at to the flat
+      // 120s default even when the task had earlier declared eta_sec=900 → the
+      // task was judged overdue ~120s later → false heartbeat-overdue L3 storm
+      // (the exact failure that fired on #13012 itself + all session).
+      //
+      // New precedence for the (non-blocked) next_check_at window:
+      //   1. explicit input.etaSec wins (and is persisted into last_eta_sec);
+      //   2. else INHERIT task.last_eta_sec (the last non-null eta) — the long
+      //      window survives an eta-less heartbeat;
+      //   3. else a kind-aware DEFAULT keyed off the last-known block kind:
+      //      human/external_api/upstream_task → long window; agent/null → short
+      //      (the task's heartbeat_timeout_sec, default 120s) — NOT a flat 120s
+      //      for everything.
+      const KIND_DEFAULT_LONG_SEC = 172800 // 48h — human/external_api/upstream_task
+      const shortDefaultSec = task.heartbeat_timeout_sec ?? SUPERVISION_DEFAULTS.heartbeat_timeout_sec
+      const kind = task.blocked_on
+      const kindDefaultSec =
+        (kind === 'human' || kind === 'external_api' || kind === 'upstream_task')
+          ? KIND_DEFAULT_LONG_SEC
+          : shortDefaultSec
+      const timeoutSec = input.etaSec ?? task.last_eta_sec ?? kindDefaultSec
+
+      // Persist an explicitly-supplied eta so a LATER eta-less heartbeat can
+      // inherit it (clause 2 above). COALESCE-style: only overwrite when an
+      // explicit etaSec is present; an eta-less heartbeat leaves last_eta_sec
+      // untouched. Applied in BOTH branches below.
+      const persistEta = input.etaSec != null
+      const etaToPersist = input.etaSec ?? null
 
       if (input.isBlocked) {
         // blocked_on determines next_check_at behavior:
@@ -1036,23 +1081,35 @@ export class TaskDB {
             blocked_at = datetime('now'),
             blocked_reason = ?,
             blocked_on = ?,
+            ${persistEta ? "last_eta_sec = ?," : ""}
             next_check_at = datetime('now', '+' || ? || ' seconds'),
             version = version + 1
           WHERE id = ?
           RETURNING *
         `)
-        return stmt.get(
-          input.blockedReason ?? null,
-          blockedOn,
-          checkDelaySec,
-          input.taskId,
-        ) as Task | null
+        const blockedParams: (string | number | null)[] = [input.blockedReason ?? null, blockedOn]
+        if (persistEta) blockedParams.push(etaToPersist)
+        blockedParams.push(checkDelaySec, input.taskId)
+        return stmt.get(...blockedParams) as Task | null
       } else {
-        // Not blocked: clear blocked fields if previously set, update heartbeat
+        // Not blocked: clear blocked fields if previously set, update heartbeat.
+        //
+        // #13012 Sub-Sprint B / Item 3 (write-time half): reset escalation_level
+        // to 0 when a GENUINE heartbeat/progress lands, so recovery resets at
+        // write time — not only at the next watchdog pass (Sub-Sprint A's
+        // watchdog.ts setHealthy is the read-time complement). Gated on
+        // isProgress !== false to match the existing progress semantics: a
+        // no-progress bare heartbeat (progress=false) must NOT clear an
+        // in-flight escalation, mirroring how last_progress_at is only bumped on
+        // real progress. Scoped to the non-blocked branch — a blocked heartbeat
+        // is not recovery.
+        const isProgressUpdate = input.isProgress !== false
         const stmt = db.prepare(`
           UPDATE tasks SET
             last_heartbeat_at = datetime('now'),
-            ${input.isProgress !== false ? "last_progress_at = datetime('now')," : ""}
+            ${isProgressUpdate ? "last_progress_at = datetime('now')," : ""}
+            ${isProgressUpdate ? "escalation_level = 0," : ""}
+            ${persistEta ? "last_eta_sec = ?," : ""}
             blocked_at = NULL,
             blocked_reason = NULL,
             next_check_at = datetime('now', '+' || ? || ' seconds'),
@@ -1060,7 +1117,10 @@ export class TaskDB {
           WHERE id = ?
           RETURNING *
         `)
-        const updated = stmt.get(timeoutSec, input.taskId) as Task | null
+        const nbParams: (string | number | null)[] = []
+        if (persistEta) nbParams.push(etaToPersist)
+        nbParams.push(timeoutSec, input.taskId)
+        const updated = stmt.get(...nbParams) as Task | null
 
         // Decay fault_count on successful heartbeat (bounded at 0, not a full reset).
         // S2.1 parity: subagent tasks carry to_agent = supervisor (parent). Since subagent
