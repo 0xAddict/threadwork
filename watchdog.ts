@@ -254,6 +254,17 @@ export class TaskReconciler {
     // addendum row can never climb escalation_level or page boss (L-escalation
     // false-positive prevention, per #1608 hardening — kept self-contained here
     // so it does not depend on #1608 landing).
+    // #13012 Sub-Sprint A / Item 2: also exclude synthetic subagent child rows
+    // (is_synthetic=1 / kind='subagent'). createSubagentTask arms their
+    // next_check_at (db.ts:1317) for heartbeat supervision, but by protocol
+    // builders write_status to the PARENT, so child rows have zero own-heartbeats
+    // and false-fire L-escalation seconds after dispatch (#1620/#1789/#1612/#1641
+    // child-row churn, memory #2197). Their lifecycle event is close_subagent, NOT
+    // heartbeats — the dead-session/heartbeat handlers already special-case
+    // kind==='subagent' for fault skipping (watchdog.ts:505,596); this extends the
+    // same recognition to the selection gate so they are NEVER selected for
+    // heartbeat-overdue escalation. COALESCE(is_synthetic,0)=0 is the primary
+    // predicate; kind!='subagent' is a belt-and-suspenders guard on the same rows.
     const dueTasks = this.taskDb.run(db =>
       db.prepare(`
         SELECT * FROM tasks
@@ -261,6 +272,8 @@ export class TaskReconciler {
         AND status NOT IN ('completed', 'cancelled')
         AND description NOT LIKE 'ESCALATION%'
         AND COALESCE(is_addendum, 0) = 0
+        AND COALESCE(is_synthetic, 0) = 0
+        AND COALESCE(kind, 'task') != 'subagent'
         ORDER BY next_check_at ASC
       `).all() as Task[]
     )
@@ -450,8 +463,20 @@ export class TaskReconciler {
       return
     }
 
-    // (f) HEALTHY: task is fine, recompute next_check_at
-    this.setNextCheck(task.id, hbTimeout)
+    // (f) HEALTHY: task is fine, recompute next_check_at AND reset escalation.
+    // #13012 Sub-Sprint A / Item 3 (watchdog-half): escalation_level RATCHETS in
+    // every handler (handleHeartbeatOverdue/Progress/DeadSession/Unclaimed do
+    // `level + 1`) but was reset NOWHERE — so a task that recovers (fresh
+    // heartbeat within window / progress) kept its L-level ratcheted and later
+    // relays reported scary high L-levels for benign states (#1594 showed L7
+    // while heartbeat was 2.5min fresh). Reaching this branch means the task
+    // passed every overdue check above (session alive, heartbeat fresh, progress
+    // fresh) → it is genuinely healthy, so reset escalation_level to 0. Scoped to
+    // this HEALTHY branch only; the write-time half (db.ts updateHeartbeat) is
+    // Sub-Sprint B. A task that stays stale never reaches here (it returns from
+    // an overdue handler above) so genuine escalation keeps climbing — no
+    // regression.
+    this.setHealthy(task.id, hbTimeout)
   }
 
   // -------------------------------------------------------------------------
@@ -989,6 +1014,26 @@ export class TaskReconciler {
     this.taskDb.run(db => {
       db.prepare(`
         UPDATE tasks SET next_check_at = datetime('now', '+' || ? || ' seconds')
+        WHERE id = ?
+      `).run(delaySec, taskId)
+    })
+  }
+
+  /**
+   * Mark a task healthy: recompute next_check_at AND reset escalation_level to 0.
+   * #13012 Sub-Sprint A / Item 3 (watchdog-half). Only called from the HEALTHY
+   * branch (f) of reconcileTask, after the task has passed every overdue/dead
+   * check — so a reset here can only fire on a genuinely-recovered task. Kept
+   * separate from setNextCheck because setNextCheck is also called by handlers
+   * that are mid-escalation (handleBlocked, dead-session re-check) where reset
+   * would be wrong; only this branch means "recovered".
+   */
+  private setHealthy(taskId: number, delaySec: number): void {
+    this.taskDb.run(db => {
+      db.prepare(`
+        UPDATE tasks SET
+          next_check_at = datetime('now', '+' || ? || ' seconds'),
+          escalation_level = 0
         WHERE id = ?
       `).run(delaySec, taskId)
     })

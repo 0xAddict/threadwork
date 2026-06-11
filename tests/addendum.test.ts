@@ -202,9 +202,15 @@ describe('#1624: post-acceptance addendum tracking', () => {
     expect(after.status).toBe('in_progress')
   })
 
-  // 7c. Control: a NON-addendum overdue subagent IS swept (escalation_level climbs),
-  // proving the exclusion is specific to addenda and the sweep otherwise works.
-  test('control: overdue NON-addendum subagent IS picked up by the sweep', async () => {
+  // 7c. #13012 Sub-Sprint A / Item 2 (UPDATED): a NON-addendum overdue *synthetic
+  // subagent* child is now ALSO excluded from the sweep. Previously this control
+  // asserted such a child WAS swept (proving the addendum exclusion was specific) —
+  // but that was the very child-row L-escalation churn #13012 Item 2 eliminates:
+  // builders write_status to the PARENT, so synthetic child rows have zero
+  // own-heartbeats and false-fire. The watchdog selection query now excludes
+  // COALESCE(is_synthetic,0)=0 AND kind!='subagent'. Their lifecycle is
+  // close_subagent, not heartbeats.
+  test('#13012 item2: overdue synthetic subagent child is EXCLUDED from the sweep', async () => {
     const audit = new AuditLog(taskDb)
     const reconciler = new TaskReconciler(taskDb, audit)
     taskDb.upsertAgentSession('boss', 'session-boss', 'alive')
@@ -222,7 +228,33 @@ describe('#1624: post-acceptance addendum tracking', () => {
     await reconciler.reconcileDueTasks()
 
     const after = taskDb.getTask(child.id)!
-    // Non-addendum subagent IS reconciled (heartbeat overdue) -> escalation_level climbs.
+    // Synthetic subagent child (is_synthetic=1 / kind='subagent') is NOT swept ->
+    // escalation_level untouched, row still in_progress (lifecycle = close_subagent).
+    expect(after.is_synthetic).toBe(1)
+    expect(after.escalation_level).toBe(0)
+    expect(after.status).toBe('in_progress')
+  })
+
+  // 7d. Control (sweep-still-works): a genuine NON-synthetic overdue task IS swept,
+  // proving the new exclusion is specific to synthetic subagent rows and real
+  // tasks still escalate normally (no regression to genuine supervision).
+  test('#13012 item2 control: overdue NON-synthetic task IS still swept', async () => {
+    const audit = new AuditLog(taskDb)
+    const reconciler = new TaskReconciler(taskDb, audit)
+    taskDb.upsertAgentSession('steve', 'session-steve', 'alive')
+
+    const task = taskDb.createTask({ from: 'boss', to: 'steve', description: 'real overdue task', priority: 'normal' })
+    taskDb.claimTask(task.id, 'steve')
+    taskDb.run(db => db.prepare(`
+      UPDATE tasks SET last_heartbeat_at = datetime('now','-600 seconds'),
+        next_check_at = datetime('now','-10 seconds') WHERE id = ?
+    `).run(task.id))
+
+    await reconciler.reconcileDueTasks()
+
+    const after = taskDb.getTask(task.id)!
+    // Non-synthetic real task IS reconciled (heartbeat overdue) -> escalation_level climbs.
+    expect(after.is_synthetic ?? 0).toBe(0)
     expect(after.escalation_level).toBeGreaterThan(0)
   })
 })
