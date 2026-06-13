@@ -6,7 +6,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { TaskDB } from './db'
-import { dispatchAgentNudge, dispatchAgentInterrupt, configureNudgeDebounce } from './nudge'
+import { dispatchAgentNudge, dispatchAgentInterrupt, configureNudgeDebounce, resolveNotifyTarget } from './nudge'
 import {
   postToGroup,
   postToGroupThreaded,
@@ -634,6 +634,34 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['task_id', 'content'],
       },
     },
+    {
+      // #13012 Sub-Sprint C / Item 6 — assign/reassign (the NULL-pool gap fix).
+      name: 'assign_task',
+      description: 'Assign (or reassign) a task to an agent. Sets to_agent AND supervisor_agent so a NULL-pool / unassigned card becomes a fully-consistent, claimable, watchdog-trackable row. Use this to un-stick a backlog card created without an assignee, or to move an already-assigned task to a different agent. Validates to_agent is a real agent (boss/steve/sadie/kiera). Does not apply to terminal (completed/cancelled/done) rows.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'The task ID to assign/reassign' },
+          to_agent: { type: 'string', description: 'Target agent: boss, steve, sadie, or kiera' },
+          supervisor: { type: 'string', description: 'Optional supervisor agent for watchdog tracking (default: the assigner). Must be a real agent.' },
+        },
+        required: ['task_id', 'to_agent'],
+      },
+    },
+    {
+      // #13012 Sub-Sprint C / Item 7 — GO transition (draft/approved → in_progress).
+      name: 'transition_task',
+      description: "Transition an approved draft (or pending) card into 'in_progress' (the [Plan now]+GO path), setting the same supervision fields a claim would (claimed_at, heartbeats, next_check_at, attempt_id). The card must already have an assignee (use assign_task first if it is in the NULL pool). Only transitions from draft/pending — it does not re-arm an in_progress/held/terminal row.",
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'The task ID to transition' },
+          to_status: { type: 'string', enum: ['in_progress'], description: "Target status (currently only 'in_progress' — the GO transition)." },
+          session_id: { type: 'string', description: 'Optional session ID to bind the worker session' },
+        },
+        required: ['task_id'],
+      },
+    },
   ],
 }))
 
@@ -819,9 +847,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         db.emitCompletionEvent(task.id, SELF_LABEL, task.attempt_id)
         safeEmitState(SELF_LABEL, 'COMPLETED', { tool: 'complete_task' })
 
-        const nudgeMsg = `Task #${task.id} completed by ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
+        // #13012 Sub-Sprint C / Item 8a — a CARD now lands in 'review' (human
+        // [Accept] gate), not 'completed'. Reflect the real terminal status in
+        // the creator nudge so the message isn't misleading.
+        const wentToReview = task.status === 'review'
+        const nudgeVerb = wentToReview ? 'is ready for review (awaiting [Accept])' : 'completed'
+        // #13012 Sub-Sprint C / Item 8b — map a non-agent creator (web-user) to a
+        // real roster recipient so the tmux nudge resolves cleanly instead of
+        // erroring "Unknown agent: web-user". Falls back to the card's
+        // assignee/owner, else boss (approver-proxy). The group post still fires
+        // and remains the human-visible trail.
+        const notifyTarget = resolveNotifyTarget(task.from_agent, task.to_agent)
+        const nudgeMsg = `Task #${task.id} ${nudgeVerb} by ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
         const [nudgeResult] = await Promise.all([
-          dispatchAgentNudge(task.from_agent, nudgeMsg, { source: SELF_LABEL }),
+          dispatchAgentNudge(notifyTarget, nudgeMsg, { source: SELF_LABEL }),
           postToGroupThreaded(formatTaskCompleted(task), task.id),
         ])
 
@@ -839,9 +878,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           auto_closed_children: autoClosedChildren ?? null,
         }, taskId)
 
-        const completeNudgeWarning = nudgeResult.ok ? '' : ` (warning: nudge to ${task.from_agent} failed — ${nudgeResult.error})`
+        const completeNudgeWarning = nudgeResult.ok ? '' : ` (warning: nudge to ${notifyTarget} failed — ${nudgeResult.error})`
         const autoCloseInfo = autoClosedChildren?.length ? ` (auto-closed ${autoClosedChildren.length} sub-agent task(s): ${autoClosedChildren.map(id => '#' + id).join(', ')})` : ''
-        return { content: [{ type: 'text', text: `Task #${task.id} completed. Result: ${result}${autoCloseInfo}${completeNudgeWarning}` }] }
+        // #13012 Sub-Sprint C / Item 8a — surface review-gate routing to the caller.
+        const statusInfo = wentToReview
+          ? ` Card moved to 'review' (awaiting human [Accept] — not auto-completed).`
+          : ''
+        return { content: [{ type: 'text', text: `Task #${task.id} ${wentToReview ? 'submitted for review' : 'completed'}.${statusInfo} Result: ${result}${autoCloseInfo}${completeNudgeWarning}` }] }
       }
 
       case 'list_tasks': {
@@ -1600,6 +1643,62 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         audit.log(SELF_LABEL, 'artifact_written', { task_id: args.task_id, artifact_id: result.artifact_id, uri: result.uri }, args.task_id as number)
         return { content: [{ type: 'text', text: `Artifact #${result.artifact_id} stored at ${result.uri}` }] }
+      }
+
+      case 'assign_task': {
+        // #13012 Sub-Sprint C / Item 6 — assign/reassign (NULL-pool gap).
+        const taskId = args.task_id as number
+        const toAgent = (args.to_agent as string).toLowerCase()
+        const supervisorRaw = (args.supervisor as string | undefined)?.toLowerCase()
+
+        if (!isKnownAgent(toAgent)) {
+          return { content: [{ type: 'text', text: `Invalid agent "${toAgent}". Valid agents: ${TEAM_AGENTS.join(', ')}`, isError: true }] }
+        }
+        // Supervisor defaults to the assigner; must be a real agent so the
+        // resulting row satisfies the supervision model (trg_require_supervision
+        // / watchdog tracking). Never pass NULL (trg_prevent_supervision_removal).
+        const supervisor = supervisorRaw ?? SELF_LABEL
+        if (!isKnownAgent(supervisor)) {
+          return { content: [{ type: 'text', text: `Invalid supervisor "${supervisor}". Valid agents: ${TEAM_AGENTS.join(', ')}`, isError: true }] }
+        }
+
+        const task = db.assignTask(taskId, toAgent, supervisor)
+        if (!task) {
+          audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: 'assign: not found or terminal' }, taskId)
+          return { content: [{ type: 'text', text: `Cannot assign task #${taskId} — it doesn't exist or is already terminal (completed/cancelled/done).`, isError: true }] }
+        }
+
+        // Notify the new assignee + post to group (mirrors create/delegate UX).
+        const nudgeMsg = `Task #${task.id} was assigned to you by ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
+        const [nudgeResult] = await Promise.all([
+          dispatchAgentNudge(toAgent, nudgeMsg, { source: SELF_LABEL }),
+          postToGroupThreaded(`📌 #${task.id} assigned to ${toAgent} by ${SELF_LABEL} (supervisor: ${supervisor})`, task.id),
+        ])
+        audit.log(SELF_LABEL, 'task_assigned', { task_id: taskId, to_agent: toAgent, supervisor }, taskId)
+        const nudgeWarning = nudgeResult.ok ? '' : ` (warning: nudge failed — ${nudgeResult.error})`
+        return { content: [{ type: 'text', text: `Task #${task.id} assigned to ${toAgent} (supervisor: ${supervisor}). Now claimable [status: ${task.status}].${nudgeWarning}` }] }
+      }
+
+      case 'transition_task': {
+        // #13012 Sub-Sprint C / Item 7 — GO transition (draft/approved → active).
+        const taskId = args.task_id as number
+        const toStatus = (args.to_status as string | undefined) ?? 'in_progress'
+        const sessionId = args.session_id as string | undefined
+
+        if (toStatus !== 'in_progress') {
+          return { content: [{ type: 'text', text: `transition_task currently supports only to_status='in_progress' (the GO transition). Got "${toStatus}".`, isError: true }] }
+        }
+
+        const task = db.transitionToInProgress(taskId, sessionId ?? AGENT_SESSIONS[SELF_LABEL])
+        if (!task) {
+          audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: 'transition: not found, not draft/pending, or unassigned' }, taskId)
+          return { content: [{ type: 'text', text: `Cannot transition task #${taskId} — it doesn't exist, is not in draft/pending, or has no assignee (assign_task it first).`, isError: true }] }
+        }
+
+        safeEmitState(SELF_LABEL, 'ACTIVE_THINKING', { taskId: task.id, tool: 'transition_task' })
+        await postToGroupThreaded(`▶️ #${task.id} GO — draft→in_progress (by ${SELF_LABEL}, owner ${task.to_agent})`, task.id)
+        audit.log(SELF_LABEL, 'task_transitioned', { task_id: taskId, to_status: 'in_progress', owner: task.to_agent }, taskId)
+        return { content: [{ type: 'text', text: `Task #${task.id} transitioned to in_progress (GO). Owner: ${task.to_agent}. Next check: ${task.next_check_at}.` }] }
       }
 
       default:

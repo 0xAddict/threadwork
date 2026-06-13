@@ -7,7 +7,20 @@ export interface Task {
   to_agent: string | null
   description: string
   priority: string
-  status: 'pending' | 'in_progress' | 'completed' | 'cancelled'
+  // Card-lifecycle statuses (draft/backlog/review/done) coexist with the core
+  // agent-task statuses. #13012 Sub-Sprint C / Item 8a adds 'review' as the
+  // terminal target for executor-completed CARD rows (human [Accept] gate);
+  // draft/backlog are autonomous-board pre-GO states. Widened from the original
+  // 4-value union so card rows typecheck without `as` casts.
+  status:
+    | 'pending'
+    | 'in_progress'
+    | 'completed'
+    | 'cancelled'
+    | 'draft'
+    | 'backlog'
+    | 'review'
+    | 'done'
   result: string | null
   created_at: string
   claimed_at: string | null
@@ -42,6 +55,12 @@ export interface Task {
   // snapping to the flat 120s default (false-L3-storm fix). NULL = no eta ever
   // declared (use kind-aware default).
   last_eta_sec: number | null
+  // #13012 Sub-Sprint C / Item 8a: card-lifecycle discriminator. Autonomous-board
+  // cards (web-user-created or board-classified, migration 0010 PRD §6) carry a
+  // non-null complexity_user (EASY|MEDIUM|COMPLEX user pick). Plain agent tasks
+  // leave it NULL. `complete_task` on a CARD row routes to 'review' (human
+  // [Accept] gate) instead of jumping to 'completed'. See isCardLifecycleRow().
+  complexity_user: string | null
 }
 
 export interface Note {
@@ -1178,10 +1197,35 @@ export class TaskDB {
         }
       }
 
-      // Complete normally — clear supervision timing fields
+      // #13012 Sub-Sprint C / Item 8a — card-vs-task TERMINAL semantics.
+      //
+      // completeTaskWithFinalizerCheck historically set status='completed'
+      // UNCONDITIONALLY. For a board CARD (complexity_user IS NOT NULL — see
+      // isCardLifecycleRow) that BYPASSES the human review gate: #1781 showed
+      // Kiera's complete_task flipping a card straight to 'completed', which the
+      // dashboard buckets as DONE — the card showed DONE on Gwei's board WITHOUT
+      // his [Accept]. Cards must route executor-completion to 'review' (awaiting
+      // human accept); ONLY the accept path reaches 'completed'. Plain agent
+      // tasks (complexity_user NULL) still complete directly, unchanged.
+      //
+      // SCOPE (this batch = the terminal/review-GATE only): we decide the TARGET
+      // status here. The execute→review ADVANCE transition (the [Accept] button /
+      // ping affordance that moves review→completed) is Steve's #13007 (item 8d,
+      // coordinated split — board-noted). This branch deliberately stops at
+      // 'review'; #13007 owns the advance out of it.
+      const targetRow = db.prepare(
+        'SELECT complexity_user FROM tasks WHERE id = ?'
+      ).get(id) as Pick<Task, 'complexity_user'> | null
+      const isCard = targetRow != null && this.isCardLifecycleRow(targetRow)
+      const terminalStatus = isCard ? 'review' : 'completed'
+
+      // Complete normally — clear supervision timing fields. For a card the
+      // terminal status is 'review' (human-accept gate, not done); completed_at
+      // is still stamped so the row leaves the active supervision window and the
+      // watchdog stops tracking it (next_check_at NULL) while it awaits accept.
       const stmt = db.prepare(`
         UPDATE tasks SET
-          status = 'completed',
+          status = ?,
           result = ?,
           completed_at = datetime('now'),
           next_check_at = NULL,
@@ -1190,7 +1234,7 @@ export class TaskDB {
         WHERE id = ? AND status = 'in_progress' AND to_agent = ?
         RETURNING *
       `)
-      const task = stmt.get(result, id, agent) as Task | null
+      const task = stmt.get(terminalStatus, result, id, agent) as Task | null
 
       if (!task) return { error: undefined, task: undefined }
       return { task, autoClosedChildren: autoClosedIds.length > 0 ? autoClosedIds : undefined }
@@ -1234,9 +1278,19 @@ export class TaskDB {
         }
       }
 
+      // #13012 Sub-Sprint C / Item 8a — same card→review gate on the boss force
+      // path. The review gate is about Gwei's human [Accept] and is independent
+      // of WHO completes, so a card force-completed by boss must also land in
+      // 'review', not 'completed'. Plain tasks complete directly (unchanged).
+      const targetRow = db.prepare(
+        'SELECT complexity_user FROM tasks WHERE id = ?'
+      ).get(id) as Pick<Task, 'complexity_user'> | null
+      const isCard = targetRow != null && this.isCardLifecycleRow(targetRow)
+      const terminalStatus = isCard ? 'review' : 'completed'
+
       const stmt = db.prepare(`
         UPDATE tasks SET
-          status = 'completed',
+          status = ?,
           result = ?,
           completed_at = datetime('now'),
           next_check_at = NULL,
@@ -1245,7 +1299,7 @@ export class TaskDB {
         WHERE id = ? AND status = 'in_progress'
         RETURNING *
       `)
-      const task = stmt.get(result, id) as Task | null
+      const task = stmt.get(terminalStatus, result, id) as Task | null
       if (!task) return { error: undefined, task: undefined }
       return { task, autoClosedChildren: autoClosedIds.length > 0 ? autoClosedIds : undefined }
     })
@@ -1270,6 +1324,107 @@ export class TaskDB {
         RETURNING *
       `)
       return stmt.get(sessionId ?? null, hbTimeout, id, agent) as Task | null
+    })
+  }
+
+  // ===========================================================================
+  // #13012 Sub-Sprint C — Card state-machine + lifecycle tools (C1: 6,7,8a,8b)
+  // ===========================================================================
+
+  /**
+   * #13012 Sub-Sprint C / Item 8a — card-lifecycle discriminator.
+   *
+   * A "board CARD" (the autonomous-board lifecycle row Gwei reviews) is
+   * distinguished from a plain agent task by a non-null `complexity_user`. That
+   * column is set ONLY by the autonomous-board ingestion path (web app /
+   * classification, migration 0010 PRD §6) — never by create_task/delegate_task,
+   * which produce plain agent tasks. Verified against prod: every web-user card
+   * and every board-classified row (incl. #1781, the canonical 8a incident)
+   * carries complexity_user; all plain agent/subagent tasks leave it NULL. (kind
+   * is only 'task'/'subagent' and there is NO sync_source column, so
+   * complexity_user is the reliable seam.)
+   */
+  isCardLifecycleRow(task: Pick<Task, 'complexity_user'>): boolean {
+    return task.complexity_user != null && task.complexity_user !== ''
+  }
+
+  /**
+   * #13012 Sub-Sprint C / Item 6 — assign/reassign a task to an agent.
+   *
+   * Closes the NULL-pool gap (5 strikes incl #1599/#1608): a card created
+   * unassigned (to_agent=NULL) can never be claimed (claimTaskWithSession needs
+   * to_agent=agent) or completed — a roach motel. This sets to_agent AND
+   * supervisor_agent so the resulting row is a FULLY-CONSISTENT assignable row:
+   *   - to_agent: who will claim/own it (so claim's WHERE to_agent=? matches).
+   *   - supervisor_agent: the watchdog/escalation trigger needs supervisor set
+   *     (delegated tasks carry supervisor; trg_require_supervision aborts an
+   *     INSERT where from_agent!=to_agent AND supervisor IS NULL). This is an
+   *     UPDATE so the trigger does not fire, but we set supervisor anyway so the
+   *     watchdog can track it exactly like a delegated row. Mirrors what
+   *     delegateTask sets (supervisor = the assigner).
+   *
+   * Idempotent-safe reassign: works on an already-assigned task too (changes
+   * to_agent + re-supervisor). Only operates on non-terminal rows
+   * (pending/draft/in_progress/backlog) — terminal rows are not reassignable.
+   *
+   * @param supervisor defaults to the assigner. trg_prevent_supervision_removal
+   *   forbids nulling an existing supervisor on a delegated row, so we never
+   *   pass NULL here.
+   * @returns the updated row, or null if the task is missing/terminal.
+   */
+  assignTask(taskId: number, toAgent: string, supervisor: string): Task | null {
+    return this.run(db => {
+      const stmt = db.prepare(`
+        UPDATE tasks SET
+          to_agent = ?,
+          supervisor_agent = ?,
+          version = version + 1
+        WHERE id = ?
+          AND status NOT IN ('completed', 'cancelled', 'done')
+        RETURNING *
+      `)
+      return stmt.get(toAgent, supervisor, taskId) as Task | null
+    })
+  }
+
+  /**
+   * #13012 Sub-Sprint C / Item 7 — GO transition (draft/approved → in_progress).
+   *
+   * claim_task rejects status='draft' (its WHERE requires status='pending'), so a
+   * card approved via [Plan now]+GO had no legit tool path into in_progress — the
+   * builder had to flip status via guarded SQLite UPDATE. This transitions an
+   * approved draft (or pending) card into in_progress, setting the SAME
+   * supervision fields claim would (claimed_at, heartbeat/progress timestamps,
+   * next_check_at, attempt_id) so the row is properly armed for the watchdog.
+   *
+   * Guards preserved (NOT bypassed):
+   *   - Requires a non-null to_agent (an unassigned card must be assign_task'd
+   *     FIRST — Item 6 — so it has an owner; otherwise the watchdog has nobody to
+   *     supervise and claim could never have run either).
+   *   - Only transitions from draft/pending (a held/parked/terminal/in_progress
+   *     row is rejected — no silent re-arm).
+   *
+   * @returns updated row, or null if not found / wrong status / unassigned.
+   */
+  transitionToInProgress(taskId: number, sessionId?: string): Task | null {
+    return this.run(db => {
+      const hbTimeout = SUPERVISION_DEFAULTS.heartbeat_timeout_sec
+      const stmt = db.prepare(`
+        UPDATE tasks SET
+          status = 'in_progress',
+          claimed_at = datetime('now'),
+          worker_session_id = ?,
+          last_heartbeat_at = datetime('now'),
+          last_progress_at = datetime('now'),
+          next_check_at = datetime('now', '+' || ? || ' seconds'),
+          attempt_id = COALESCE(attempt_id, 0) + 1,
+          version = version + 1
+        WHERE id = ?
+          AND status IN ('draft', 'pending')
+          AND to_agent IS NOT NULL
+        RETURNING *
+      `)
+      return stmt.get(sessionId ?? null, hbTimeout, taskId) as Task | null
     })
   }
 

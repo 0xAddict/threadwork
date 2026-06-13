@@ -10,6 +10,49 @@ export function resolveSession(agent: string | null | undefined): string | null 
   return AGENT_SESSIONS[label] ?? null
 }
 
+/**
+ * #13012 Sub-Sprint C / Item 8b — web-user / non-agent creator notify mapping.
+ *
+ * A web-created board card has from_agent='web-user' (a non-roster creator).
+ * The complete_task auto-nudge nudges task.from_agent → dispatchAgentNudge
+ * ('web-user') → resolveSession('web-user') returns null (not in AGENT_SESSIONS)
+ * → the dispatcher returns { ok:false, error:'Unknown agent: web-user' } and the
+ * completion path surfaces a spurious "Unknown agent" warning.
+ *
+ * This maps a non-roster creator to a REAL roster recipient so the notify
+ * resolves cleanly instead of erroring. Resolution order:
+ *   1. If `creator` is already a roster agent → use it (unchanged behavior; the
+ *      normal agent-to-agent completion nudge is preserved exactly).
+ *   2. Else (web-user / any non-agent creator) → fall back to a real recipient:
+ *      the card's assignee/owner (`fallback`, typically task.to_agent — the
+ *      agent who built the card and is the natural "your card is done"
+ *      recipient) if it is a roster agent, otherwise BOSS (the approver-proxy
+ *      who relays acceptance to Gwei). Boss is always a valid roster session, so
+ *      this never returns an unresolvable target.
+ *
+ * The team GROUP post (postToGroupThreaded) is unaffected — it always fires and
+ * is the human-visible trail; this just keeps the tmux agent-nudge from erroring
+ * on a web creator. Pure mapping; no side effects.
+ *
+ * @param creator  the raw from_agent on the card (may be 'web-user' etc.)
+ * @param fallback the card's assignee/owner (task.to_agent) — preferred real
+ *                 recipient when the creator is a non-agent. May be null.
+ * @returns a roster agent label guaranteed resolvable by resolveSession.
+ */
+export function resolveNotifyTarget(
+  creator: string | null | undefined,
+  fallback: string | null | undefined,
+): string {
+  const creatorLabel = creator?.toLowerCase()
+  if (creatorLabel && AGENT_SESSIONS[creatorLabel]) return creatorLabel
+
+  const fallbackLabel = fallback?.toLowerCase()
+  if (fallbackLabel && AGENT_SESSIONS[fallbackLabel]) return fallbackLabel
+
+  // Approver-proxy: boss relays acceptance to Gwei. Always a valid session.
+  return 'boss'
+}
+
 export function buildNudgeCommand(session: string, message: string): string[] {
   return [TMUX_PATH, 'send-keys', '-t', session, message, 'C-m']
 }
