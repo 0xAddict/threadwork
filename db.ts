@@ -2195,14 +2195,20 @@ export class TaskDB {
 
   recordFault(agent: string, faultType: string): { circuit_state: string; fault_count: number } {
     return this.run(db => {
-      // Increment fault count
+      // Increment fault count, saturating at FAULT_THRESHOLD + 1.
+      // #13012 FIX (C): without a cap, an abandoned in_progress task (stale
+      // heartbeat, live session) re-charges a fault every watchdog tick and the
+      // counter climbs unbounded into the hundreds (observed 499/500). The cap
+      // keeps the metric legible and bounds the blast radius; the open-circuit
+      // check below still fires at the threshold, and the decay path keeps one
+      // tick of headroom (MAX(0, fault_count-1)).
       db.prepare(`
         UPDATE agent_sessions SET
-          fault_count = COALESCE(fault_count, 0) + 1,
+          fault_count = MIN(COALESCE(fault_count, 0) + 1, ?),
           last_fault_at = datetime('now'),
           last_fault_type = ?
         WHERE agent = ?
-      `).run(faultType, agent)
+      `).run(this.FAULT_THRESHOLD + 1, faultType, agent)
 
       const row = db.prepare('SELECT fault_count, circuit_state FROM agent_sessions WHERE agent = ?').get(agent) as any
       if (!row) return { circuit_state: 'closed', fault_count: 0 }

@@ -1020,6 +1020,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case 'get_boot_briefing': {
+        // #13012 FIX (A): reset the circuit breaker on respawn. get_boot_briefing
+        // is the first task-board call a freshly (re)started session makes, so a
+        // tripped/degrading circuit carried over from the PREVIOUS session pid
+        // (whose abandoned in_progress tasks ran fault_count into the hundreds and
+        // opened the breaker) must not penalize this fresh session. Guarded so the
+        // healthy boot path does no extra writes. Mirrors the existing
+        // half_open->closed reset at the complete_task handler (db.closeCircuit).
+        const bootCircuit = db.getCircuitState(SELF_LABEL)
+        if (bootCircuit && bootCircuit.circuit_state !== 'closed') {
+          db.closeCircuit(SELF_LABEL)
+          audit.log(SELF_LABEL, 'circuit_closed', {
+            agent: SELF_LABEL,
+            reason: 'session respawn (get_boot_briefing)',
+            prior_state: bootCircuit.circuit_state,
+            prior_fault_count: bootCircuit.fault_count,
+          })
+        }
+
         const briefing = mem.getBootBriefing(SELF_LABEL, db)
         const sections: string[] = []
 
