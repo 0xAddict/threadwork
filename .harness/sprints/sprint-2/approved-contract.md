@@ -1,60 +1,119 @@
-# Sprint 2 Approved Contract
+# Sprint 2 Approved Contract — Daemon-side Boot-Recovery Fallback
 
-**status: APPROVED**
+Status: APPROVED (with one required modification — see below)
+Verifier: harness-verifier
+Date: 2026-05-22
 
-## Verifier Notes
+## Decision
 
-All 8 criteria are objective, measurable, and testable. The test commands map 1:1 to criteria. The Definition of Done uses concrete numeric thresholds (147 existing + >=7 new = >=154 total, 0 TS errors). No modifications required.
+APPROVED WITH REQUIRED MODIFICATION — see RM-1 below. The contract is otherwise
+solid: criteria are objective, measurable, and testable without a browser; all
+10 are specifically testable via script execution + code inspection; ground-truth
+line number citations are accurate.
 
-One clarification on criterion 5: the nudge message format must match the specified string pattern exactly — "Board check: You have X pending task(s) and Y open decision(s) awaiting input. Run list_tasks and list_decisions to catch up." — with correct integer substitution. Partial matches or alternate wording will fail this criterion.
+## Contract Assessment
 
-One clarification on criterion 8: the fix must apply specifically to the `postToGroup` call where decision IDs with '#' prefixes appear. The '#' character must be escaped as `\\#` in the MarkdownV2 payload. Verifier will inspect the compiled/source string at that callsite directly.
+All ground-truth claims verified:
+- Lines 342–350: deterministic-hung check confirmed (TOOL_IN_FLIGHT / SUBAGENT_RUNNING
+  STUCK paths, "regardless of freshness threshold").
+- Lines 358–373: existing stale-state OS-facts branch confirmed (pid_alive /
+  seen_alive → ALIVE via `os-facts`).
+- Line 9: `_SOURCED` guard confirmed.
+- `agent_sessions.current_task_id` → `tasks.last_progress_at` confirmed as the
+  right column for Q3 (canonical task progress signal).
 
----
+Design approach (os_facts_alive helper, D1/D2 fix) is correct and minimal.
+The refactor to share the helper across the hung-check and the existing stale
+branch is the right pattern; it ensures scenario 3 stays green without a
+separate code path.
 
-## Goal
-Add idle agent board check nudging to the watchdog: detect agents with no recent activity, check if there is pending work, and nudge them with a summary of what is waiting.
+## Open Questions — Resolutions
 
-## Acceptance Criteria
+Q1 (TASK_PROGRESS_FRESH_SEC = 900s): Accepted. 900s is a reasonable threshold
+for distinguishing a genuinely hung agent (no task progress for 15 min) from a
+healthy already-running one (regular `write_status`/`send_note` calls). Document
+it as a named constant so it can be tuned later.
 
-1. **Activity tracking via audit_log**: The watchdog queries each agent's most recent audit_log entry (actions: task_claimed, status_written, decision_position_submitted, decision_critique_submitted, note_added, task_completed) to determine their "last activity" timestamp. No new tables needed.
+Q2 (sibling test file `heartbeat-v2-fallback.test.sh`): Accepted. The existing
+suite's `5 pass / 0 fail` gate stays byte-stable for AC#6. The sibling file owns
+AC#1–#5 (and any child-PID test required by RM-1). The Verifier will run both
+files and require green results on both.
 
-2. **Idle detection (15-min threshold)**: If an agent's last activity is older than 15 minutes AND there are pending tasks assigned to them or open decisions awaiting their input, the watchdog nudges them to check the board.
+Q3 (task progress column): Use `tasks.last_progress_at` as the canonical signal,
+accessed via `agent_sessions.current_task_id → tasks.id`. If `last_progress_at`
+is NULL, fall back to `tasks.last_heartbeat_at` (also present in the schema).
+Document the fallback column in the implementation log.
 
-3. **Active task exclusion**: Agents with at least one in_progress task are NOT nudged (they are busy, not idle).
+## Required Modification
 
-4. **Per-agent cooldown (30 min)**: The watchdog checks the audit_log for a recent `idle_board_nudge` entry per agent within the last 30 minutes. If found, the agent is skipped. This prevents double-nudging without needing a new table.
+**RM-1: Child-PID signal must be explicitly scoped in or out.**
 
-5. **Nudge message with board summary**: The nudge message includes specific counts: "Board check: You have X pending task(s) and Y open decision(s) awaiting input. Run list_tasks and list_decisions to catch up."
+The roadmap (Sprint 2 specification) states: "it must fall back to OS facts (PID
+alive, child PID, last task progress)." Child PID is listed as a named OS signal
+alongside PID alive and task progress. The contract's design approach marks it
+"optionally also." This is ambiguous — the contract cannot leave a roadmap-
+specified signal in "optional" limbo.
 
-6. **Audit trail logging**: Every idle nudge is logged to the audit_log with action='idle_board_nudge' and detail containing the agent name, pending task count, and open decision count.
+The Generator must do ONE of the following before implementation begins:
 
-7. **ReconcileResult updated**: Add `idle_nudges: number` field to ReconcileResult. The cycle summary log line includes the new counter.
+**Option A — include child-PID in scope:**
+Add an acceptance criterion (AC#11) for child-PID:
+"Stale hung-tool + dead claude_pid + live child PID → ALIVE. When claude_pid is
+dead but `pgrep -P claude_pid` (or equivalent) shows a live child process,
+classify ALIVE via `os-facts-child-pid`."
+Add a corresponding test in the fallback test file (set pid=dead but seed a
+real child PID that is alive).
 
-8. **Bonus: Fix '#' escaping in MarkdownV2**: The postToGroup call at line 819 of watchdog.ts (ready-to-finalize message) sends an unescaped '#' in the Telegram MarkdownV2 message. Fix it to use `\\#` so it renders correctly instead of falling back to plain text.
+**Option B — explicitly descope child-PID with justification:**
+Add a section "Child-PID scope decision" to the contract stating: child-PID is
+deferred to a post-Sprint-2 enhancement because (a) the primary false-positive
+scenario in #843 was a live claude_pid with stale declarations, not a dead
+parent-shell; (b) `pgrep -P` semantics on macOS launchd-spawned processes may
+not reliably find Claude Code's worker processes; (c) the remaining OS signals
+(PID alive, last_seen_at, task progress) are sufficient to fix the #843 symptom.
+If descoped, explicitly mark it as a known gap in the implementation log.
 
-## Test Commands
+Either option is acceptable. Pick one, update the contract, set status to
+"negotiating" → "implementing" when ready.
 
-1. `bun test` -- all 147 existing tests still pass (no regressions)
-2. New test: idle agent with pending tasks gets nudged after 15 min
-3. New test: agent with active in_progress tasks is NOT nudged
-4. New test: agent nudged once is NOT nudged again within 30 min cooldown
-5. New test: nudge message includes correct pending task and decision counts
-6. New test: idle_board_nudge action logged to audit trail
-7. New test: ReconcileResult includes idle_nudges field
-8. New test: watchdog '#' escaping fix -- verify postToGroup message uses escaped '#'
+**No other modifications required.** Once RM-1 is resolved, the contract is
+approved as-is.
 
-## Definition of Done
+## Rubric Thresholds (reminder)
 
-- All existing tests pass (147/147)
-- At least 7 new tests pass covering the above criteria
-- The watchdog.ts `monitorIdleAgents()` method is integrated into the main reconciliation cycle
-- The '#' escaping bug from Sprint 1 is fixed
-- Code compiles with no TypeScript errors (`bun build --target=bun watchdog.ts` succeeds)
+Per decision-log.md adapted rubric:
+- Functionality (40%) hard threshold >= 9 for PASS.
+- "Design Quality" → Completeness & structure (25%).
+- "Craft" → Executability & correctness (20%).
+- "Originality" → de-emphasised, baseline 7-8 (15%).
+- Overall >= 78 required for PASS.
 
-## Target Metrics
+## What Will Fail This Sprint
 
-- Existing test count: 147 pass, 0 fail
-- New tests added: >= 7
-- Total tests after sprint: >= 154
-- Zero TypeScript compilation errors
+The Verifier will fail if ANY of the following:
+
+- `bash tests/heartbeat/heartbeat-v2.test.sh` does not exit 0 with `5 pass / 0 fail`.
+- The fallback test file does not exist with at least 5 new scenarios (AC#1–#5).
+- RED-then-GREEN not demonstrated: new tests must fail against the pre-Sprint-2
+  daemon and pass against the Sprint-2 daemon.
+- Stale TOOL_IN_FLIGHT + live claude_pid returns STUCK (D1 not fixed).
+- Genuine hung (all OS signals negative) still returns ALIVE (real hung suppressed).
+- `heartbeat-daemon.sh` (v1) is modified.
+- Any file other than `bin/heartbeat-daemon-v2.sh` and `tests/heartbeat/heartbeat-v2-fallback.test.sh`
+  (plus `.harness/` bookkeeping) is modified — confirmed by `git diff`.
+- `bash -n bin/heartbeat-daemon-v2.sh` fails.
+- The daemon cannot be sourced in tests (the `_SOURCED` guard breaks).
+- Commit message does not reference sprint-2 and task #1269.
+
+## Notes for Implementation
+
+- The `last_progress_at` column exists in the tasks table and is the right
+  signal. The query to check it: `SELECT last_progress_at FROM tasks WHERE id=(SELECT current_task_id FROM agent_sessions WHERE agent='$agent' LIMIT 1) LIMIT 1;` — handle NULLs gracefully.
+- `TASK_PROGRESS_FRESH_SEC` should be a named constant at the top of the daemon
+  (alongside `LAST_SEEN_ALIVE_SEC` and the other thresholds).
+- The new `classification_method` strings for auditing should be:
+  `os-facts-hung-override` (D1 fix, PID/seen_alive signal), and
+  `last-task-progress` (D2 fix, task progress signal) — or equivalently named
+  strings that make the decision path unambiguous in the DB.
+- Do NOT rename or alter `init_db_v2` or `classify_agent_v2` function signatures
+  — the test harness calls them by name.

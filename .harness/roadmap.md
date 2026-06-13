@@ -1,62 +1,54 @@
-# Watchdog Decision Monitoring & Idle Agent Nudging
+# V2 Heartbeat Cutover — Harness Roadmap
 
-## Goal
-Extend the threadwork watchdog to monitor open decisions and nudge idle agents, closing two visibility gaps in the agent coordination system.
+## IMPORTANT: This is NOT a web-app project
+This harness builds threadwork INFRASTRUCTURE, not an app. There is no running
+web app, no browser, no UI. Deliverables are (1) a documentation runbook and
+(2) a bash daemon-script change. The Verifier evaluates by reading docs,
+running shell/script tests, and inspecting code — NOT browser automation.
+Rubric adaptation is in decision-log.md.
 
-## Sprint 1: Decision Lifecycle Monitoring
+## Project
+PROJECT_PATH: /Users/coachstokes/.claude/mcp-servers/task-board
+Goal: migrate the threadwork heartbeat/watchdog from v1 (LLM pane-text
+guessing — idle-park blind spot, escalation storms) to the already-built v2
+"state-contracts" system (agents declare state; daemon reads + verifies vs OS
+facts), then decommission v1. The real v2 daemon already exists at
+`bin/heartbeat-daemon-v2.sh` (489 lines, ground-truth source). Epic: task #1266.
+Phase A of the epic = Sprint 1 + an interleaved ops step + Sprint 2.
 
-**Scope:** Add decision monitoring to the watchdog's reconciliation cycle.
+## Sprint 1 — V2 Cutover Runbook (task #1267)
+Write a durable, executable cutover runbook to disk at
+`docs/v2-heartbeat-cutover-runbook.md`. Reconstruct the design from:
+- the real `bin/heartbeat-daemon-v2.sh` (primary, ground truth)
+- task-board task bodies #826 (state-contracts spec), #842/#843 (soak bug),
+  #829/#830 (harness build that produced v2) — via list_tasks if available
+The runbook must cover ALL 5 cutover steps with exact commands, file paths,
+verification checks, and rollback for each:
+  Step 0: this runbook itself.
+  Step 1: repoint launchd `com.threadwork.heartbeat-v2` from the empty stub
+          `~/bin/heartbeat-daemon-v2.sh` (3-line placeholder) to the real
+          `bin/heartbeat-daemon-v2.sh`; reload; verify it runs real code.
+  Step 2b: daemon-side boot-recovery fallback (see Sprint 2).
+  Step 3: 48h v1/v2 parallel soak; pass = v2 false-positive rate <= 50% of v1.
+  Step 4: cutover flip (v1 off, v2 on), DB collapse, 14-day v1 decommission
+          with rollback path.
+Deliverable = the runbook file, committed to git.
 
-Features:
-1. Call `expireStaleDecisions()` each watchdog cycle to auto-expire overdue decisions
-2. Detect open decisions that have been waiting for positions > 10 minutes — nudge assigned/relevant agents to submit positions
-3. Detect decisions in 'positions' or 'critique' status where all expected agents have responded — alert Boss that the decision is ready to finalize
-4. Post Telegram group notifications for decision state changes (expired, ready-to-finalize)
-5. Add decision monitoring stats to the cycle summary log
+## Interleaved ops (task #1268 — NOT a harness sprint)
+Between Sprint 1 and Sprint 2, Boss executes Step 1 (repoint launchd) per the
+runbook. The harness does NOT do this — Boss handles it directly.
 
-Key files: `watchdog.ts`, `decision.ts`, `nudge.ts`, `notify.ts`
+## Sprint 2 — Daemon-side boot-recovery fallback (task #1269)
+Implement the fallback described in task #843: Claude Code loads emit-state
+hooks only at SessionStart, so already-running agents emit no state
+declarations. The v2 daemon must NOT false-positive on missing/stale
+declarations — it must fall back to OS facts (PID alive, child PID, last task
+progress) when a declaration is stale or absent. Modify
+`bin/heartbeat-daemon-v2.sh`. Deliverable = the code change + tests proving the
+fallback works AND v1 behaviour is not regressed. Commit to git.
 
-Acceptance criteria:
-- expireStaleDecisions() called every watchdog cycle
-- Open decisions with no positions after 10 min trigger agent nudge
-- Decisions with positions from all participating agents trigger Boss notification
-- All decision actions logged to audit trail
-- Existing watchdog task reconciliation unchanged (no regressions)
-
-## Sprint 2: Idle Agent Board Check Nudging
-
-**Scope:** Periodically nudge idle agents to check the task board for pending work and open decisions.
-
-Features:
-1. Track agent "last activity" (last task claim, last status update, last position/critique submission)
-2. If an agent has been idle > 15 minutes and there are pending tasks or open decisions, nudge them to check the board
-3. Respect a per-agent cooldown (don't nudge the same agent more than once per 30 minutes)
-4. Include summary of what's waiting in the nudge message (e.g., "2 pending tasks, 1 open decision awaiting your position")
-5. Skip agents with active in_progress tasks (they're busy, not idle)
-
-Key files: `watchdog.ts`, `db.ts`, `nudge.ts`, `server.ts`
-
-Acceptance criteria:
-- Idle agents (no activity for 15 min) get nudged with board summary
-- Agents with active tasks are NOT nudged
-- 30-minute cooldown between nudges per agent
-- Nudge message includes specific counts of pending work
-- All nudges logged to audit trail
-
-## Sprint 3: Integration Testing & Edge Cases
-
-**Scope:** Verify both features work together without conflicts, handle edge cases.
-
-Features:
-1. Test decision expiry + nudge interaction (expired decisions shouldn't trigger position nudges)
-2. Test idle nudge doesn't fire during decision monitoring nudges (avoid double-nudging)
-3. Verify watchdog cycle time stays under 5 seconds with both features active
-4. Add decision monitoring metrics to watchdog cycle summary
-5. Handle edge case: agent opens decision and is also the only one expected to respond
-
-Acceptance criteria:
-- No double-nudges within 30-second window
-- Watchdog cycle completes in < 5 seconds
-- Expired decisions don't generate position nudges
-- Cycle summary includes decision stats
-- All existing tests still pass (`bun test`)
+## Out of scope for the harness
+Steps 3 and 4 (tasks #1270/#1271) are STAGED only — their runbook sections are
+written in Sprint 1, but the 48h soak and the cutover flip are NOT executed by
+this harness. After Sprint 2 the harness reports done; Boss hard-stops for
+GweiSprayer's greenlight before Step 3.
