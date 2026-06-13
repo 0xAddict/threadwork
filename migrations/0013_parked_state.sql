@@ -1,0 +1,37 @@
+-- Migration 0013: prior_status — first-class PARKED task state (#13012 Sub-Sprint C2 / Item 4)
+--
+-- PROBLEM: the watchdog nags BOTH "claim-and-idle" (an owner deliberately
+-- holding an in_progress task) via heartbeat-overdue escalation AND "unclaimed"
+-- (a pending task nobody picked up) via the unclaimed-task sweep. There was no
+-- way for an owner to deliberately HOLD a task without it accruing faults /
+-- triggering escalation.
+--
+-- FIX: a first-class parked state. status='parked' is distinct from in_progress
+-- (heartbeat-supervised) and from pending/unclaimed (unclaimed-swept). The
+-- watchdog SKIPS status='parked' rows in BOTH selection paths (the due-task
+-- selector adds 'parked' to its status NOT IN (...) gate; the unclaimed sweep
+-- never matches because parked != pending). park_task saves the CURRENT status
+-- into prior_status and flips status='parked' + NULLs next_check_at; unpark_task
+-- restores status=prior_status (re-arming next_check_at if the restored status is
+-- in_progress). prior_status NULL = the task has never been parked.
+--
+-- The tasks.status column has NO CHECK constraint (it is `TEXT NOT NULL DEFAULT
+-- 'pending'`), so adding the 'parked' value needs no schema change — only this
+-- new prior_status column to remember what to restore on unpark.
+--
+-- Idempotent ALTER mirroring the 0008/0009/0010/0011/0012 pattern. db.ts also
+-- performs the equivalent ADD COLUMN inside its in-process migrate() loop
+-- (try/exec, column-exists swallowed), so a running server self-heals on boot.
+-- This .sql file is the documentation/parity artifact. See
+-- 0013_parked_state.down.sql to reverse.
+--
+-- LANE NOTE (#13012 C2): the watchdog skip lives ENTIRELY in the task-selection
+-- path (watchdog.ts reconcileDueTasks + checkUnclaimedTasks) — it does NOT touch
+-- the fault-accrual / circuit-breaker functions (recordFault / closeCircuit / the
+-- half_open recovery loop), which Snoopy's #2224 circuit-reset patch owns.
+--
+-- DEPLOYMENT: no manual run required on prod. The column is added by db.ts
+-- migrate() at the next server boot (Boss's gated deploy-window restart). Running
+-- this file manually is only for the /tmp copy-db test harness.
+
+ALTER TABLE tasks ADD COLUMN prior_status TEXT;

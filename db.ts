@@ -12,6 +12,8 @@ export interface Task {
   // terminal target for executor-completed CARD rows (human [Accept] gate);
   // draft/backlog are autonomous-board pre-GO states. Widened from the original
   // 4-value union so card rows typecheck without `as` casts.
+  // #13012 Sub-Sprint C2 / Item 4 adds 'parked' — a deliberate-hold state the
+  // watchdog SKIPS entirely (no heartbeat-overdue faults, no escalation).
   status:
     | 'pending'
     | 'in_progress'
@@ -21,6 +23,7 @@ export interface Task {
     | 'backlog'
     | 'review'
     | 'done'
+    | 'parked'
   result: string | null
   created_at: string
   claimed_at: string | null
@@ -55,6 +58,11 @@ export interface Task {
   // snapping to the flat 120s default (false-L3-storm fix). NULL = no eta ever
   // declared (use kind-aware default).
   last_eta_sec: number | null
+  // #13012 Sub-Sprint C2 / Item 4: the status held immediately before a park, so
+  // unpark_task can restore it verbatim. NULL = never parked. Only meaningful
+  // while status='parked' (a fresh park overwrites it; unpark leaves it as a
+  // historical breadcrumb).
+  prior_status: string | null
   // #13012 Sub-Sprint C / Item 8a: card-lifecycle discriminator. Autonomous-board
   // cards (web-user-created or board-classified, migration 0010 PRD §6) carry a
   // non-null complexity_user (EASY|MEDIUM|COMPLEX user pick). Plain agent tasks
@@ -326,6 +334,19 @@ export class TaskDB {
     // 0008/0009/0010/0011 pattern; see migrations/0012_last_eta_sec.sql for the
     // documentation/parity artifact.
     try { this.db.exec('ALTER TABLE tasks ADD COLUMN last_eta_sec INTEGER') } catch { /* column already exists */ }
+
+    // Migration 0013 (#13012 Sub-Sprint C2 / Item 4): prior_status — the status a
+    // task held immediately BEFORE it was parked, so unpark_task can restore it
+    // verbatim. A first-class parked state (status='parked') lets an owner
+    // deliberately HOLD a task without watchdog fault-accrual or escalation
+    // (distinct from in_progress, which gets heartbeat-nagged, and from
+    // unclaimed/pending, which gets unclaimed-nagged). park sets
+    // prior_status=<current status> + status='parked' + next_check_at=NULL;
+    // unpark restores status=prior_status and re-arms next_check_at. NULL = the
+    // task has never been parked. Idempotent ALTER mirroring the
+    // 0008/0009/0010/0011/0012 pattern; see migrations/0013_parked_state.sql for
+    // the documentation/parity artifact.
+    try { this.db.exec('ALTER TABLE tasks ADD COLUMN prior_status TEXT') } catch { /* column already exists */ }
 
     // Migration 0010: Autonomous Board P1-WS1 card schema additions (PRD §6).
     // Idempotent ALTERs (mirror the 0008/0009 pattern). See
@@ -1429,6 +1450,78 @@ export class TaskDB {
   }
 
   /**
+   * #13012 Sub-Sprint C2 / Item 4 — PARK a task (deliberate hold).
+   *
+   * Today both "claim-and-idle" (an owner deliberately holding an in_progress
+   * task) and "unclaimed" (a pending task nobody picked up) get nagged by the
+   * watchdog — the former via heartbeat-overdue escalation, the latter via the
+   * unclaimed-task sweep. A first-class parked state lets an owner deliberately
+   * hold a task WITHOUT fault accrual or escalation: the watchdog SKIPS
+   * status='parked' rows in both its due-task selection gate and its unclaimed
+   * sweep (see watchdog.ts).
+   *
+   * park saves the CURRENT status into prior_status and flips status='parked',
+   * then NULLs next_check_at so the durable due-time loop can never re-pick it
+   * (belt-and-suspenders alongside the status gate). Only non-terminal,
+   * not-already-parked rows can be parked. Returns the updated row, or null if
+   * the task is missing / terminal / already parked.
+   *
+   * Does NOT touch supervisor_agent (so trg_prevent_supervision_removal never
+   * fires) and does NOT touch any circuit-breaker / fault-count state.
+   */
+  parkTask(taskId: number): Task | null {
+    return this.run(db => {
+      const stmt = db.prepare(`
+        UPDATE tasks SET
+          prior_status = status,
+          status = 'parked',
+          next_check_at = NULL,
+          version = version + 1
+        WHERE id = ?
+          AND status NOT IN ('completed', 'cancelled', 'done', 'parked')
+        RETURNING *
+      `)
+      return stmt.get(taskId) as Task | null
+    })
+  }
+
+  /**
+   * #13012 Sub-Sprint C2 / Item 4 — UNPARK a task (resume from hold).
+   *
+   * Restores status = prior_status (the state captured at park time). If the
+   * restored status is 'in_progress', the row is re-armed for watchdog
+   * supervision (fresh heartbeat/progress timestamps + next_check_at) so the
+   * resumed task is tracked exactly as a live claim would be — a parked task
+   * resuming work must not be born already-overdue. For any other restored
+   * status (pending/draft/backlog/...) next_check_at stays NULL (those states
+   * are surfaced via their own sweeps, not the due-time loop). Only operates on
+   * a row currently status='parked'. Returns the updated row, or null if the
+   * task is missing or not parked.
+   *
+   * Falls back to 'pending' if prior_status is somehow NULL (defensive; a parked
+   * row always has prior_status set by parkTask).
+   */
+  unparkTask(taskId: number): Task | null {
+    return this.run(db => {
+      const hbTimeout = SUPERVISION_DEFAULTS.heartbeat_timeout_sec
+      const stmt = db.prepare(`
+        UPDATE tasks SET
+          status = COALESCE(prior_status, 'pending'),
+          last_heartbeat_at = CASE WHEN COALESCE(prior_status, 'pending') = 'in_progress'
+            THEN datetime('now') ELSE last_heartbeat_at END,
+          last_progress_at = CASE WHEN COALESCE(prior_status, 'pending') = 'in_progress'
+            THEN datetime('now') ELSE last_progress_at END,
+          next_check_at = CASE WHEN COALESCE(prior_status, 'pending') = 'in_progress'
+            THEN datetime('now', '+' || ? || ' seconds') ELSE NULL END,
+          version = version + 1
+        WHERE id = ? AND status = 'parked'
+        RETURNING *
+      `)
+      return stmt.get(hbTimeout, taskId) as Task | null
+    })
+  }
+
+  /**
    * Get all child tasks of a parent task.
    * @param includeCompleted If false, excludes completed/cancelled children. Default: true.
    */
@@ -1477,6 +1570,19 @@ export class TaskDB {
    * is already terminal — a missing heartbeat must not page boss). When
    * `is_addendum` is false (default) the in_progress-parent requirement is
    * UNCHANGED, preserving the current refusal behavior for completed parents.
+   *
+   * #13012 Sub-Sprint C2 / Item 5 — PRE-GO PREP rows: when `kind` is 'prep' the
+   * row records prep work done BEFORE a task goes GO (transition to in_progress).
+   * spawn_subagent normally rejects a draft/un-GO'd parent (parent must be
+   * in_progress), so pre-GO prep was invisible to read_status/get_children. A
+   * prep row relaxes the parent-status requirement to also accept the PRE-GO
+   * states (draft/pending/backlog) AS WELL AS in_progress, is flagged
+   * kind='prep' + is_synthetic=1 (so the watchdog selection gate's existing
+   * COALESCE(is_synthetic,0)=0 / kind!='subagent' predicate already excludes it —
+   * we additionally exclude kind='prep' explicitly), and is labeled "[prep to
+   * #N]" for get_children visibility. next_check_at is NULL (prep is not
+   * heartbeat-supervised — its visibility is read_status + get_children, not the
+   * due-time loop). Prep is mutually exclusive with addendum.
    */
   createSubagentTask(input: {
     description: string
@@ -1485,16 +1591,25 @@ export class TaskDB {
     heartbeat_timeout_sec?: number
     progress_timeout_sec?: number
     is_addendum?: boolean
+    kind?: 'subagent' | 'prep'
   }): Task {
     return this.run(db => {
       const hbTimeout = input.heartbeat_timeout_sec ?? 180 // Sub-agents get longer heartbeat default
       const progTimeout = input.progress_timeout_sec ?? SUPERVISION_DEFAULTS.progress_timeout_sec
       const isAddendum = input.is_addendum === true
+      const isPrep = input.kind === 'prep'
+
+      if (isPrep && isAddendum) {
+        throw new Error('A row cannot be both kind=prep and is_addendum (prep is PRE-GO; addendum is POST-acceptance).')
+      }
 
       // Validate parent exists. For a normal subagent the parent must be
       // in_progress (unchanged). For an addendum the parent must be terminal
       // (completed|cancelled) — addenda only make sense AFTER acceptance; a
-      // still-running parent should use a normal subagent row.
+      // still-running parent should use a normal subagent row. For a PREP row
+      // the parent may be PRE-GO (draft/pending/backlog) OR in_progress — the
+      // whole point is to make work visible BEFORE the GO transition that
+      // spawn_subagent would otherwise require.
       const parent = db.prepare('SELECT id, status FROM tasks WHERE id = ?').get(input.parent_task_id) as { id: number; status: string } | null
       if (!parent) {
         throw new Error(`Parent task #${input.parent_task_id} not found`)
@@ -1503,17 +1618,30 @@ export class TaskDB {
         if (parent.status !== 'completed' && parent.status !== 'cancelled') {
           throw new Error(`Addendum parent #${input.parent_task_id} is ${parent.status}, not completed/cancelled. Use a normal subagent row (addendum:false) for an in-progress parent.`)
         }
+      } else if (isPrep) {
+        const prepOk = ['draft', 'pending', 'backlog', 'in_progress'].includes(parent.status)
+        if (!prepOk) {
+          throw new Error(`Prep parent #${input.parent_task_id} is ${parent.status}; prep rows attach to a PRE-GO (draft/pending/backlog) or in_progress parent, not a terminal one.`)
+        }
       } else if (parent.status !== 'in_progress') {
         throw new Error(`Parent task #${input.parent_task_id} is not in_progress (status: ${parent.status})`)
       }
 
-      // Telegram/team-group + get_children visibility: label addenda explicitly.
+      // Telegram/team-group + get_children visibility: label addenda + prep rows.
       const description = isAddendum
         ? `[addendum to #${input.parent_task_id}] ${input.description}`
+        : isPrep
+        ? `[prep to #${input.parent_task_id}] ${input.description}`
         : input.description
 
-      // Addendum rows: next_check_at = NULL (watchdog never re-picks them; parent
-      // is terminal). Normal subagent rows: armed for heartbeat supervision.
+      // Row kind/status: a PREP row is kind='prep', status='pending' (it is NOT a
+      // claim — it is a visibility breadcrumb for pre-GO work) and next_check_at
+      // NULL (never heartbeat-supervised). Addendum + normal subagent rows are
+      // kind='subagent', status='in_progress'. Addendum: next_check_at NULL
+      // (parent terminal). Normal: armed for heartbeat supervision.
+      const rowKind = isPrep ? 'prep' : 'subagent'
+      const rowStatus = isPrep ? 'pending' : 'in_progress'
+      const armNextCheck = !isPrep && !isAddendum
       const stmt = db.prepare(`
         INSERT INTO tasks (
           from_agent, to_agent, description, priority,
@@ -1525,11 +1653,11 @@ export class TaskDB {
           is_synthetic, is_addendum
         ) VALUES (
           $from, $to, $description, 'normal',
-          $supervisor_agent, 'subagent', $parent_task_id,
+          $supervisor_agent, $kind, $parent_task_id,
           $heartbeat_timeout_sec, $progress_timeout_sec,
-          'in_progress', datetime('now'),
-          datetime('now'), datetime('now'),
-          ${isAddendum ? 'NULL' : "datetime('now', '+' || $heartbeat_timeout_sec || ' seconds')"},
+          $status, ${isPrep ? 'NULL' : "datetime('now')"},
+          ${isPrep ? 'NULL' : "datetime('now')"}, ${isPrep ? 'NULL' : "datetime('now')"},
+          ${armNextCheck ? "datetime('now', '+' || $heartbeat_timeout_sec || ' seconds')" : 'NULL'},
           1, $is_addendum
         )
         RETURNING *
@@ -1543,6 +1671,8 @@ export class TaskDB {
         $heartbeat_timeout_sec: hbTimeout,
         $progress_timeout_sec: progTimeout,
         $is_addendum: isAddendum ? 1 : 0,
+        $kind: rowKind,
+        $status: rowStatus,
       }) as Task
     })
   }

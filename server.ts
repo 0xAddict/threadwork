@@ -389,7 +389,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'spawn_subagent',
-      description: 'Create a durable child task row BEFORE spawning a sub-agent via the Agent tool. Records the sub-agent invocation so the watchdog can monitor it. Call this before Agent tool, then pass the returned child_task_id to the sub-agent. Does NOT actually spawn the agent — you do that with the Agent tool. PAIRING REQUIREMENT: every spawn_subagent must be paired with a close_subagent call in a finally-equivalent block — call close_subagent immediately after Agent returns whether it succeeded, errored, or was interrupted. ADDENDUM: by default the parent task MUST be in_progress. To record a post-acceptance addendum (a fix shipped AFTER the card was accepted/completed), pass addendum:true — this allows a completed/cancelled parent, labels the row "[addendum to #N]", and excludes it from the parent completion gate and the watchdog escalation sweep.',
+      description: 'Create a durable child task row BEFORE spawning a sub-agent via the Agent tool. Records the sub-agent invocation so the watchdog can monitor it. Call this before Agent tool, then pass the returned child_task_id to the sub-agent. Does NOT actually spawn the agent — you do that with the Agent tool. PAIRING REQUIREMENT: every spawn_subagent must be paired with a close_subagent call in a finally-equivalent block — call close_subagent immediately after Agent returns whether it succeeded, errored, or was interrupted. ADDENDUM: by default the parent task MUST be in_progress. To record a post-acceptance addendum (a fix shipped AFTER the card was accepted/completed), pass addendum:true — this allows a completed/cancelled parent, labels the row "[addendum to #N]", and excludes it from the parent completion gate and the watchdog escalation sweep. PREP (#13012 Item 5): to record PRE-GO prep work on a draft/pending/backlog parent (before it transitions to in_progress), pass kind:"prep" — this relaxes the in_progress-parent requirement to also accept PRE-GO states, labels the row "[prep to #N]", makes the work visible to read_status/get_children, and excludes it from the watchdog selection (like synthetic/addendum rows). prep is mutually exclusive with addendum.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -397,6 +397,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           parent_task_id: { type: 'number', description: 'The task ID this sub-agent is working under' },
           model: { type: 'string', description: 'Optional model hint (e.g., "haiku", "sonnet"). Stored in description for reference only.' },
           addendum: { type: 'boolean', description: 'Set true to record a post-acceptance addendum under a COMPLETED/CANCELLED parent. Default false (parent must be in_progress — current refusal behavior preserved).' },
+          kind: { type: 'string', enum: ['subagent', 'prep'], description: 'Row kind. Default "subagent". Pass "prep" (#13012 Item 5) to record PRE-GO prep work on a draft/pending/backlog (or in_progress) parent — visible to read_status/get_children, excluded from the watchdog. Mutually exclusive with addendum.' },
         },
         required: ['description', 'parent_task_id'],
       },
@@ -658,6 +659,30 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           task_id: { type: 'number', description: 'The task ID to transition' },
           to_status: { type: 'string', enum: ['in_progress'], description: "Target status (currently only 'in_progress' — the GO transition)." },
           session_id: { type: 'string', description: 'Optional session ID to bind the worker session' },
+        },
+        required: ['task_id'],
+      },
+    },
+    {
+      // #13012 Sub-Sprint C2 / Item 4 — park (deliberate hold; watchdog skips).
+      name: 'park_task',
+      description: "Park a task into a deliberate-HOLD state (status='parked') that the watchdog SKIPS entirely — no heartbeat-overdue faults, no escalation while parked. Use this when an owner wants to deliberately hold a claimed task (claim-and-idle) or queue a task without it being nagged as unclaimed. The prior status is saved so unpark_task restores it verbatim. Only non-terminal, not-already-parked rows can be parked. Does not touch supervisor or any circuit-breaker state.",
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'The task ID to park' },
+        },
+        required: ['task_id'],
+      },
+    },
+    {
+      // #13012 Sub-Sprint C2 / Item 4 — unpark (resume from hold).
+      name: 'unpark_task',
+      description: "Unpark a parked task — restores the status it held before park_task (its prior_status). If that prior status was 'in_progress', the row is re-armed for watchdog supervision (fresh heartbeat/progress timestamps + next_check_at) so the resumed task is tracked exactly like a live claim. Only operates on a row currently status='parked'.",
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          task_id: { type: 'number', description: 'The task ID to unpark' },
         },
         required: ['task_id'],
       },
@@ -1256,10 +1281,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const parentTaskId = args.parent_task_id as number
         const model = args.model as string | undefined
         const isAddendum = (args.addendum as boolean) === true
+        // #13012 Sub-Sprint C2 / Item 5 — prep rows for PRE-GO visibility.
+        const isPrep = (args.kind as string | undefined) === 'prep'
 
-        const fullDescription = model
-          ? `[subagent:${model}] ${description}`
-          : `[subagent] ${description}`
+        const prefix = isPrep ? '[prep]' : (model ? `[subagent:${model}]` : '[subagent]')
+        const fullDescription = `${prefix} ${description}`
 
         try {
           const childTask = db.createSubagentTask({
@@ -1267,24 +1293,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             parent_task_id: parentTaskId,
             supervisor_agent: SELF_LABEL,
             is_addendum: isAddendum,
+            kind: isPrep ? 'prep' : 'subagent',
           })
 
-          audit.log(SELF_LABEL, 'subagent_spawned', {
+          audit.log(SELF_LABEL, isPrep ? 'prep_recorded' : 'subagent_spawned', {
             parent_task_id: parentTaskId,
             child_task_id: childTask.id,
             description: childTask.description,
             model: model ?? null,
             is_addendum: isAddendum ? 1 : 0,
+            kind: isPrep ? 'prep' : 'subagent',
           }, childTask.id)
-          safeEmitState(SELF_LABEL, 'SUBAGENT_RUNNING', { taskId: childTask.id, tool: 'spawn_subagent', addendum: isAddendum })
+          safeEmitState(SELF_LABEL, 'SUBAGENT_RUNNING', { taskId: childTask.id, tool: 'spawn_subagent', addendum: isAddendum, prep: isPrep })
 
-          // #1624: addendum rows carry next_check_at=NULL (watchdog excluded);
-          // surface that in the reply so callers know the row is durably tracked
-          // but not heartbeat-supervised.
-          const supervisionNote = isAddendum
+          // #1624 addendum + #13012 prep rows carry next_check_at=NULL (watchdog
+          // excluded); surface that in the reply so callers know the row is
+          // durably tracked / visible but not heartbeat-supervised.
+          const supervisionNote = isPrep
+            ? `PRE-GO prep row for #${parentTaskId} — labeled "[prep to #${parentTaskId}]", visible to read_status/get_children, excluded from the watchdog. Write progress with write_status(task_id=${childTask.id}).`
+            : isAddendum
             ? `Addendum to #${parentTaskId} — labeled "[addendum to #${parentTaskId}]", excluded from watchdog escalation and from the parent completion gate.`
             : `Watchdog will monitor heartbeat (timeout: ${childTask.heartbeat_timeout_sec}s).`
-          return { content: [{ type: 'text', text: `Sub-agent task #${childTask.id} created (child of #${parentTaskId}). Pass this ID to the sub-agent. ${supervisionNote}` }] }
+          const noun = isPrep ? 'Prep' : 'Sub-agent'
+          return { content: [{ type: 'text', text: `${noun} task #${childTask.id} created (child of #${parentTaskId}). Pass this ID to the sub-agent. ${supervisionNote}` }] }
         } catch (err: any) {
           return { content: [{ type: 'text', text: `spawn_subagent failed: ${err.message}`, isError: true }] }
         }
@@ -1334,7 +1365,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const lines = children.map(c => {
           // #1624: label addendum rows explicitly so get_children makes the
           // post-acceptance-fix lineage visible at a glance.
-          const kindTag = c.is_addendum ? '[addendum]' : (c.is_synthetic ? '[subagent]' : '[task]')
+          // #13012 C2 / Item 5: label kind='prep' rows so PRE-GO prep work is
+          // visible on the board (the exact gap Item 5 closes).
+          const kindTag = c.is_addendum ? '[addendum]' : (c.kind === 'prep' ? '[prep]' : (c.is_synthetic ? '[subagent]' : '[task]'))
           const resultInfo = c.result ? ` | Result: ${c.result}` : ''
           return `#${c.id} ${kindTag} [${c.status}] ${c.description}${resultInfo}`
         })
@@ -1699,6 +1732,39 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         await postToGroupThreaded(`▶️ #${task.id} GO — draft→in_progress (by ${SELF_LABEL}, owner ${task.to_agent})`, task.id)
         audit.log(SELF_LABEL, 'task_transitioned', { task_id: taskId, to_status: 'in_progress', owner: task.to_agent }, taskId)
         return { content: [{ type: 'text', text: `Task #${task.id} transitioned to in_progress (GO). Owner: ${task.to_agent}. Next check: ${task.next_check_at}.` }] }
+      }
+
+      case 'park_task': {
+        // #13012 Sub-Sprint C2 / Item 4 — deliberate hold; watchdog skips parked.
+        const taskId = args.task_id as number
+
+        const task = db.parkTask(taskId)
+        if (!task) {
+          audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: 'park: not found, terminal, or already parked' }, taskId)
+          return { content: [{ type: 'text', text: `Cannot park task #${taskId} — it doesn't exist, is already terminal (completed/cancelled/done), or is already parked.`, isError: true }] }
+        }
+
+        safeEmitState(SELF_LABEL, 'ACTIVE_THINKING', { taskId: task.id, tool: 'park_task' })
+        await postToGroupThreaded(`⏸️ #${task.id} parked (deliberate hold, was ${task.prior_status}) by ${SELF_LABEL} — watchdog will skip it until unpark.`, task.id)
+        audit.log(SELF_LABEL, 'task_parked', { task_id: taskId, prior_status: task.prior_status }, taskId)
+        return { content: [{ type: 'text', text: `Task #${task.id} parked (prior status: ${task.prior_status}). Watchdog skips it — no heartbeat-overdue faults or escalation. Use unpark_task to resume.` }] }
+      }
+
+      case 'unpark_task': {
+        // #13012 Sub-Sprint C2 / Item 4 — resume from hold (restore prior_status).
+        const taskId = args.task_id as number
+
+        const task = db.unparkTask(taskId)
+        if (!task) {
+          audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: 'unpark: not found or not parked' }, taskId)
+          return { content: [{ type: 'text', text: `Cannot unpark task #${taskId} — it doesn't exist or is not currently parked.`, isError: true }] }
+        }
+
+        safeEmitState(SELF_LABEL, 'ACTIVE_THINKING', { taskId: task.id, tool: 'unpark_task' })
+        const rearmed = task.status === 'in_progress' ? ` Re-armed for watchdog supervision (next check: ${task.next_check_at}).` : ''
+        await postToGroupThreaded(`▶️ #${task.id} unparked → ${task.status} by ${SELF_LABEL}.`, task.id)
+        audit.log(SELF_LABEL, 'task_unparked', { task_id: taskId, restored_status: task.status }, taskId)
+        return { content: [{ type: 'text', text: `Task #${task.id} unparked — restored to ${task.status}.${rearmed}` }] }
       }
 
       default:

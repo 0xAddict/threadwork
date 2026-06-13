@@ -265,15 +265,35 @@ export class TaskReconciler {
     // same recognition to the selection gate so they are NEVER selected for
     // heartbeat-overdue escalation. COALESCE(is_synthetic,0)=0 is the primary
     // predicate; kind!='subagent' is a belt-and-suspenders guard on the same rows.
+    //
+    // #13012 Sub-Sprint C2 / Item 4: also SKIP parked tasks (status='parked'). A
+    // parked task is a DELIBERATE hold — the owner explicitly parked it via
+    // park_task — so it must accrue no heartbeat-overdue faults and trigger no
+    // escalation while parked. parkTask also NULLs next_check_at, so a parked row
+    // would not match `next_check_at <= now` anyway; this status predicate is the
+    // primary, legible guard (and protects against a manual/legacy next_check_at
+    // surviving on a parked row). unpark_task restores prior_status and re-arms.
+    //
+    // #13012 Sub-Sprint C2 / Item 5: also SKIP kind='prep' rows. Pre-GO prep rows
+    // are is_synthetic=1 (already covered by COALESCE(is_synthetic,0)=0 above) and
+    // carry next_check_at=NULL, but kind!='prep' is the explicit belt-and-
+    // suspenders guard matching the kind!='subagent' idiom — prep work is visible
+    // via read_status/get_children, never heartbeat-supervised here.
+    //
+    // NOTE (lane split, #13012 C2): this is the task-SELECTION gate ONLY. It does
+    // NOT touch the fault-accrual / circuit-breaker path (recordFault / closeCircuit
+    // in db.ts, the half_open recovery loop below) — Snoopy's #2224 circuit-reset
+    // patch owns that region, so these predicates stay entirely in the selection idiom.
     const dueTasks = this.taskDb.run(db =>
       db.prepare(`
         SELECT * FROM tasks
         WHERE next_check_at <= datetime('now')
-        AND status NOT IN ('completed', 'cancelled')
+        AND status NOT IN ('completed', 'cancelled', 'parked')
         AND description NOT LIKE 'ESCALATION%'
         AND COALESCE(is_addendum, 0) = 0
         AND COALESCE(is_synthetic, 0) = 0
         AND COALESCE(kind, 'task') != 'subagent'
+        AND COALESCE(kind, 'task') != 'prep'
         ORDER BY next_check_at ASC
       `).all() as Task[]
     )
@@ -800,6 +820,14 @@ export class TaskReconciler {
   // -------------------------------------------------------------------------
 
   private async checkUnclaimedTasks(result: ReconcileResult): Promise<void> {
+    // #13012 Sub-Sprint C2: parked rows carry status='parked' (not 'pending') so
+    // they never match this unclaimed sweep — a deliberate hold is not "unclaimed".
+    // Item 5 prep rows DO carry status='pending' + next_check_at IS NULL, so they
+    // WOULD match here and get nagged as unclaimed — exclude them explicitly. Prep
+    // rows are is_synthetic=1 / kind='prep' visibility breadcrumbs, not real
+    // unclaimed work; the COALESCE(is_synthetic,0)=0 / kind!='prep' predicates
+    // mirror the due-task selection gate above so prep is excluded from BOTH
+    // watchdog selection paths.
     const unclaimed = this.taskDb.run(db =>
       db.prepare(`
         SELECT * FROM tasks
@@ -807,6 +835,8 @@ export class TaskReconciler {
         AND next_check_at IS NULL
         AND created_at < datetime('now', '-' || ? || ' seconds')
         AND description NOT LIKE 'ESCALATION%'
+        AND COALESCE(is_synthetic, 0) = 0
+        AND COALESCE(kind, 'task') != 'prep'
       `).all(UNCLAIMED_CHECK_SEC) as Task[]
     )
 
