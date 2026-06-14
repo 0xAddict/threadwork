@@ -1,5 +1,13 @@
-import { describe, test, expect } from 'bun:test'
-import { formatTaskCreated, formatTaskCompleted, formatTaskClaimed, esc } from '../notify'
+import { describe, test, expect, afterEach } from 'bun:test'
+import {
+  formatTaskCreated,
+  formatTaskCompleted,
+  formatTaskClaimed,
+  esc,
+  getGroupPostToken,
+  getWatcherToken,
+  __resetWatcherToken,
+} from '../notify'
 
 describe('notify formatting', () => {
   test('formatTaskCreated produces correct status message', () => {
@@ -84,5 +92,56 @@ describe('notify formatting', () => {
     const msg2 = `Decision \\#${7} ready to finalize: "${esc('Use #hashtag (beta)')}" \\- ${2} positions in\\.`
     expect(msg2).toContain('\\#hashtag')
     expect(msg2).toContain('\\(beta\\)')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GROUP lifecycle posts source the ACTING AGENT's own bot token (revert of
+// #1855 — Gwei #13048). These assert getGroupPostToken() returns the per-agent
+// TELEGRAM_BOT_TOKEN, NOT the consolidated watcher ("Codey") token, and that a
+// missing agent token yields a skip (undefined) — never a watcher fallback.
+//
+// 🔒 Tests use DUMMY placeholder strings only — never a real bot token value.
+// ---------------------------------------------------------------------------
+describe('group post token source — per-agent (revert #1855, #13048)', () => {
+  const origAgentToken = process.env.TELEGRAM_BOT_TOKEN
+  const origWatcherEnv = process.env.WATCHER_BOT_TOKEN
+
+  afterEach(() => {
+    if (origAgentToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN
+    else process.env.TELEGRAM_BOT_TOKEN = origAgentToken
+    if (origWatcherEnv === undefined) delete process.env.WATCHER_BOT_TOKEN
+    else process.env.WATCHER_BOT_TOKEN = origWatcherEnv
+    __resetWatcherToken()
+  })
+
+  test('getGroupPostToken returns the acting agent per-session TELEGRAM_BOT_TOKEN', () => {
+    process.env.TELEGRAM_BOT_TOKEN = 'AGENT_TOKEN_DUMMY'
+    expect(getGroupPostToken()).toBe('AGENT_TOKEN_DUMMY')
+  })
+
+  test('getGroupPostToken does NOT return the watcher (Codey) token', () => {
+    // Even with a watcher token present in the env, the group path must use the
+    // agent token — the whole point of the #1855 revert.
+    process.env.TELEGRAM_BOT_TOKEN = 'AGENT_TOKEN_DUMMY'
+    process.env.WATCHER_BOT_TOKEN = 'WATCHER_TOKEN_DUMMY'
+    __resetWatcherToken()
+    const groupToken = getGroupPostToken()
+    expect(groupToken).toBe('AGENT_TOKEN_DUMMY')
+    expect(groupToken).not.toBe('WATCHER_TOKEN_DUMMY')
+    expect(groupToken).not.toBe(getWatcherToken())
+  })
+
+  test('getGroupPostToken returns undefined (skip, no watcher fallback) when agent token absent', () => {
+    delete process.env.TELEGRAM_BOT_TOKEN
+    // A watcher token may exist — the group path must STILL skip, not fall back.
+    process.env.WATCHER_BOT_TOKEN = 'WATCHER_TOKEN_DUMMY'
+    __resetWatcherToken()
+    expect(getGroupPostToken()).toBeUndefined()
+  })
+
+  test('empty/whitespace agent token is treated as absent (skip)', () => {
+    process.env.TELEGRAM_BOT_TOKEN = '   '
+    expect(getGroupPostToken()).toBeUndefined()
   })
 })

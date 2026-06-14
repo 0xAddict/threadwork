@@ -2,28 +2,49 @@ import { Database } from 'bun:sqlite'
 import { existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 import type { Task } from './db'
-import { TELEGRAM_GROUP_ID, DB_PATH, cardDeepLink } from './config'
+import { TELEGRAM_GROUP_ID, DB_PATH, cardDeepLink, getTelegramToken } from './config'
 
 // ---------------------------------------------------------------------------
-// Board WATCHER bot token for GROUP lifecycle posts (#1855)
+// Per-agent bot token for GROUP lifecycle posts (revert of #1855 — Gwei #13048)
 //
-// All GROUP lifecycle events (create/claim/complete/note/decision/nudge digest)
-// now speak with ONE voice — the board watcher bot (@Iceproncessfinancebot,
-// id 8761954986) — instead of inheriting each agent's per-session
-// TELEGRAM_BOT_TOKEN. This is the PROCESS half of the bot split: PROCESS (board
-// state-changes → group) = watcher bot; DIALOGUE (DM/nudge-to-agent) = agent
-// bots. Group messages still NAME their agent in the text (e.g. "sadie
-// completed #1785"); only the SENDING bot identity changes.
+// REVERTED: #1855 ("GROUP lifecycle posts speak as board watcher bot") routed
+// all GROUP lifecycle events (create/claim/complete/note/decision/nudge digest)
+// through ONE consolidated board-bot ("Codey", @Iceproncessfinancebot, id
+// 8761954986) via getWatcherToken(). Per GweiSprayer's directive we restore the
+// PRE-#1855 behavior: each agent's board events post under THAT agent's OWN bot
+// so the group visibly shows WHO did what — not a single "Codey" voice.
+//
+// HOW per-agent attribution works for the MCP path: notify.ts runs INSIDE each
+// agent's own task-board MCP process. telegram-pool.sh launches each agent's
+// `claude` (and therefore its child MCP server) with that agent's per-session
+// TELEGRAM_BOT_TOKEN in the env, so getTelegramToken() (config.ts → reads
+// process.env.TELEGRAM_BOT_TOKEN) naturally resolves the ACTING agent's bot.
 //
 // The DM/agent path is unaffected — dispatchAgentNudge() in nudge.ts delivers
 // inter-agent nudges via tmux send-keys, never through this token or
 // sendToGroup(), so it keeps its agent-bot/per-pane identity untouched.
 //
-// 🔒 The token VALUE is never logged or embedded here — it is read at call time
-// from ~/.secrets/watcher-bot-token (overridable for tests via
-// WATCHER_BOT_TOKEN env / WATCHER_BOT_TOKEN_FILE path), mirroring the step-1
-// daemon's resolveBotToken(). Fail-loud per #2198: a missing/empty token throws
-// a visible error rather than silently no-op'ing.
+// Everything else from the #1785/#1855 era is PRESERVED: per-card threading,
+// deep-links, MarkdownV2 templates, nudge digest/throttle, and the test-mode
+// guard.
+//
+// FALLBACK (documented, #13048): if the acting agent's own token is genuinely
+// unavailable (falsy), we LOG + SKIP the group post (return null) rather than
+// crash the board — matching the PRE-#1855 path, which did `if (!token) return`.
+// We deliberately do NOT fall back to the watcher bot: silently re-posting as
+// "Codey" is exactly the consolidated behavior Gwei wants gone, so a missing
+// agent token must surface as a (logged) skipped post, not a mis-attributed one.
+// This relaxes the #2198 fail-loud throw back to the original skip-on-falsy.
+//
+// 🔒 No token VALUE is ever logged or embedded here — getTelegramToken() reads
+// it at call time from the process env (set per-agent by telegram-pool.sh).
+//
+// NOTE: getWatcherToken() / __resetWatcherToken() below are retained (no longer
+// called by the group path) for the separate board-watcher DAEMON's intake-DM
+// concern and to keep the #1855 rollback a one-line token-source flip. See the
+// DAEMON-PATH note in the #13048 report: the board-watcher daemon pings DRAFT
+// cards to human DM recipients (not the team group) and legitimately stays on
+// the watcher bot — it is out of scope for this per-agent group-attribution revert.
 // ---------------------------------------------------------------------------
 
 const WATCHER_BOT_TOKEN_FILE =
@@ -33,15 +54,33 @@ const WATCHER_BOT_TOKEN_FILE =
 let _watcherTokenCache: string | null = null
 
 /**
- * Resolve the board watcher bot token for GROUP lifecycle posts.
+ * Resolve the token used for GROUP lifecycle posts.
  *
- * Precedence (mirrors the step-1 daemon's resolveBotToken):
+ * Reverted to PRE-#1855: returns the ACTING agent's own per-session bot token
+ * (config.getTelegramToken() → process.env.TELEGRAM_BOT_TOKEN, set per-agent by
+ * telegram-pool.sh). Returns undefined when no agent token is present, so the
+ * caller logs + skips the post (see FALLBACK note above) instead of mis-posting
+ * as the consolidated watcher bot.
+ *
+ * Exported (and pure w.r.t. its env input) so tests can assert the token source
+ * without making a network call — sendToGroup() is POST_DISABLED in test mode.
+ */
+export function getGroupPostToken(): string | undefined {
+  const token = getTelegramToken()
+  if (token && token.trim() !== '') return token
+  return undefined
+}
+
+/**
+ * Resolve the board watcher bot token (DEAD for the group path post-#13048).
+ *
+ * Retained only as a backstop helper / for the board-watcher daemon's DM-intake
+ * concern. The group lifecycle path now uses getGroupPostToken() (per-agent).
+ *
+ * Precedence (mirrors the daemon's resolveBotToken):
  *   1. WATCHER_BOT_TOKEN env var (tests / explicit override)
  *   2. WATCHER_BOT_TOKEN_FILE (default ~/.secrets/watcher-bot-token), read +
  *      cached at first use.
- *
- * Fail-loud (#2198): throws if no token can be resolved — never returns a falsy
- * value that would make the caller silently skip the post.
  */
 export function getWatcherToken(): string {
   const fromEnv = process.env.WATCHER_BOT_TOKEN
@@ -64,7 +103,7 @@ export function getWatcherToken(): string {
   }
 
   throw new Error(
-    `[notify] FATAL: watcher bot token missing — set WATCHER_BOT_TOKEN env or create ${WATCHER_BOT_TOKEN_FILE}. Refusing to post group lifecycle events with no board-bot identity (#1855/#2198).`,
+    `[notify] FATAL: watcher bot token missing — set WATCHER_BOT_TOKEN env or create ${WATCHER_BOT_TOKEN_FILE}.`,
   )
 }
 
@@ -245,11 +284,18 @@ async function sendToGroup(
   replyToMessageId?: string | null,
 ): Promise<string | null> {
   if (POST_DISABLED) return null
-  // GROUP lifecycle posts speak as the board watcher bot (#1855). Fail-loud per
-  // #2198: getWatcherToken() throws (visible error) if the token is absent,
-  // rather than silently dropping the post the way the old `if (!token) return`
-  // per-agent path did.
-  const token = getWatcherToken()
+  // GROUP lifecycle posts speak as the ACTING AGENT's own bot (revert of #1855,
+  // Gwei #13048) so the group shows who did what. getGroupPostToken() resolves
+  // this MCP process's per-session TELEGRAM_BOT_TOKEN. PRE-#1855 fallback: if the
+  // agent token is absent, LOG + SKIP (return null) rather than crash or
+  // mis-post as the consolidated "Codey" watcher bot.
+  const token = getGroupPostToken()
+  if (!token) {
+    console.error(
+      '[notify] no per-agent TELEGRAM_BOT_TOKEN in this MCP process — skipping group lifecycle post (set AGENT_LABEL/TELEGRAM_BOT_TOKEN via telegram-pool.sh). #13048',
+    )
+    return null
+  }
 
   const basePayload: Record<string, unknown> = { chat_id: TELEGRAM_GROUP_ID, text }
   if (replyToMessageId) basePayload.reply_to_message_id = replyToMessageId
