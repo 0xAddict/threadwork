@@ -49,3 +49,7 @@ logs/
 # Hook + bin backups (created by install.sh when overwriting existing files)
 hooks/*.bak-*
 bin/*.bak-*
+
+# Skill placeholder backups (not canonical)
+skills/**/*.placeholder-bak-*
+*.placeholder-bak-*
