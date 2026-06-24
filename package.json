@@ -11,6 +11,7 @@
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "devDependencies": {
+    "bats": "^1.13.0",
     "typescript": "^6.0.2"
   }
 }

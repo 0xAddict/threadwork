@@ -68,6 +68,48 @@ log() {
   printf '[%s] %s\n' "$ts" "$*" >&2 || true
 }
 
+# Cutover #1469 (2026-05-30): append one JSON line per classification to
+# emit.log so the alert-review soak monitor (src/alert-review/index.ts) scores
+# real input instead of empty. Fields match the EmitLogLine interface:
+# timestamp_iso, fingerprint, severity, agent, state, reason_class, destination,
+# emit_method, alert_id. Best-effort; never aborts the daemon.
+EMIT_LOG_PATH="${EMIT_LOG_PATH:-$HOME/.claude/state/heartbeat-v2/emit.log}"
+emit_log() {
+  local agent="$1" ext_status="$2" reason="$3" destination="$4" emit_method="$5"
+  local ts_iso; ts_iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  local severity
+  case "$ext_status" in
+    CRASHED) severity="CRITICAL" ;;
+    STUCK)   severity="WARNING"  ;;
+    *)       severity="INFO"     ;;
+  esac
+  # Stable fingerprint = sha256(agent|ext_status); dedup-friendly, no PII.
+  local fingerprint
+  fingerprint="$(printf '%s|%s' "$agent" "$ext_status" \
+    | shasum -a 256 2>/dev/null | awk '{print substr($1,1,16)}')"
+  [[ -z "$fingerprint" ]] && fingerprint="${agent}-${ext_status}"
+  local reason_class; reason_class="$(printf '%s' "$ext_status" | tr '[:upper:]' '[:lower:]')"
+  local alert_id="hbv2-${agent}-$(date -u '+%Y%m%dT%H%M%SZ')"
+  # Emit via a tiny python json.dumps to guarantee valid escaping of reason.
+  python3 -c '
+import json, sys
+print(json.dumps({
+  "timestamp_iso": sys.argv[1],
+  "fingerprint":   sys.argv[2],
+  "severity":      sys.argv[3],
+  "agent":         sys.argv[4],
+  "state":         sys.argv[5],
+  "reason_class":  sys.argv[6],
+  "destination":   sys.argv[7],
+  "emit_method":   sys.argv[8],
+  "alert_id":      sys.argv[9],
+  "reason":        sys.argv[10],
+}))' "$ts_iso" "$fingerprint" "$severity" "$agent" "$ext_status" \
+     "$reason_class" "$destination" "$emit_method" "$alert_id" "$reason" \
+     >> "$EMIT_LOG_PATH" 2>/dev/null \
+    || log "WARN: emit_log append failed for $agent/$ext_status"
+}
+
 # Sprint 2: enforce required secrets only on the real run path (main()).
 # Sourcing the daemon for tests must NOT abort; require_env is never called
 # from the sourced/test path.
@@ -110,6 +152,10 @@ except Exception:
 }
 
 send_telegram() {
+  if [ "${V2_TELEGRAM_ENABLED:-1}" != "1" ]; then
+    log "telegram suppressed (V2_TELEGRAM_ENABLED=${V2_TELEGRAM_ENABLED:-1})"
+    return 0
+  fi
   local text="$1"
   curl -s -X POST \
     "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
@@ -282,6 +328,16 @@ alert_v2() {
     log "[$session] ALIVE — $reason"
     # No Telegram for routine ALIVE; periodic digest handled by hourly summary
   fi
+
+  # Cutover #1469: record this classification to emit.log for the soak monitor.
+  # destination=telegram when an alert was sent above; log otherwise.
+  local _emit_dest _emit_method
+  if [[ "$ext_status" =~ ^(CRASHED|STUCK)$ ]] || (( is_recovery )); then
+    _emit_dest="telegram"; _emit_method="send_telegram"
+  else
+    _emit_dest="log"; _emit_method="none"
+  fi
+  emit_log "$agent" "$ext_status" "$reason" "$_emit_dest" "$_emit_method"
 }
 
 # =============================================================================
@@ -539,6 +595,17 @@ except Exception:
 
   # Step 8: alert
   alert_v2 "$agent" "$ext_status" "$declared_state" "$declared_source" "$reason" "$consecutive" "$last_ext"
+
+  # Step 9 (Sprint 4): loop-detector + escalation-bridge hook.
+  # Fire-and-forget. Bash backgrounds the bun shell-out; the daemon NEVER waits.
+  # If the hook is missing/fails/times-out, this line still returns 0 immediately
+  # and the heartbeat loop continues unaffected.
+  if [[ -x /Users/coachstokes/bin/sprint4-heartbeat-hook.sh ]]; then
+    /Users/coachstokes/bin/sprint4-heartbeat-hook.sh \
+      "$agent" "$ext_status" "$declared_state" "$declared_source" \
+      "$reason" "$consecutive" "$state_age_sec" "$method" \
+      >/dev/null 2>&1 || true
+  fi
 
   log "[$session] → $ext_status ($method) — $reason"
   echo "$ext_status"

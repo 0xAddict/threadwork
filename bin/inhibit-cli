@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# =============================================================================
+# inhibit-cli — Atomic-write CLI for inhibit_rules.json
+#
+# Sprint 1 / DEL-1 / C0.9 — Provides safe, atomic writes to inhibit_rules.json
+# using the tmp+rename pattern to prevent races with hot-reload (DD8 mitigation).
+#
+# Usage:
+#   inhibit-cli list                        # Show current rules
+#   inhibit-cli add --id <id> --source-match <json> --target-match <json> \
+#                   --equal-labels <label,...> [--expires-at <iso8601>]
+#   inhibit-cli remove --id <id>
+#   inhibit-cli edit --id <id> [--expires-at <iso8601>]
+#   inhibit-cli validate                    # Validate current rules file
+# =============================================================================
+
+set -uo pipefail
+
+RULES_FILE="${INHIBIT_RULES_FILE:-$HOME/.claude/mcp-servers/task-board/inhibit_rules.json}"
+
+# =============================================================================
+# Atomic write: write to tmp, then rename (atomic on same filesystem)
+# =============================================================================
+
+atomic_write() {
+  local target="$1"
+  local content="$2"
+  local dir; dir="$(dirname "$target")"
+  local tmp; tmp="$(mktemp "${dir}/.inhibit_rules.XXXXXX.json")"
+  printf '%s\n' "$content" > "$tmp"
+  # Validate JSON before committing
+  if ! python3 -c "import json,sys; json.load(open('$tmp'))" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "ERROR: Generated JSON is invalid, aborting write" >&2
+    return 1
+  fi
+  mv "$tmp" "$target"
+}
+
+# =============================================================================
+# Load current rules
+# =============================================================================
+
+load_rules() {
+  if [[ ! -f "$RULES_FILE" ]]; then
+    echo "[]"
+    return
+  fi
+  cat "$RULES_FILE"
+}
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+cmd_list() {
+  local rules; rules="$(load_rules)"
+  if [[ "$rules" == "[]" || -z "$rules" ]]; then
+    echo "(no rules)"
+    return 0
+  fi
+  echo "$rules" | python3 -c "
+import json,sys
+rules = json.load(sys.stdin)
+for r in rules:
+    print(f\"  id={r.get('id','?')} source={r.get('source_match',{})} target={r.get('target_match',{})} equal={r.get('equal_labels',[])} expires={r.get('expires_at','never')}\")"
+}
+
+cmd_validate() {
+  if [[ ! -f "$RULES_FILE" ]]; then
+    echo "Rules file not found: $RULES_FILE"
+    return 1
+  fi
+  if python3 -c "import json; json.load(open('$RULES_FILE'))" 2>/dev/null; then
+    echo "Rules file is valid JSON"
+    return 0
+  else
+    echo "ERROR: Rules file has invalid JSON" >&2
+    return 1
+  fi
+}
+
+cmd_add() {
+  local id="" source_match="" target_match="" equal_labels="" expires_at="" comment=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id) id="$2"; shift 2 ;;
+      --source-match) source_match="$2"; shift 2 ;;
+      --target-match) target_match="$2"; shift 2 ;;
+      --equal-labels) equal_labels="$2"; shift 2 ;;
+      --expires-at) expires_at="$2"; shift 2 ;;
+      --comment) comment="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  if [[ -z "$id" || -z "$source_match" || -z "$target_match" || -z "$equal_labels" ]]; then
+    echo "ERROR: --id, --source-match, --target-match, --equal-labels are required" >&2
+    return 1
+  fi
+
+  local current_rules; current_rules="$(load_rules)"
+  local new_rules
+  new_rules="$(python3 -c "
+import json, sys
+rules = json.loads('''$current_rules''')
+# Check for duplicate ID
+if any(r.get('id') == '$id' for r in rules):
+    print('ERROR: Rule ID already exists: $id', file=sys.stderr)
+    sys.exit(1)
+new_rule = {
+    'id': '$id',
+    'source_match': json.loads('''$source_match'''),
+    'target_match': json.loads('''$target_match'''),
+    'equal_labels': [l.strip() for l in '$equal_labels'.split(',')],
+}
+if '$expires_at':
+    new_rule['expires_at'] = '$expires_at'
+if '$comment':
+    new_rule['comment'] = '$comment'
+rules.append(new_rule)
+print(json.dumps(rules, indent=2))
+")" || return 1
+
+  atomic_write "$RULES_FILE" "$new_rules"
+  echo "Rule '$id' added successfully"
+}
+
+cmd_remove() {
+  local id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id) id="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  if [[ -z "$id" ]]; then
+    echo "ERROR: --id is required" >&2
+    return 1
+  fi
+
+  local current_rules; current_rules="$(load_rules)"
+  local new_rules
+  new_rules="$(python3 -c "
+import json
+rules = json.loads('''$current_rules''')
+orig_len = len(rules)
+rules = [r for r in rules if r.get('id') != '$id']
+if len(rules) == orig_len:
+    print('WARN: Rule ID not found: $id')
+print(json.dumps(rules, indent=2))
+")"
+
+  atomic_write "$RULES_FILE" "$new_rules"
+  echo "Rule '$id' removed"
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+if [[ $# -eq 0 ]]; then
+  echo "Usage: inhibit-cli <list|add|remove|validate> [options]"
+  exit 1
+fi
+
+cmd="$1"
+shift
+
+case "$cmd" in
+  list) cmd_list "$@" ;;
+  add) cmd_add "$@" ;;
+  remove) cmd_remove "$@" ;;
+  validate) cmd_validate "$@" ;;
+  *)
+    echo "Unknown command: $cmd. Use: list|add|remove|validate" >&2
+    exit 1
+    ;;
+esac

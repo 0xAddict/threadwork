@@ -12,6 +12,16 @@ access.json
 *.db.bak-wal
 *.db.fresh
 
+# Token-bearing DB backups / recovery dumps (HARD GUARDRAIL — never commit)
+*.bak
+tasks*.bak
+tasks*.bak-shm
+tasks*.bak-wal
+tasks.db.bak-*
+tasks.db.backup-*
+recovery/
+state/*.txt
+
 # Lock files
 locks/
 

@@ -410,17 +410,41 @@ query_freshness_note_count() {
   echo "$count"
 }
 
-# Scan last 5 notes on a task for structural-change keywords (Zone 1 check).
+# Scan recent notes on a task for structural-change keywords (Zone 1 check).
 # Outputs the matching keyword (first match) or empty string if none.
 # Keywords: REVERSED|DECISION|BLOCKED|ESCALAT*|OVERRIDDEN|FURY|CORRECTION (word-boundary anchored)
 # F1: BSD word-boundary anchors [[:<:]] / [[:>:]] prevent substring false-positives
 # (e.g. "decisional", "blocker", "indecisive"). ESCALAT[A-Z]* preserves the
 # intentional prefix match for ESCALATE/ESCALATED/ESCALATION/ESCALATING.
+#
+# F4 (task #1473/#1474): author-scope the scan so a keyword in a note the calling
+# agent has ALREADY POSTED PAST no longer blocks it. We scan only notes whose id
+# is >= the calling agent's own most-recent note on this task — i.e. the agent's
+# latest note plus anything posted after it. Rationale: once an agent has posted
+# a note AFTER a structural-keyword note, it has seen/acknowledged that signal, so
+# the older keyword must stop blocking. Without this, a single historical keyword
+# note (often the watchdog's "ESCALATION"/"BLOCKED", or an unrelated agent's note)
+# permanently poisons the last-5-notes window and blocks EVERY subsequent
+# send_note from EVERY agent forever — a team-wide board-comms blackhole
+# (confirmed on #850).
+#   - Keyword in a note OLDER than the agent's last note  -> ALLOW (acknowledged).
+#   - Keyword in the agent's OWN latest note              -> BLOCK (preserves the
+#       existing contract: just flagged a structural change, re-read first).
+#   - Keyword in a foreign note NEWER than agent's last   -> BLOCK (new signal).
+#   - Agent has never posted (last_self_id=0)             -> scan last 5 as before
+#       (first-encounter detection preserved).
 check_structural_keywords() {
   local task_id="$1"
+  local agent="$2"
+  # Most-recent note id authored by the calling agent on this task (0 if none).
+  local self_id_sql last_self_id
+  self_id_sql="SELECT COALESCE(MAX(id),0) FROM notes \
+    WHERE task_id=${task_id} AND from_agent='${agent}';"
+  last_self_id=$(sqlite3 -readonly "$DB" "$self_id_sql" 2>>"$DEBUG_LOG")
+  case "$last_self_id" in ''|*[!0-9]*) last_self_id=0 ;; esac
   local notes_sql
   notes_sql="SELECT message FROM notes \
-    WHERE task_id=${task_id} \
+    WHERE task_id=${task_id} AND id >= ${last_self_id} \
     ORDER BY id DESC LIMIT 5;"
   local keyword_match=""
   while IFS= read -r line; do
@@ -650,7 +674,7 @@ EOF
     # ZONE 1: GRACE_MIN ≤ age < KEYWORD_MIN → keyword scan
     # -------------------------------------------------------------------------
     if [ "$ACTIVITY_AGE_MIN" -lt "$KEYWORD_MIN" ] 2>/dev/null; then
-      KEYWORD_MATCH=$(check_structural_keywords "$TASK_ID")
+      KEYWORD_MATCH=$(check_structural_keywords "$TASK_ID" "$AGENT")
       if [ -z "$KEYWORD_MATCH" ]; then
         log_audit "$TASK_ID" "ALLOW" "ALLOW-no-keywords age=${AGE_LABEL} zone=1 tool=$TOOL_NAME"
         exit 0
