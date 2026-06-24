@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Durable telegram-poller-watchdog daemon (made resident after two ad-hoc arms died). -->
+<!-- v1 death: build used `setsid` (absent on macOS) => process-group kill. -->
+<!-- v2 death: unexplained death post-reconnect, invisible because stderr -> /dev/null. -->
+<!-- This launchd job fixes both: KeepAlive auto-restarts on ANY death (covers v2 without -->
+<!-- root-causing it), and StandardErrorPath captures stderr for future death diagnosis. -->
+<!-- The watchdog script itself is UNCHANGED; only durability + crash-visibility added. -->
+<!-- PATH note: tmux lives at /Users/coachstokes/.local/bin (non-standard) — MUST be on -->
+<!-- PATH or the watchdog runs but silently can't see panes/processes (all-unknown census).-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.threadwork.telegram-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/coachstokes/bin/telegram-poller-watchdog.sh</string>
+        <string>loop</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/coachstokes/.claude/state/telegram-watchdog/watchdog.stderr.log</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/coachstokes/.claude/state/telegram-watchdog/watchdog.stdout.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/coachstokes</string>
+        <key>PATH</key>
+        <string>/Users/coachstokes/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>
+    </dict>
+</dict>
+</plist>

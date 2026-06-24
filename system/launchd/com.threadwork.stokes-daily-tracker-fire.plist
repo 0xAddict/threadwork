@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.threadwork.stokes-daily-tracker-fire</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/coachstokes/bin/stokes-daily-tracker-fire.sh</string>
+    </array>
+
+    <!-- Fire at 20:30 EEST (deterministic; v1 — randomized window in v2) -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>20</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/coachstokes/.claude/state/stokes-daily-tracker/fire-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/coachstokes/.claude/state/stokes-daily-tracker/fire-stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/coachstokes</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/coachstokes/bin</string>
+        <key>TZ</key>
+        <string>Europe/Helsinki</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/coachstokes</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>THREADWORK_VERSION</key>
+		<string>v1.0.0</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.threadwork.heartbeat-v2</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>set -a; . /Users/coachstokes/.threadwork/secrets.env; exec /Users/coachstokes/.claude/mcp-servers/task-board/bin/heartbeat-daemon-v2.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/coachstokes/.threadwork/logs/heartbeat-v2.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/coachstokes/.threadwork/logs/heartbeat-v2.out.log</string>
+</dict>
+</plist>

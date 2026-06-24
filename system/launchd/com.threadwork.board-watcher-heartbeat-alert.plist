@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- board-watcher heartbeat staleness alert consumer (P1 accept #2 gap-closure, task #1626) -->
+<!-- Runs every 120s; fires a deduped Telegram alert when board-watcher beat age >300s. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.threadwork.board-watcher-heartbeat-alert</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/coachstokes/threadwork-dashboard/board-watcher/launchd/heartbeat-stale-alert.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/board-watcher/heartbeat-alert.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/board-watcher/heartbeat-alert.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/coachstokes</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>WATCHER_DB_PATH</key>
+        <string>/Users/coachstokes/.claude/mcp-servers/task-board/tasks.db</string>
+        <key>WATCHER_BOT_TOKEN_FILE</key>
+        <string>/Users/coachstokes/.secrets/watcher-bot-token</string>
+        <key>TELEGRAM_CHAT_ID</key>
+        <string>REPLACE_WITH_TELEGRAM_CHAT_ID</string>
+        <key>STALE_THRESHOLD_SEC</key>
+        <string>300</string>
+        <key>ALERT_COOLDOWN_SEC</key>
+        <string>1800</string>
+        <key>LOG_DIR</key>
+        <string>/Users/coachstokes/.threadwork/logs/board-watcher</string>
+    </dict>
+</dict>
+</plist>

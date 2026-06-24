@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- board-sync daemon heartbeat staleness alert consumer (P1 accept gap-closure, task #1641). -->
+<!-- Runs every 120s; fires a deduped Telegram alert when the sync daemon's -->
+<!-- tw_agent_registry (Supabase) last_seen_at age > STALE_THRESHOLD_SEC. -->
+<!-- Mirrors com.threadwork.board-watcher-heartbeat-alert (task #1626). -->
+<!-- SECURITY (#1627): NO service-role key in this plist. The alert script reads -->
+<!-- VITE_SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY from dashboard/.env at runtime. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.threadwork.board-sync-heartbeat-alert</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/coachstokes/threadwork-dashboard/sync-daemon/launchd/sync-heartbeat-stale-alert.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/board-sync/heartbeat-alert.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/board-sync/heartbeat-alert.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/coachstokes</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>SYNC_DAEMON_AGENT</key>
+        <string>sync-daemon</string>
+        <key>SYNC_DAEMON_ENV_FILE</key>
+        <string>/Users/coachstokes/threadwork-dashboard/.env</string>
+        <key>WATCHER_BOT_TOKEN_FILE</key>
+        <string>/Users/coachstokes/.secrets/watcher-bot-token</string>
+        <key>TELEGRAM_CHAT_ID</key>
+        <string>REPLACE_WITH_TELEGRAM_CHAT_ID</string>
+        <key>STALE_THRESHOLD_SEC</key>
+        <string>180</string>
+        <key>ALERT_COOLDOWN_SEC</key>
+        <string>1800</string>
+        <key>LOG_DIR</key>
+        <string>/Users/coachstokes/.threadwork/logs/board-sync</string>
+    </dict>
+</dict>
+</plist>

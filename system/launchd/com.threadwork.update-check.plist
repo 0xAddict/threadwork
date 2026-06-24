@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Source: v1/12-j.md §"18 write paths" #18 (update-check LaunchAgent). -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.threadwork.update-check</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>/Users/coachstokes/.threadwork/bin/update-check.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/update-check.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/update-check.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/coachstokes</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>THREADWORK_VERSION</key>
+        <string>v1.0.0</string>
+    </dict>
+</dict>
+</plist>

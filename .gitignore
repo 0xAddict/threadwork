@@ -53,3 +53,16 @@ bin/*.bak-*
 # Skill placeholder backups (not canonical)
 skills/**/*.placeholder-bak-*
 *.placeholder-bak-*
+
+# system/ backup namespace — guard against accidental secret/runtime leakage.
+# (Curated structure files are added explicitly; these patterns block the rest.)
+system/**/*.bak
+system/**/*.bak-*
+system/**/*.db
+system/**/*.db-shm
+system/**/*.db-wal
+system/**/*.log
+system/secrets.env
+system/**/.env
+system/**/*.token
+system/**/access.json

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.threadwork.sprint-chain-driver
+  Auto-chains Generator-Verifier harness sprints (sprint-N passed -> fire sprint-N+1).
+  Mirrors com.threadwork.subagent-stall-watcher conventions.
+
+  IMPORTANT: Edit HARNESS_ROOT below from the placeholder
+  __SET_THIS_BEFORE_LOADING__ to your harness project root (the directory that
+  contains .harness/sprints/) BEFORE running launchctl bootstrap. The driver
+  no-ops while the placeholder is in place so loading early is safe but useless.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.threadwork.sprint-chain-driver</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <string>/Users/coachstokes/.claude/hooks/sprint-chain-driver.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/coachstokes/.claude/state/sprint-chain-driver/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/coachstokes/.claude/state/sprint-chain-driver/stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/coachstokes</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/Users/coachstokes/.local/bin</string>
+        <!-- Replace placeholder with the harness project root before bootstrap. -->
+        <key>HARNESS_ROOT</key>
+        <string>__SET_THIS_BEFORE_LOADING__</string>
+        <key>TARGET_TMUX_SESSION</key>
+        <string>claude-steve</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.threadwork.stokes-daily-tracker-poll</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/coachstokes/bin/stokes-daily-tracker-poll.sh</string>
+    </array>
+
+    <!-- 60-second polling interval -->
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/coachstokes/.claude/state/stokes-daily-tracker/poll-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/coachstokes/.claude/state/stokes-daily-tracker/poll-stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/coachstokes</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/coachstokes/bin</string>
+        <key>TZ</key>
+        <string>Europe/Helsinki</string>
+    </dict>
+</dict>
+</plist>

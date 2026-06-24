@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.threadwork.board-watcher</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/coachstokes/threadwork-dashboard/board-watcher/launchd/run-watcher.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/coachstokes/threadwork-dashboard/board-watcher</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/board-watcher/board-watcher.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/board-watcher/board-watcher.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/coachstokes</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>THREADWORK_VERSION</key>
+        <string>v1.0.0</string>
+        <key>WATCHER_SWEEP_INTERVAL_SEC</key>
+        <string>300</string>
+        <key>HEARTBEAT_INTERVAL_SEC</key>
+        <string>120</string>
+        <key>SILENCE_TIMEOUT_SEC</key>
+        <string>14400</string>
+        <key>AUTO_SLEEP_SEC</key>
+        <string>86400</string>
+        <key>WATCHER_BOT_TOKEN_FILE</key>
+        <string>/Users/coachstokes/.secrets/watcher-bot-token</string>
+        <key>WATCHER_DB_PATH</key>
+        <string>/Users/coachstokes/.claude/mcp-servers/task-board/tasks.db</string>
+        <key>WATCHER_RECIPIENTS_PATH</key>
+        <string>/Users/coachstokes/threadwork-dashboard/board-watcher/config/recipients.json</string>
+    </dict>
+</dict>
+</plist>

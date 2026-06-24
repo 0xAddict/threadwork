@@ -1,0 +1,14 @@
+{
+  "_comment": "SCRUBBED EXAMPLE of the task-board MCP registration. This is how the task-board MCP server is registered with Claude Code. The live registration lives in ~/.claude.json under the top-level \"mcpServers\" key (one entry per MCP server). On install, scripts/install.sh ALSO writes a standalone ~/.claude/mcp-servers/task-board/mcp.json with the resolved absolute path. Copy the \"task-board\" block below into your ~/.claude.json mcpServers map (or run scripts/install.sh which generates mcp.json for you). No secrets are required for the task-board server itself (env is empty). Replace ${HOME} with your real home directory absolute path; Claude Code does not expand env vars in this file.",
+  "mcpServers": {
+    "task-board": {
+      "type": "stdio",
+      "command": "${HOME}/.bun/bin/bun",
+      "args": [
+        "run",
+        "${HOME}/.claude/mcp-servers/task-board/server.ts"
+      ],
+      "env": {}
+    }
+  }
+}

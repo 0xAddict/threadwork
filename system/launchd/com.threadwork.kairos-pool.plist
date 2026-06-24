@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Source: v1/12-j.md §"18 write paths" #16 (kairos-pool LaunchAgent). -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.threadwork.kairos-pool</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/coachstokes/.claude/kairos-pool.sh</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/kairos-pool.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/kairos-pool.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/coachstokes</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>THREADWORK_VERSION</key>
+        <string>v1.0.0</string>
+        <key>THREADWORK_INSTALL_UUID</key>
+        <string>REPLACE_WITH_INSTALL_UUID</string>
+    </dict>
+</dict>
+</plist>

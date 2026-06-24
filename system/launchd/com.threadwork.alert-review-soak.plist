@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.threadwork.alert-review-soak</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>set -a; . /Users/coachstokes/.threadwork/secrets.env; exec /Users/coachstokes/.claude/mcp-servers/task-board/src/alert-review/runner-soak.sh</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>21600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/coachstokes</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/coachstokes/.bun/bin</string>
+    <key>ALERT_REVIEW_MODE</key>
+    <string>soak</string>
+    <key>ALERT_REVIEW_WINDOW_HOURS</key>
+    <string>24</string>
+    <key>ALERT_REVIEW_FP_THRESHOLD</key>
+    <string>8</string>
+    <key>ALERT_REVIEW_SOAK_START_ISO</key>
+    <string>2026-05-27T12:04:54Z</string>
+    <key>ALERT_REVIEW_SOAK_END_ISO</key>
+    <string>2026-05-29T12:04:54Z</string>
+    <key>ALERT_REVIEW_TG_CHAT_ID</key>
+    <string>REPLACE_WITH_TELEGRAM_CHAT_ID</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/coachstokes/.claude/state/alert-review/soak/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/coachstokes/.claude/state/alert-review/soak/stderr.log</string>
+</dict>
+</plist>

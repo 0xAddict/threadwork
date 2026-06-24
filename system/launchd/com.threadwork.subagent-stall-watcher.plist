@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Source: v1/12-j.md §"18 write paths" #17 (subagent-stall-watcher LaunchAgent). -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.threadwork.subagent-stall-watcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/coachstokes/.claude/hooks/subagent-stall-watcher.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/subagent-stall-watcher.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/coachstokes/.threadwork/logs/subagent-stall-watcher.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/coachstokes</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>THREADWORK_VERSION</key>
+        <string>v1.0.0</string>
+    </dict>
+</dict>
+</plist>
