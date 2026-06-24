@@ -1,0 +1,740 @@
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "ENABLE_TOOL_SEARCH": "true",
+    "FRESHNESS_HOOK_ENABLED": "1",
+    "CLAUDE_CODE_EFFORT_LEVEL": "xhigh"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Bash(git *)",
+      "Bash(ls *)",
+      "Bash(ls)",
+      "Bash(cd *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(find *)",
+      "Bash(which *)",
+      "Bash(echo *)",
+      "Bash(pwd)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(touch *)",
+      "Bash(chmod *)",
+      "Bash(bun *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(node *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(diff *)",
+      "Bash(file *)",
+      "Bash(stat *)",
+      "Bash(du *)",
+      "Bash(env *)",
+      "Bash(printenv *)",
+      "Bash(tmux *)",
+      "Bash(sqlite3 *)",
+      "Bash(fuser *)",
+      "Bash(lsof *)",
+      "Bash(gh *)",
+      "Edit(/Users/coachstokes/.claude/*)",
+      "Write(/Users/coachstokes/.claude/*)",
+      "Read(/Users/coachstokes/.claude/*)",
+      "Edit(/Users/coachstokes/.claude/**/*)",
+      "Write(/Users/coachstokes/.claude/**/*)",
+      "Read(/Users/coachstokes/.claude/**/*)",
+      "Edit(/Users/coachstokes/.claude/mcp-servers/task-board/**)",
+      "Write(/Users/coachstokes/.claude/mcp-servers/task-board/**)",
+      "Read(/Users/coachstokes/.claude/mcp-servers/task-board/**)",
+      "Edit(/Users/coachstokes/.env)",
+      "Write(/Users/coachstokes/.env)",
+      "Read(/Users/coachstokes/.env)",
+      "Edit(/Users/coachstokes/**/.env)",
+      "Write(/Users/coachstokes/**/.env)",
+      "Read(/Users/coachstokes/**/.env)",
+      "Bash(pip *)",
+      "Bash(pip3 *)",
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(say *)",
+      "Bash(ffmpeg *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(tar *)",
+      "Bash(unzip *)",
+      "Bash(zip *)",
+      "Bash(gzip *)",
+      "Bash(gunzip *)",
+      "Bash(jq *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(xargs *)",
+      "Bash(tee *)",
+      "Bash(rm *)",
+      "Bash(realpath *)",
+      "Bash(dirname *)",
+      "Bash(basename *)",
+      "Bash(open *)",
+      "Bash(pbcopy *)",
+      "Bash(pbpaste *)",
+      "Bash(brew *)",
+      "Bash(cargo *)",
+      "Bash(go *)",
+      "Bash(deno *)",
+      "Bash(pnpm *)",
+      "Bash(yarn *)",
+      "Bash(docker *)",
+      "Bash(netlify *)",
+      "Bash(supabase *)",
+      "Bash(camoufox *)",
+      "Bash(playwright *)",
+      "Bash(sox *)",
+      "Bash(aplay *)",
+      "Bash(afplay *)",
+      "Bash(date *)",
+      "Bash(sleep *)",
+      "Bash(kill *)",
+      "Bash(ps *)",
+      "Bash(top *)",
+      "Bash(df *)",
+      "Bash(free *)",
+      "Bash(uname *)",
+      "Bash(hostname *)",
+      "Bash(whoami *)",
+      "Bash(id *)",
+      "Bash(test *)",
+      "Bash(true *)",
+      "Bash(false *)",
+      "Bash(source *)",
+      "Bash(export *)",
+      "Bash(cat *)",
+      "Edit(/Users/coachstokes/Documents/**/*)",
+      "Write(/Users/coachstokes/Documents/**/*)",
+      "Read(/Users/coachstokes/Documents/**/*)",
+      "Edit(/Users/coachstokes/Desktop/**/*)",
+      "Write(/Users/coachstokes/Desktop/**/*)",
+      "Read(/Users/coachstokes/Desktop/**/*)",
+      "Edit(/Users/coachstokes/Downloads/**/*)",
+      "Write(/Users/coachstokes/Downloads/**/*)",
+      "Read(/Users/coachstokes/Downloads/**/*)",
+      "Edit(/tmp/**/*)",
+      "Write(/tmp/**/*)",
+      "Read(/tmp/**/*)",
+      "Edit(/Users/coachstokes/**/*.sh)",
+      "Write(/Users/coachstokes/**/*.sh)",
+      "Read(/Users/coachstokes/**/*.sh)",
+      "Edit(/Users/coachstokes/**/*.ts)",
+      "Write(/Users/coachstokes/**/*.ts)",
+      "Read(/Users/coachstokes/**/*.ts)",
+      "Edit(/Users/coachstokes/**/*.js)",
+      "Write(/Users/coachstokes/**/*.js)",
+      "Read(/Users/coachstokes/**/*.js)",
+      "Edit(/Users/coachstokes/**/*.json)",
+      "Write(/Users/coachstokes/**/*.json)",
+      "Read(/Users/coachstokes/**/*.json)",
+      "Edit(/Users/coachstokes/**/*.py)",
+      "Write(/Users/coachstokes/**/*.py)",
+      "Read(/Users/coachstokes/**/*.py)",
+      "Edit(/Users/coachstokes/**/*.md)",
+      "Write(/Users/coachstokes/**/*.md)",
+      "Read(/Users/coachstokes/**/*.md)",
+      "Edit(/Users/coachstokes/**/*.html)",
+      "Write(/Users/coachstokes/**/*.html)",
+      "Read(/Users/coachstokes/**/*.html)",
+      "Edit(/Users/coachstokes/**/*.css)",
+      "Write(/Users/coachstokes/**/*.css)",
+      "Read(/Users/coachstokes/**/*.css)",
+      "Edit(/Users/coachstokes/**/*.mts)",
+      "Write(/Users/coachstokes/**/*.mts)",
+      "Read(/Users/coachstokes/**/*.mts)",
+      "Edit(/Users/coachstokes/**/*.yaml)",
+      "Write(/Users/coachstokes/**/*.yaml)",
+      "Read(/Users/coachstokes/**/*.yaml)",
+      "Edit(/Users/coachstokes/**/*.yml)",
+      "Write(/Users/coachstokes/**/*.yml)",
+      "Read(/Users/coachstokes/**/*.yml)",
+      "Edit(/Users/coachstokes/**/*.toml)",
+      "Write(/Users/coachstokes/**/*.toml)",
+      "Read(/Users/coachstokes/**/*.toml)",
+      "Edit(/Users/coachstokes/**/*.txt)",
+      "Write(/Users/coachstokes/**/*.txt)",
+      "Read(/Users/coachstokes/**/*.txt)",
+      "Edit(/Users/coachstokes/**/*.log)",
+      "Write(/Users/coachstokes/**/*.log)",
+      "Read(/Users/coachstokes/**/*.log)",
+      "Edit(/Users/coachstokes/**/*.ogg)",
+      "Write(/Users/coachstokes/**/*.ogg)",
+      "Read(/Users/coachstokes/**/*.ogg)",
+      "Edit(/Users/coachstokes/**/*.mp3)",
+      "Write(/Users/coachstokes/**/*.mp3)",
+      "Read(/Users/coachstokes/**/*.mp3)",
+      "Edit(/Users/coachstokes/**/*.wav)",
+      "Write(/Users/coachstokes/**/*.wav)",
+      "Read(/Users/coachstokes/**/*.wav)",
+      "mcp__task-board__consolidate_memories",
+      "mcp__task-board__get_memory_health_report",
+      "mcp__task-board__challenge_memory",
+      "mcp__task-board__supersede_memory",
+      "mcp__task-board__promote_memory",
+      "mcp__task-board__pin_memory",
+      "mcp__task-board__save_memory",
+      "mcp__task-board__recall_memories",
+      "mcp__task-board__get_boot_briefing",
+      "mcp__task-board__create_task",
+      "mcp__task-board__claim_task",
+      "mcp__task-board__complete_task",
+      "mcp__task-board__delegate_task",
+      "mcp__task-board__list_tasks",
+      "mcp__task-board__send_note",
+      "mcp__task-board__nudge_agent",
+      "mcp__task-board__interrupt_agent",
+      "mcp__task-board__write_status",
+      "mcp__task-board__read_status",
+      "mcp__task-board__clear_status",
+      "mcp__task-board__spawn_subagent",
+      "mcp__task-board__close_subagent",
+      "mcp__task-board__get_children",
+      "mcp__task-board__open_decision",
+      "mcp__task-board__submit_position",
+      "mcp__task-board__critique_position",
+      "mcp__task-board__list_decisions",
+      "mcp__task-board__get_decision_brief",
+      "mcp__task-board__finalize_decision",
+      "mcp__task-board__query_audit_log",
+      "mcp__task-board__force_debrief",
+      "mcp__task-board__write_finding",
+      "mcp__task-board__read_findings",
+      "mcp__task-board__read_finding_raw",
+      "mcp__task-board__write_artifact",
+      "mcp__task-board__report_progress",
+      "mcp__task-board__get_progress",
+      "mcp__task-board__get_violations",
+      "mcp__task-board__run_hygiene",
+      "mcp__task-board__get_db_stats",
+      "mcp__plugin_telegram_telegram__reply",
+      "mcp__plugin_telegram_telegram__react",
+      "mcp__plugin_telegram_telegram__edit_message",
+      "mcp__plugin_telegram_telegram__download_attachment",
+      "mcp__claude-in-chrome__tabs_context_mcp",
+      "mcp__claude-in-chrome__tabs_create_mcp",
+      "mcp__claude-in-chrome__navigate",
+      "mcp__claude-in-chrome__read_page",
+      "mcp__claude-in-chrome__get_page_text",
+      "mcp__claude-in-chrome__javascript_tool",
+      "mcp__claude-in-chrome__computer",
+      "mcp__claude-in-chrome__find",
+      "mcp__claude-in-chrome__form_input",
+      "mcp__claude-in-chrome__gif_creator",
+      "mcp__claude-in-chrome__read_console_messages",
+      "mcp__claude-in-chrome__read_network_requests",
+      "mcp__claude-in-chrome__resize_window",
+      "mcp__claude-in-chrome__shortcuts_execute",
+      "mcp__claude-in-chrome__shortcuts_list",
+      "mcp__claude-in-chrome__switch_browser",
+      "mcp__claude-in-chrome__update_plan",
+      "mcp__claude-in-chrome__upload_image",
+      "mcp__nano-banana-mcp__generate_image",
+      "mcp__nano-banana-mcp__edit_image",
+      "mcp__nano-banana-mcp__continue_editing",
+      "mcp__nano-banana-mcp__get_configuration_status",
+      "mcp__nano-banana-mcp__get_last_image_info",
+      "mcp__nano-banana-mcp__configure_gemini_token",
+      "mcp__macos-control__screenshot",
+      "mcp__macos-control__click_at",
+      "mcp__macos-control__click_by_text",
+      "mcp__macos-control__click_element",
+      "mcp__macos-control__double_click_at",
+      "mcp__macos-control__type_text",
+      "mcp__macos-control__press_key",
+      "mcp__macos-control__get_page_text",
+      "mcp__macos-control__get_page_elements",
+      "mcp__macos-control__get_ui_elements",
+      "mcp__macos-control__screen_ocr",
+      "mcp__macos-control__find_text_on_screen",
+      "mcp__macos-control__scroll",
+      "mcp__macos-control__launch_app",
+      "mcp__macos-control__list_running_apps",
+      "mcp__macos-control__open_url",
+      "mcp__macos-control__batch_actions",
+      "mcp__macos-control__execute_javascript",
+      "mcp__macos-control__fill_by_label",
+      "mcp__macos-control__select_option",
+      "mcp__macos-control__get_clipboard",
+      "mcp__macos-control__set_clipboard",
+      "mcp__macos-automator__execute_script",
+      "mcp__macos-automator__get_scripting_tips",
+      "mcp__fast-playwright__browser_navigate",
+      "mcp__fast-playwright__browser_snapshot",
+      "mcp__fast-playwright__browser_click",
+      "mcp__fast-playwright__browser_type",
+      "mcp__fast-playwright__browser_take_screenshot",
+      "mcp__fast-playwright__browser_evaluate",
+      "mcp__fast-playwright__browser_find_elements",
+      "mcp__fast-playwright__browser_tab_new",
+      "mcp__fast-playwright__browser_tab_list",
+      "mcp__fast-playwright__browser_tab_select",
+      "mcp__fast-playwright__browser_tab_close",
+      "mcp__fast-playwright__browser_close",
+      "mcp__fast-playwright__browser_install",
+      "mcp__fast-playwright__browser_press_key",
+      "mcp__fast-playwright__browser_hover",
+      "mcp__fast-playwright__browser_drag",
+      "mcp__fast-playwright__browser_select_option",
+      "mcp__fast-playwright__browser_handle_dialog",
+      "mcp__fast-playwright__browser_file_upload",
+      "mcp__fast-playwright__browser_navigate_back",
+      "mcp__fast-playwright__browser_navigate_forward",
+      "mcp__fast-playwright__browser_wait_for",
+      "mcp__fast-playwright__browser_resize",
+      "mcp__fast-playwright__browser_console_messages",
+      "mcp__fast-playwright__browser_network_requests",
+      "mcp__fast-playwright__browser_diagnose",
+      "mcp__fast-playwright__browser_inspect_html",
+      "mcp__fast-playwright__browser_batch_execute",
+      "mcp__claude_ai_Supabase__execute_sql",
+      "mcp__claude_ai_Supabase__list_tables",
+      "mcp__claude_ai_Supabase__get_logs",
+      "mcp__claude_ai_Supabase__get_project_url",
+      "mcp__claude_ai_Supabase__list_edge_functions",
+      "mcp__claude_ai_Supabase__get_edge_function",
+      "mcp__claude_ai_Supabase__deploy_edge_function",
+      "mcp__claude_ai_Supabase__apply_migration",
+      "mcp__claude_ai_Supabase__list_migrations",
+      "mcp__claude_ai_Supabase__list_extensions",
+      "mcp__claude_ai_Supabase__get_advisors",
+      "mcp__claude_ai_Supabase__search_docs",
+      "mcp__claude_ai_Supabase__get_publishable_keys",
+      "mcp__claude_ai_Supabase__get_storage_config",
+      "mcp__claude_ai_Supabase__update_storage_config",
+      "mcp__claude_ai_Supabase__list_storage_buckets",
+      "mcp__claude_ai_Supabase__generate_typescript_types",
+      "mcp__claude_ai_Supabase__create_branch",
+      "mcp__claude_ai_Supabase__list_branches",
+      "mcp__claude_ai_Supabase__delete_branch",
+      "mcp__claude_ai_Supabase__merge_branch",
+      "mcp__claude_ai_Supabase__rebase_branch",
+      "mcp__claude_ai_Supabase__reset_branch",
+      "mcp__claude_ai_Gmail__gmail_search_messages",
+      "mcp__claude_ai_Gmail__gmail_read_message",
+      "mcp__claude_ai_Gmail__gmail_read_thread",
+      "mcp__claude_ai_Gmail__gmail_create_draft",
+      "mcp__claude_ai_Gmail__gmail_list_drafts",
+      "mcp__claude_ai_Gmail__gmail_list_labels",
+      "mcp__claude_ai_Gmail__gmail_get_profile",
+      "mcp__claude_ai_Google_Calendar__authenticate",
+      "mcp__claude_ai_Resend_Cloud_MCP__Resend_Execute_Tool",
+      "mcp__claude_ai_Resend_Cloud_MCP__Resend_Skills_Tool",
+      "mcp__claude_ai_Two8_Gmail__TWO8_Gmail_Execute_Tool",
+      "mcp__claude_ai_Two8_Gmail__TWO8_Gmail_Skills_Tool",
+      "mcp__claude_ai_Veeqo_MCP__Veeqo_Execute_Tool",
+      "mcp__claude_ai_Veeqo_MCP__Veeqo_Skills_Tool",
+      "mcp__claude_ai_Friecrawl_Stokes__Firecrawl_Execute_Tool",
+      "mcp__claude_ai_Friecrawl_Stokes__Firecrawl_Skills_Tool",
+      "mcp__gymbandz-shopify-mcp__Gymbandz_Shopify_Execute_Tool",
+      "mcp__gymbandz-shopify-mcp__Gymbandz_Shopify_Skills_Tool",
+      "mcp__netlify__netlify-coding-rules",
+      "mcp__netlify__netlify-project-services-reader",
+      "mcp__netlify__netlify-project-services-updater",
+      "mcp__netlify__netlify-deploy-services-reader",
+      "mcp__netlify__netlify-deploy-services-updater",
+      "mcp__netlify__netlify-extension-services-reader",
+      "mcp__netlify__netlify-extension-services-updater",
+      "mcp__netlify__netlify-team-services-reader",
+      "mcp__netlify__netlify-user-services-reader",
+      "mcp__shadcn__list_components",
+      "mcp__shadcn__get_component",
+      "mcp__shadcn__list_blocks",
+      "mcp__shadcn__get_block",
+      "mcp__plugin_context7_context7__resolve-library-id",
+      "mcp__plugin_context7_context7__query-docs",
+      "mcp__plugin_mintlify_Mintlify__search_mintlify",
+      "mcp__plugin_mintlify_Mintlify__get_page_mintlify",
+      "mcp__plugin_sentry_sentry__authenticate",
+      "mcp__plugin_supabase_supabase__authenticate",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__navigate_page",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__take_screenshot",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__take_snapshot",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__click",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__fill",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__fill_form",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__hover",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__drag",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__press_key",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__type_text",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__list_pages",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__new_page",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__select_page",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__close_page",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__emulate",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__resize_page",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__upload_file",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__wait_for",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__handle_dialog",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__list_network_requests",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_network_request",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__list_console_messages",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__lighthouse_audit",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__performance_start_trace",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__performance_stop_trace",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__performance_analyze_insight",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__take_memory_snapshot",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__select_option"
+    ]
+  },
+  "model": "claude-opus-4-8[1m]",
+  "hooks": {
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/coachstokes/.claude/hooks/thinking-to-telegram.py"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/subagent-heartbeat.sh stop"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/subagent-blackboard.sh subagent-stop"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/emit-state.sh ACTIVE_THINKING"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/session-boot.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/emit-state.sh IDLE_BOOT"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "You have a new task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '[DELEGATION REMINDER] You received a task. Use the task-delegation skill: claim it, then delegate to your runner or sub-agent. Do NOT execute work directly in your main thread.'"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/mcp-servers/task-board/scripts/telegram-typing-start.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/emit-state.sh ACTIVE_THINKING"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/sender-gate.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/pre-work-tools.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__task-board__claim_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/mentor-memory-injector.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__task-board__send_note",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/mentor-memory-injector.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__task-board__nudge_agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/mentor-memory-injector.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__task-board__complete_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/mentor-memory-injector.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_telegram_telegram__reply",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/mentor-memory-injector.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_telegram_telegram__reply",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/sycophant-gate.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__task-board__claim_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/freshness-check.sh preclaim"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__task-board__claim_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/freshness-check.sh prerevisit"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__task-board__delegate_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/freshness-check.sh prerevisit"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__task-board__complete_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/freshness-check.sh prerevisit"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__task-board__send_note",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/freshness-check.sh prerevisit"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/enforce-delegation.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/context-budget-watch.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/subagent-heartbeat.sh start"
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/emit-state.sh SUBAGENT_RUNNING"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/emit-state.sh TOOL_IN_FLIGHT"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/board-report-enforcer.sh pre"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__task-board__complete_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/warmup-verify-gate.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__plugin_telegram_telegram__reply",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/mcp-servers/task-board/scripts/telegram-typing-stop.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/emit-state.sh ACTIVE_THINKING"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/board-report-enforcer.sh post"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__task-board__send_note",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/scope-drift-advisor.sh post"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/coachstokes/.claude/hooks/emit-state.sh WAITING_HUMAN"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true,
+    "context7@claude-plugins-official": true,
+    "skill-creator@claude-plugins-official": true,
+    "supabase@claude-plugins-official": true,
+    "hookify@claude-plugins-official": true,
+    "sentry@claude-plugins-official": true,
+    "firecrawl@claude-plugins-official": true,
+    "chrome-devtools-mcp@claude-plugins-official": true,
+    "mintlify@claude-plugins-official": true,
+    "mcp-server-dev@claude-plugins-official": true,
+    "netlify-skills@claude-plugins-official": true,
+    "telegram@claude-plugins-official": true,
+    "ralph-loop@claude-plugins-official": true,
+    "code-simplifier@claude-plugins-official": true,
+    "codex@openai-codex": true,
+    "claude-arsenal@the-arsenal": true
+  },
+  "extraKnownMarketplaces": {
+    "openai-codex": {
+      "source": {
+        "source": "github",
+        "repo": "openai/codex-plugin-cc"
+      }
+    },
+    "the-arsenal": {
+      "source": {
+        "source": "url",
+        "url": "file:///Users/coachstokes/.claude/plugins/marketplaces/the-arsenal/.claude-plugin/marketplace.json"
+      }
+    }
+  },
+  "feedbackSurveyRate": 0,
+  "effortLevel": "xhigh",
+  "showThinkingSummaries": true,
+  "skipDangerousModePermissionPrompt": true
+}

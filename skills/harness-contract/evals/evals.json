@@ -1,0 +1,23 @@
+{
+  "skill_name": "harness-contract",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Harness this end to end: update a config file, add a regression test, and write a short HTML report. I don't want more questions; make a sprint contract with a hard spec gate and run it autonomously.",
+      "expected_output": "Creates a bounded harness plan with approved-contract.md, measurable must_pass criteria, Generator and Verifier prompts, read-only contract hardening, session-scoped Stop gate setup, monitor/cron wiring, and no subjective acceptance criteria.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Use /harness-contract --codex-verify for these four deliverables. Make sure a third adversarial verifier checks the final result before it can be marked done.",
+      "expected_output": "Includes the normal Generator + Verifier harness plus the Codex adversarial verification gate, AWAITING_CODEX_VERIFY state, codex-adversarial-report.md requirement, and Stop hook evidence check for ADVERSARIAL PASS.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Turn this vague multi-task request into a sprint contract first: migrate two settings files, add docs, and prove existing tests still pass. I want a hard gate and no infinite loop.",
+      "expected_output": "Formalizes the request into 8-15 objective must_pass criteria with literal verifier shell commands, out-of-scope boundaries, a tick budget, immutable approved contract, and clear fail/escalation behavior.",
+      "files": []
+    }
+  ]
+}

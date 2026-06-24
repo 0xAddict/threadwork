@@ -1,0 +1,23 @@
+{
+  "skill_name": "fable-harness",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Use the fable-harness skill to prepare (dry run — do NOT spawn live background agents, cron, or Monitor, just write the files and prepared snippets) a sprint for three deliverables: update a config file, add a regression test, and write a short HTML report. I want the Opus thinking-high builder and the Fable verifier. Make a hard spec gate, no more questions.",
+      "expected_output": "Writes a bounded harness sprint in a fresh ~/<topic>-harness dir: approved-contract.md with 8-15 C-format must_pass criteria each with a literal verifier_check, a hard >=98% gate, out-of-scope list, contract hardening (sha256 + chmod a-w), Stop hook + settings.local.json(.disabled), active-session.json, status.txt=implementing, and Generator/Verifier prompts. Critically: the contract names Generator model = opus (thinking high) and Verifier model = fable, and the Generator prompt instructs high thinking. Cron/Monitor are prepared snippets, not live, because it's a dry run.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "fable-harness --codex these four deliverables (dry run, don't fire live agents/cron). I want a Codex adversary whose job is to actively try to FAIL the build before it can be marked done, not just a polite second opinion.",
+      "expected_output": "Includes the Opus-Generator + Fable-Verifier harness PLUS the Codex red-team gate: a codex-adversarial-prompt.md whose mandate is to BREAK the build (find hollow PASSes, fabricated TDD, integration not actually exercised), an AWAITING_CODEX_VERIFY state, a C5.1 criterion checking codex-adversarial-report.md contains ADVERSARIAL PASS, the Stop hook codex evidence check, and the rule that ADVERSARIAL FAIL bounces back to the Generator. Models are still opus (generator) / fable (verifier).",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Turn this vague multi-task request into a fable-harness sprint contract first (dry run artifacts only): migrate two settings files, add docs, and prove existing tests still pass. Hard gate, no infinite loop, Opus builder + Fable grader.",
+      "expected_output": "Formalizes the request into 8-15 objective C-format must_pass criteria with literal verifier shell commands (including a no-regression check), out-of-scope boundaries, a tick budget, an immutable hashed contract, Generator model=opus thinking-high and Verifier model=fable, and clear fail/escalation behavior. No subjective criteria.",
+      "files": []
+    }
+  ]
+}

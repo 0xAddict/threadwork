@@ -39,7 +39,16 @@ log() {
 trap 'exit 0' EXIT
 
 CHAT_ID="${TELEGRAM_CHAT_ID:-1712539766}"
-BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+# Route subagent heartbeat/status reports to the dedicated "Jake" bot
+# (@APGbotbot) so they stay OFF the main threadwork channel (GweiSprayer
+# request 2026-06-06). Falls back to the session's TELEGRAM_BOT_TOKEN if the
+# Jake token file is missing.
+JAKE_TOKEN_FILE="$HOME/.claude/state/jake-bot/token.txt"
+if [ -r "$JAKE_TOKEN_FILE" ]; then
+  BOT_TOKEN="$(tr -d '\r\n' < "$JAKE_TOKEN_FILE")"
+else
+  BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+fi
 
 if [ -z "$BOT_TOKEN" ]; then
   log "no TELEGRAM_BOT_TOKEN — skipping"

@@ -27,13 +27,22 @@
 #                 FRESHNESS note in last 5 min, then ALLOW. Full inject on block.
 #
 #               ZONE 3 (age ≥ HARDBLOCK_HR*60, default 120 min):
-#                 HARD BLOCK exit 2 with full inject regardless of FRESHNESS note.
+#                 HARD BLOCK exit 2 with full inject UNLESS the agent has
+#                 posted a FRESHNESS verdict note within the last 5 minutes
+#                 (#1713-adjacent fix: gate-queued cards age >2h BY DESIGN, so
+#                 every post-gate dispatch hit an unclearable wall — third
+#                 ZONE-3 incident 2026-06-11, walled steve off #1602. Same
+#                 verdict-note mechanic as ZONE-1/2; the hardblock still fires
+#                 for the no-verdict case, which is its actual purpose: stop
+#                 blind writes to stale cards).
 #
 # Skip rules (fail-open / exit 0):
 #   - FRESHNESS_HOOK_DISABLED=1   global kill-switch (logged to disabled.log)
 #   - FRESHNESS_BYPASS=1          per-call emergency (logged to bypass.log)
 #   - task age < threshold        brand-new / recently-active tasks
 #   - preclaim: task status != 'pending'   DB layer rejects non-pending claims
+#   - prerevisit: terminal status (completed/cancelled/done/complete) —
+#     terminal cards are archives, not stale work (#13014 item 8c)
 #   - boss-self coord (from='boss' AND to_agent='boss')
 #   - watchdog/synthetic (from='watchdog' OR is_synthetic=1)
 #   - any internal error          fail-open; hook NEVER deadlocks Claude Code
@@ -55,7 +64,7 @@ DEBUG_LOG="$STATE_DIR/debug.log"
 BYPASS_LOG="$STATE_DIR/bypass.log"
 DISABLED_LOG="$STATE_DIR/disabled.log"
 AUDIT_LOG="$HOME/.claude/state/freshness-hook.log"
-DB="$HOME/.claude/mcp-servers/task-board/tasks.db"
+DB="${FRESHNESS_DB:-$HOME/.claude/mcp-servers/task-board/tasks.db}"  # env override is for TESTS ONLY
 CACHE_TTL=10
 FRESHNESS_HOURS_COLD_DEFAULT=24
 
@@ -104,6 +113,21 @@ try:
     if tid == "" or tid is None:
         sys.exit(0)
     print(tid)
+except Exception:
+    pass' 2>/dev/null
+}
+
+# Extract tool_input.message from hook JSON (used by the ^FRESHNESS: escape-valve
+# exemption in prerevisit mode — see BUGFIX #1617). Returns empty string if absent.
+extract_message() {
+  python3 -c 'import json,sys
+try:
+    data = json.loads(sys.stdin.read())
+    ti = data.get("tool_input", {}) or {}
+    msg = ti.get("message", "")
+    if msg is None:
+        msg = ""
+    print(msg)
 except Exception:
     pass' 2>/dev/null
 }
@@ -588,6 +612,27 @@ EOF
         ;;
     esac
 
+    # -------------------------------------------------------------------------
+    # BUGFIX #1617 — FIX (a): ^FRESHNESS: escape-valve exemption.
+    #
+    # The block-inject in every zone instructs the agent to post a
+    #   send_note(message="FRESHNESS: <verdict> ...")
+    # as the way to clear the gate. But send_note is itself a revisit-class
+    # tool, so that very escape-valve note re-enters THIS hook. On a task that
+    # is keyword-poisoned (ZONE-1) or stale (ZONE-2/3) the FRESHNESS note's own
+    # send_note got blocked before it could land in the notes table — a hard
+    # deadlock with no escape (verified live on #1595, 2026-06-10). EXEMPT any
+    # send_note whose message starts with "FRESHNESS:" so the verdict can
+    # ALWAYS land. This is the intended escape valve and must never be gated.
+    # Scoped to send_note only — other revisit-class tools are unaffected.
+    if [ "$TOOL_NAME" = "mcp__task-board__send_note" ]; then
+      _FCHK_MSG=$(echo "$STDIN_DATA" | extract_message)
+      if echo "$_FCHK_MSG" | grep -Eqi '^[[:space:]]*FRESHNESS:'; then
+        log_audit "${TASK_ID:-?}" "ALLOW" "freshness-verdict-note-exempt tool=$TOOL_NAME"
+        exit 0
+      fi
+    fi
+
     run_common_checks "FRESHNESS_REVISIT_LADDER" "zone-ladder"
 
     # Load zone thresholds (env-var overridable, with validation)
@@ -649,11 +694,21 @@ EOF
       exit 0
     fi
 
-    # Skip: terminal status
-    if [ "$STATUS" = "completed" ] || [ "$STATUS" = "cancelled" ]; then
-      log_audit "$TASK_ID" "PASS" "terminal-status=$STATUS"
-      exit 0
-    fi
+    # Skip: terminal status (#13014 item 8c). Terminal cards are ARCHIVES, not
+    # stale work — post-completion notes (acceptance evidence, governance
+    # dispositions, audit appendices) are legitimate and common. The skip
+    # existed for completed/cancelled, but the board also carries the terminal
+    # spellings 'done' and 'complete' (e.g. #1707/#13006), which fell through
+    # to the zone ladder and hit ZONE-3 hardblocks during routine
+    # record-keeping. ALLOW outright for all four terminal spellings; the
+    # gate's actual purpose — stopping blind writes to stale ACTIVE work —
+    # is untouched (active statuses still ride the full zone ladder below).
+    case "$STATUS" in
+      completed|cancelled|done|complete)
+        log_audit "$TASK_ID" "PASS" "terminal-status=$STATUS"
+        exit 0
+        ;;
+    esac
 
     # Age label for human-readable display
     if [ "$ACTIVITY_AGE_MIN" -lt 60 ] 2>/dev/null; then
@@ -679,23 +734,56 @@ EOF
         log_audit "$TASK_ID" "ALLOW" "ALLOW-no-keywords age=${AGE_LABEL} zone=1 tool=$TOOL_NAME"
         exit 0
       fi
-      # Keyword found — BLOCK with full inject (bypass options + zone thresholds
-      # are emitted inside emit_stale_context; no trailing footer needed here).
+      # BUGFIX #1617 — FIX (b): verdict-detection now reads the NOTES TABLE.
+      # Previously ZONE-1 blocked purely on the keyword scan and NEVER consulted
+      # whether the agent had already posted a FRESHNESS verdict — so the block
+      # the inject promises to clear could not be cleared by posting the verdict
+      # it asks for (confirmed live on #1595: a correctly-formatted verdict in the
+      # notes table did not unblock). The notes table is the source of truth, and
+      # query_freshness_note_count already reads it (FRESHNESS: <verdict> by this
+      # agent in the last 5 min). Honour it here so the documented loop works:
+      # block -> post FRESHNESS verdict (now allowed by fix (a)) -> retry passes.
+      COUNT=$(query_freshness_note_count "$TASK_ID" "$AGENT")
+      if [ "$COUNT" -gt 0 ] 2>/dev/null; then
+        log_audit "$TASK_ID" "ALLOW" "verdict-found-zone1 keyword=${KEYWORD_MATCH} age=${AGE_LABEL} zone=1 tool=$TOOL_NAME"
+        exit 0
+      fi
+      # Keyword found and no verdict posted — BLOCK with full inject (bypass
+      # options + zone thresholds are emitted inside emit_stale_context).
       log_audit "$TASK_ID" "BLOCK" "BLOCK-keyword-${KEYWORD_MATCH} age=${AGE_LABEL} zone=1 tool=$TOOL_NAME"
       emit_stale_context "$TASK_ID" "$AGE_LABEL" "$TOOL_NAME" "ZONE-1-keyword-${KEYWORD_MATCH}"
       exit 2
     fi
 
     # -------------------------------------------------------------------------
-    # ZONE 3: age ≥ HARDBLOCK_MIN → HARD BLOCK (FRESHNESS note cannot bypass)
+    # ZONE 3: age ≥ HARDBLOCK_MIN → HARD BLOCK unless a FRESHNESS verdict note
+    # was posted by this agent in the last 5 minutes.
+    #
+    # FIX (#1713-adjacent, 2026-06-11): ZONE-3 previously rejected the verdict-
+    # note path outright ("does NOT bypass this zone") and pointed at
+    # FRESHNESS_BYPASS=1 — which is unreachable from MCP tool calls (the agent
+    # cannot set env vars on the hook's process). Gate-queued cards age >2h BY
+    # DESIGN, so every post-gate dispatch hard-walled (third ZONE-3 incident
+    # today; walled steve off #1602). The #1617 fixes made the verdict
+    # mechanic work in ZONE-1/2 and exempted the ^FRESHNESS: send_note itself,
+    # so the verdict note can ALWAYS land — extend the same clearance here.
+    # The hardblock is preserved for the no-verdict case: an agent must still
+    # read the stale-context inject and post a reasoned verdict before writing
+    # to a >2h-stale card.
     # -------------------------------------------------------------------------
     if [ "$ACTIVITY_AGE_MIN" -ge "$HARDBLOCK_MIN" ] 2>/dev/null; then
+      COUNT=$(query_freshness_note_count "$TASK_ID" "$AGENT")
+      if [ "$COUNT" -gt 0 ] 2>/dev/null; then
+        log_audit "$TASK_ID" "ALLOW" "verdict-found-zone3 age=${AGE_LABEL} zone=3 tool=$TOOL_NAME"
+        exit 0
+      fi
       log_audit "$TASK_ID" "BLOCK" "HARDBLOCK-age-${HARDBLOCK_HR}h age=${AGE_LABEL} zone=3 tool=$TOOL_NAME"
       emit_stale_context "$TASK_ID" "$AGE_LABEL" "$TOOL_NAME" "ZONE-3-HARDBLOCK-${HARDBLOCK_HR}h"
       cat >&2 <<EOF
 
 HARD BLOCK: task is ${AGE_LABEL} old (>= ${HARDBLOCK_HR}h threshold).
-A FRESHNESS note does NOT bypass this zone. You must use FRESHNESS_BYPASS=1 or address the staleness.
+To clear: post the FRESHNESS verdict note described above (it is never blocked),
+then retry within 5 minutes. FRESHNESS_BYPASS=1 remains the emergency override.
 EOF
       exit 2
     fi
