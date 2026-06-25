@@ -916,6 +916,60 @@ export class TaskDB {
       GROUP BY wb.window_start, wb.window_end;
     `)
 
+    // Migration 0014 (#10060784): BM25 full-text search over memories.
+    //
+    // External-content FTS5 vtable mirroring memories.content, kept in sync by
+    // AFTER INSERT/UPDATE/DELETE triggers, plus a one-time backfill. Powers the
+    // query/task-aware recall() BM25 blend and get_boot_briefing(query). See
+    // migrations/0014_memory_fts.sql for the documentation/parity artifact.
+    //
+    // ADDITIVE + SAFE: only creates a new vtable + shadow tables + triggers and
+    // backfills. Does not touch existing memories rows/columns. Wrapped in
+    // try/catch because (a) FTS5 must be compiled into the bun:sqlite build
+    // (verified available) and (b) a partial older deploy may already have the
+    // objects — both cases are tolerated so a healthy boot never crashes.
+    try {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+          content,
+          content='memories',
+          content_rowid='id',
+          tokenize='unicode61 remove_diacritics 2'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_memories_fts_ai
+        AFTER INSERT ON memories
+        BEGIN
+          INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_memories_fts_ad
+        AFTER DELETE ON memories
+        BEGIN
+          INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_memories_fts_au
+        AFTER UPDATE ON memories
+        BEGIN
+          INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
+          INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+        END;
+      `)
+      // One-time backfill, guarded so it does not re-run on every boot. If the
+      // FTS index is empty but the base table has rows, populate it. The
+      // triggers keep it synced thereafter.
+      const ftsCount = (this.db.prepare('SELECT count(*) AS n FROM memories_fts').get() as { n: number }).n
+      const memCount = (this.db.prepare('SELECT count(*) AS n FROM memories').get() as { n: number }).n
+      if (ftsCount === 0 && memCount > 0) {
+        this.db.exec('INSERT INTO memories_fts(rowid, content) SELECT id, content FROM memories')
+      }
+    } catch (err) {
+      // FTS5 unavailable or objects already partially present. recall() falls
+      // back to the LIKE path automatically, so memory search still works.
+      console.warn('[task-board] memories_fts (migration 0014) setup skipped:', (err as Error)?.message)
+    }
+
   }
 
   createTask(input: CreateTaskInput): Task {

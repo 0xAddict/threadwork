@@ -273,6 +273,33 @@ CREATE INDEX idx_memories_state ON memories(state);
 CREATE INDEX idx_memories_classification_state ON memories(classification, state);
 CREATE INDEX idx_memories_last_accessed ON memories(last_accessed);
 CREATE INDEX idx_memories_supersedes ON memories(supersedes_memory_id);
+-- Migration 0014 (#10060784): BM25 full-text search over memories.
+-- External-content FTS5 vtable + shadow tables + sync triggers + backfill.
+-- See migrations/0014_memory_fts.sql and db.ts::migrate() for the authoritative
+-- runtime application. The CREATE VIRTUAL TABLE implicitly creates the
+-- memories_fts_data / _idx / _docsize / _config shadow tables.
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+  content,
+  content='memories',
+  content_rowid='id',
+  tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER trg_memories_fts_ai
+AFTER INSERT ON memories
+BEGIN
+  INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER trg_memories_fts_ad
+AFTER DELETE ON memories
+BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
+END;
+CREATE TRIGGER trg_memories_fts_au
+AFTER UPDATE ON memories
+BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
+  INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+END;
 CREATE INDEX idx_decisions_status ON decisions(status);
 CREATE INDEX idx_decision_positions_decision ON decision_positions(decision_id);
 CREATE INDEX idx_decision_critiques_decision ON decision_critiques(decision_id);

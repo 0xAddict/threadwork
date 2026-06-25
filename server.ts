@@ -246,8 +246,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'get_boot_briefing',
-      description: 'Load your boot briefing: role, top memories, shared knowledge, and recent tasks. Call this on startup.',
-      inputSchema: { type: 'object', properties: {} },
+      description: 'Load your boot briefing: role, top memories, shared knowledge, recent tasks, and (when a query is given or an active task exists) BM25-relevant memories. Call this on startup.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Optional. Focus the relevant-memories section on this query. When omitted, auto-derived from your active task.' },
+        },
+      },
     },
     {
       name: 'promote_memory',
@@ -1038,11 +1043,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           })
         }
 
-        const briefing = mem.getBootBriefing(SELF_LABEL, db)
+        const bootQuery = args.query as string | undefined
+        const briefing = mem.getBootBriefing(SELF_LABEL, db, bootQuery)
         const sections: string[] = []
 
         if (briefing.role.length > 0) {
           sections.push('== ROLE ==\n' + briefing.role.map(m => m.content).join('\n'))
+        }
+        // Relevant-memories section (#10060784). Only rendered when there is a
+        // query (explicit or task-derived) AND it produced results. When empty,
+        // the remaining sections are byte-for-byte identical to the pre-0014
+        // output, preserving backward-compat for the no-active-task path.
+        if (briefing.relevantMemories.length > 0) {
+          const header = briefing.relevantQuery
+            ? `== RELEVANT TO YOUR TASK ==`
+            : `== RELEVANT MEMORIES ==`
+          sections.push(header + '\n' + briefing.relevantMemories.map(m => `#${m.id} [${m.category}] ${m.pinned ? '📌 ' : ''}${m.content}`).join('\n'))
         }
         if (briefing.topMemories.length > 0) {
           sections.push('== TOP MEMORIES ==\n' + briefing.topMemories.map(m => `[${m.category}] ${m.content}`).join('\n'))
@@ -1059,6 +1075,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           memory_count: briefing.topMemories.length,
           shared_count: briefing.sharedMemories.length,
           task_count: briefing.recentTasks.length,
+          relevant_count: briefing.relevantMemories.length,
+          relevant_query: briefing.relevantQuery,
         })
 
         if (sections.length === 0) {

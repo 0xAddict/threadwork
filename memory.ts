@@ -51,7 +51,25 @@ export interface BootBriefing {
   topMemories: Memory[]
   sharedMemories: Memory[]
   recentTasks: Task[]
+  // Query/task-aware section (#10060784). When the boot briefing is derived
+  // from an active task (or an explicit query), these are the BM25-relevant
+  // memories. Empty when there is no query/results — in which case the briefing
+  // is byte-for-byte identical to the pre-0014 output for backward-compat.
+  relevantMemories: Memory[]
+  // The query actually used for relevance (explicit arg or auto-derived from the
+  // agent's active task). null when neither was available.
+  relevantQuery: string | null
 }
+
+// Weights for the BM25 relevance blend used by recall(). Tuned so a strong
+// lexical (BM25) match dominates, but quality / importance / recency act as
+// tie-breakers and gentle boosts. All four normalized to [0,1] before blending.
+export const RECALL_BLEND_WEIGHTS = {
+  bm25: 0.6,
+  quality: 0.2,
+  importance: 0.15,
+  recency: 0.05,
+} as const
 
 export class MemoryDB {
   private taskDb: TaskDB
@@ -192,46 +210,193 @@ export class MemoryDB {
     })
   }
 
-  recallMemories(agent: string, filter: RecallFilter): Memory[] {
-    return this.taskDb.run(db => {
-      const conditions = ['(agent = ? OR agent = ?)', "state != 'superseded'"]
-      const params: unknown[] = [agent, 'shared']
+  /**
+   * Sanitize a free-text query into a SAFE FTS5 MATCH expression (#10060784).
+   *
+   * Our memory content is tag/ID-heavy ([session-handoff:...], #10060xxx,
+   * [snoopy-sop], dotted hostnames, etc). Passed raw to FTS5 MATCH, characters
+   * like ':', '#', '-', '[', '.', '*', '"', '(', ')', 'AND'/'OR'/'NOT' are
+   * operators or syntax — they throw "fts5: syntax error" and break recall.
+   *
+   * Strategy: lowercase -> split on every non-alphanumeric -> drop empties ->
+   * double-quote each token (a quoted FTS5 string is a literal phrase, so all
+   * operator meaning is neutralized) -> OR-join. Returns '' when nothing usable
+   * remains, signalling the caller to use the LIKE fallback.
+   *
+   * Example: 'session-handoff:boss #10060' -> '"session" OR "handoff" OR "boss" OR "10060"'
+   */
+  sanitizeFtsQuery(query: string): string {
+    const normalized = query.normalize('NFC').toLowerCase()
+    // Split on anything that is not a letter or digit (Unicode-aware). This
+    // turns ':', '-', '#', '.', '[', ']', whitespace, etc. into delimiters.
+    const tokens = normalized
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter(t => t.length > 0)
+    if (tokens.length === 0) return ''
+    // Double-quote escapes any embedded quote by doubling it (FTS5 phrase
+    // literal syntax). After the split above a token can't contain a quote, but
+    // we double-defend in case the tokenizer is changed later.
+    return tokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ')
+  }
 
+  /** Apply the recall side-effects (access tracking + importance boost) to a set of rows. */
+  private touchRecalled(db: any, ids: number[]): void {
+    if (ids.length === 0) return
+    db.prepare(`
+      UPDATE memories
+      SET last_accessed = datetime('now'),
+          access_count = access_count + 1,
+          importance = MIN(importance + 1, 5)
+      WHERE id IN (${ids.map(() => '?').join(',')})
+    `).run(...ids)
+  }
+
+  /**
+   * recall() — swappable retrieval interface (#10060784).
+   *
+   * Primary backend: FTS5 BM25 blend. Falls back to the LIKE path when the
+   * sanitized MATCH expression is empty/invalid, or for category-only /
+   * no-query queries (where there is no text to rank). Both paths apply the
+   * same access-tracking + importance side-effects and the same
+   * agent/shared/state filters, so behavior is identical except for ordering.
+   */
+  recall(agent: string, filter: RecallFilter): Memory[] {
+    return this.taskDb.run(db => {
+      const limit = filter.limit ?? 10
+
+      // Decide whether the BM25 path is viable: we need a non-empty query that
+      // sanitizes to a usable MATCH expr, and the memories_fts table must exist.
+      let matchExpr = ''
       if (filter.query) {
-        const normalized = this.normalizeContent(filter.query)
-        if (normalized.length > 0) {
-          const tokens = normalized.split(' ').filter(t => t.length > 0)
-          for (const token of tokens) {
-            const escaped = token.replace(/%/g, '\\%').replace(/_/g, '\\_')
-            conditions.push("LOWER(content) LIKE ? ESCAPE '\\'")
-            params.push(`%${escaped}%`)
-          }
+        matchExpr = this.sanitizeFtsQuery(filter.query)
+      }
+
+      if (matchExpr.length > 0 && this.ftsAvailable(db)) {
+        try {
+          return this.recallBm25(db, agent, filter, matchExpr, limit)
+        } catch (err) {
+          // Any FTS error (e.g. an edge-case MATCH syntax issue) degrades to the
+          // proven LIKE path rather than failing the recall.
+          console.warn('[task-board] recall BM25 path failed, falling back to LIKE:', (err as Error)?.message)
         }
       }
-      if (filter.category) {
-        conditions.push('category = ?')
-        params.push(filter.category)
-      }
 
-      const limit = filter.limit ?? 10
-      const sql = `SELECT * FROM memories WHERE ${conditions.join(' AND ')} ORDER BY quality DESC, importance DESC, last_accessed DESC LIMIT ?`
-      params.push(limit)
-
-      const results = db.prepare(sql).all(...params) as Memory[]
-
-      if (results.length > 0) {
-        const ids = results.map(r => r.id)
-        db.prepare(`
-          UPDATE memories
-          SET last_accessed = datetime('now'),
-              access_count = access_count + 1,
-              importance = MIN(importance + 1, 5)
-          WHERE id IN (${ids.map(() => '?').join(',')})
-        `).run(...ids)
-      }
-
-      return results
+      return this.recallLike(db, agent, filter, limit)
     })
+  }
+
+  /** Backward-compatible alias. server.ts calls recallMemories(); now routed through recall(). */
+  recallMemories(agent: string, filter: RecallFilter): Memory[] {
+    return this.recall(agent, filter)
+  }
+
+  /** Cheap check that the FTS index exists in this DB (false on pre-0014 DBs). */
+  private ftsAvailable(db: any): boolean {
+    const row = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = 'memories_fts'"
+    ).get() as { name: string } | undefined
+    return !!row
+  }
+
+  /**
+   * BM25 relevance path. Joins memories_fts on rowid=memories.id, orders by a
+   * blend of normalized bm25 + quality + importance + recency.
+   *
+   * bm25() returns a score where MORE-NEGATIVE = MORE-relevant. We negate it so
+   * larger = better, then min-max normalize across the candidate window to
+   * [0,1]. quality is already ~[0,1]; importance is mapped from its [0,5] range;
+   * recency is exp-style decay on age in days computed in SQL via julianday.
+   */
+  private recallBm25(db: any, agent: string, filter: RecallFilter, matchExpr: string, limit: number): Memory[] {
+    const conditions = ['(m.agent = ? OR m.agent = ?)', "m.state != 'superseded'"]
+    const params: unknown[] = [agent, 'shared']
+
+    if (filter.category) {
+      conditions.push('m.category = ?')
+      params.push(filter.category)
+    }
+
+    // Pull a generous candidate window (limit*5, min 50) ranked by raw bm25, so
+    // the quality/importance/recency blend can re-rank within a relevant set
+    // rather than the whole table. Then blend + re-sort + slice in JS.
+    const candidateWindow = Math.max(limit * 5, 50)
+    const W = RECALL_BLEND_WEIGHTS
+
+    const sql = `
+      SELECT m.*,
+             bm25(memories_fts) AS bm25_raw,
+             (julianday('now') - julianday(m.last_accessed)) AS age_days
+      FROM memories_fts
+      JOIN memories m ON m.id = memories_fts.rowid
+      WHERE memories_fts MATCH ?
+        AND ${conditions.join(' AND ')}
+      ORDER BY bm25(memories_fts)
+      LIMIT ?
+    `
+    const rows = db.prepare(sql).all(matchExpr, ...params, candidateWindow) as Array<
+      Memory & { bm25_raw: number; age_days: number }
+    >
+
+    if (rows.length === 0) return []
+
+    // Normalize bm25 (negate so larger=better), then min-max across candidates.
+    const scoresNeg = rows.map(r => -r.bm25_raw)
+    const minS = Math.min(...scoresNeg)
+    const maxS = Math.max(...scoresNeg)
+    const span = maxS - minS
+
+    const blended = rows.map((r, i) => {
+      const normBm25 = span > 0 ? (scoresNeg[i] - minS) / span : 1
+      const normQuality = Math.max(0, Math.min(1, r.quality ?? 0))
+      const normImportance = Math.max(0, Math.min(1, (r.importance ?? 0) / 5))
+      // Recency: 1.0 at age 0, halving ~ every 30 days (gentle).
+      const ageDays = Number.isFinite(r.age_days) ? Math.max(0, r.age_days) : 0
+      const normRecency = Math.pow(0.5, ageDays / 30)
+      const score =
+        W.bm25 * normBm25 +
+        W.quality * normQuality +
+        W.importance * normImportance +
+        W.recency * normRecency
+      return { row: r as Memory, score }
+    })
+
+    blended.sort((a, b) => b.score - a.score)
+    const top = blended.slice(0, limit).map(b => b.row)
+
+    this.touchRecalled(db, top.map(r => r.id))
+    return top
+  }
+
+  /**
+   * LIKE fallback path — the pre-0014 behavior, preserved verbatim for
+   * category-only / substring / empty-MATCH queries and for pre-0014 DBs.
+   */
+  private recallLike(db: any, agent: string, filter: RecallFilter, limit: number): Memory[] {
+    const conditions = ['(agent = ? OR agent = ?)', "state != 'superseded'"]
+    const params: unknown[] = [agent, 'shared']
+
+    if (filter.query) {
+      const normalized = this.normalizeContent(filter.query)
+      if (normalized.length > 0) {
+        const tokens = normalized.split(' ').filter(t => t.length > 0)
+        for (const token of tokens) {
+          const escaped = token.replace(/%/g, '\\%').replace(/_/g, '\\_')
+          conditions.push("LOWER(content) LIKE ? ESCAPE '\\'")
+          params.push(`%${escaped}%`)
+        }
+      }
+    }
+    if (filter.category) {
+      conditions.push('category = ?')
+      params.push(filter.category)
+    }
+
+    const sql = `SELECT * FROM memories WHERE ${conditions.join(' AND ')} ORDER BY quality DESC, importance DESC, last_accessed DESC LIMIT ?`
+    params.push(limit)
+
+    const results = db.prepare(sql).all(...params) as Memory[]
+    this.touchRecalled(db, results.map(r => r.id))
+    return results
   }
 
   promoteMemory(id: number): Memory | null {
@@ -246,7 +411,23 @@ export class MemoryDB {
     `).get(id) as Memory | null)
   }
 
-  getBootBriefing(agent: string, taskDb: TaskDB): BootBriefing {
+  /**
+   * Boot briefing (#10060784: query/task-aware).
+   *
+   * @param query  Optional explicit query. When omitted, auto-derived from the
+   *               agent's active task (in_progress/claimed, most recent claim,
+   *               falling back to agent_sessions.current_task_id).
+   *
+   * BACKWARD-COMPAT: when there is no query AND no active task, relevantMemories
+   * is [] and relevantQuery is null — the server renders exactly the pre-0014
+   * sections (ROLE / TOP MEMORIES / SHARED / RECENT TASKS), byte-for-byte.
+   *
+   * When a query IS available, relevantMemories is a BLEND: pinned/role rows are
+   * ALWAYS kept; remaining slots are filled by BM25 relevance via recall(). This
+   * never drops the existing guarantees — role/top/shared/recent are still
+   * computed and returned unchanged.
+   */
+  getBootBriefing(agent: string, taskDb: TaskDB, query?: string): BootBriefing {
     return this.taskDb.run(db => {
       const role = db.prepare(
         `SELECT * FROM memories WHERE agent = ? AND category = 'role' AND pinned = 1 AND state = 'active' ORDER BY quality DESC, importance DESC`
@@ -264,7 +445,76 @@ export class MemoryDB {
         `SELECT * FROM tasks WHERE to_agent = ? AND status = 'completed' ORDER BY completed_at DESC LIMIT 5`
       ).all(agent) as Task[]
 
-      return { role, topMemories, sharedMemories, recentTasks }
+      // Resolve the relevance query: explicit arg wins; else auto-derive from
+      // the agent's active task.
+      let relevantQuery: string | null = (query && query.trim().length > 0) ? query.trim() : null
+      if (!relevantQuery) {
+        const activeTask = db.prepare(
+          `SELECT description FROM tasks
+           WHERE to_agent = ? AND status IN ('in_progress','claimed')
+           ORDER BY claimed_at DESC LIMIT 1`
+        ).get(agent) as { description: string } | undefined
+        if (activeTask?.description) {
+          relevantQuery = activeTask.description
+        } else {
+          // Fallback: agent_sessions.current_task_id (set by write_status).
+          const sess = db.prepare(
+            `SELECT current_task_id FROM agent_sessions WHERE agent = ?`
+          ).get(agent) as { current_task_id: number | null } | undefined
+          if (sess?.current_task_id) {
+            const t = db.prepare(`SELECT description FROM tasks WHERE id = ?`).get(sess.current_task_id) as
+              { description: string } | undefined
+            if (t?.description) relevantQuery = t.description
+          }
+        }
+      }
+
+      // Build relevantMemories: BM25-relevance-LED, with pinned/role rows that
+      // ALSO match the query guaranteed to surface. No query (or no results)
+      // -> [] (backward-compat).
+      //
+      // Why relevance-led rather than pinned-first: there can be many (100+)
+      // pinned rows (pin is used liberally to prevent decay). A naive
+      // "all-pinned-first" fill would crowd the relevant hits out of the small
+      // RELEVANT_LIMIT window entirely. Instead we lead with BM25 hits, then
+      // guarantee any *relevant* pinned/role row is not dropped, and only use
+      // leftover slots for top pinned rows. recall()'s candidate pool already
+      // includes pinned rows, so a pinned row relevant to the task ranks
+      // naturally; the separate `role` section independently guarantees role
+      // rows are always shown.
+      let relevantMemories: Memory[] = []
+      if (relevantQuery) {
+        const RELEVANT_LIMIT = 5
+        // recall() applies access-tracking side-effects; that is desirable here
+        // since these memories ARE being surfaced to the agent on boot.
+        const ranked = this.recall(agent, { query: relevantQuery, limit: RELEVANT_LIMIT })
+
+        const seen = new Set<number>()
+        const merged: Memory[] = []
+        // 1. Relevance-led: BM25 hits first (pinned-or-not).
+        for (const m of ranked) {
+          if (merged.length >= RELEVANT_LIMIT) break
+          if (!seen.has(m.id)) { seen.add(m.id); merged.push(m) }
+        }
+        // 2. Backfill any leftover slots with top pinned/role rows so a slow day
+        //    (few/no relevant hits) still yields a useful section. Ordered by
+        //    quality/importance; capped by the leftover slot count.
+        if (merged.length < RELEVANT_LIMIT) {
+          const pinned = db.prepare(
+            `SELECT * FROM memories
+             WHERE (agent = ? OR agent = 'shared') AND pinned = 1 AND state != 'superseded'
+             ORDER BY quality DESC, importance DESC
+             LIMIT ?`
+          ).all(agent, RELEVANT_LIMIT) as Memory[]
+          for (const m of pinned) {
+            if (merged.length >= RELEVANT_LIMIT) break
+            if (!seen.has(m.id)) { seen.add(m.id); merged.push(m) }
+          }
+        }
+        relevantMemories = merged.slice(0, RELEVANT_LIMIT)
+      }
+
+      return { role, topMemories, sharedMemories, recentTasks, relevantMemories, relevantQuery }
     })
   }
 

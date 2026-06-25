@@ -364,10 +364,18 @@ describe('recallMemories query normalization (S3.1)', () => {
     expect(results[0].content).toContain('#381')
   })
 
-  test('underscore vs hyphen: hyphen query does NOT match underscore content', () => {
+  test('underscore vs hyphen: hyphen query NOW matches underscore content (BM25, #10060784)', () => {
+    // BEHAVIOR CHANGE (#10060784): recall now routes text queries through the
+    // FTS5 BM25 backend, whose unicode61 tokenizer splits on BOTH '_' and '-'.
+    // So 'blocked_relay' content and 'blocked-relay' query both tokenize to
+    // ['blocked','relay'] and MATCH. This is the intended improvement for our
+    // tag/ID-heavy content (session-handoff, blocked_relay, two8.shop). The old
+    // LIKE path treated them as distinct literals (asserted length 0); the new
+    // path correctly unifies them.
     mem.saveMemory({ agent: 'steve', content: 'blocked_relay circuit issue', category: 'learning' })
     const results = mem.recallMemories('steve', { query: 'blocked-relay' })
-    expect(results).toHaveLength(0)
+    expect(results).toHaveLength(1)
+    expect(results[0].content).toBe('blocked_relay circuit issue')
   })
 })
 
