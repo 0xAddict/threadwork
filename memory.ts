@@ -71,6 +71,27 @@ export const RECALL_BLEND_WEIGHTS = {
   recency: 0.05,
 } as const
 
+// GAP-4b (#10060804): down-weight factor for the shared "Session-Debrief"
+// aggregate class in recall() ranking. There are ~23 of these shared `decision`
+// blobs; they average ~143k chars (~13x the corpus mean) and carry
+// importance=5/quality=0.8. They are a measured BM25 false-positive magnet —
+// they outrank the specific gold memory in 31/36 low-overlap paraphrase queries
+// (GAP-4b Stage-2). Two mechanisms drive it, neither fixable by BM25 params:
+//   (1) SQLite FTS5 bm25() length-normalization (k1=1.2, b=0.75) is fixed and
+//       NOT tunable from SQL, and b<1 only PARTIALLY discounts length — a 13x
+//       blob still matches many of the OR-joined query tokens, so its raw bm25
+//       stays competitive.
+//   (2) The blend adds a query-INDEPENDENT quality(0.2*0.8=0.16) +
+//       importance(0.15*1.0=0.15) ≈ 0.31 boost, and recall()'s touchRecalled
+//       side-effect keeps these constantly-recalled blobs pinned at max
+//       importance + freshest recency.
+// We DEMOTE (not exclude) their final blended score: a focused memory on the
+// queried topic ranks above them, while a debrief can still surface when it is
+// genuinely the only/best match. Factor chosen a priori from the blend algebra
+// (a strong debrief match ~0.96 -> ~0.29, below a typical focused match ~0.68),
+// per the GAP-4b judge verdict #10060803 — NOT grid-searched against the eval.
+export const DEBRIEF_DEMOTE_FACTOR = 0.3
+
 export class MemoryDB {
   private taskDb: TaskDB
 
@@ -252,6 +273,20 @@ export class MemoryDB {
   }
 
   /**
+   * GAP-4b (#10060804): classify the shared "Session-Debrief" aggregate magnet.
+   *
+   * Matches exactly the set the eval harness flags (agent='shared',
+   * category='decision', content beginning "Decision #<n>: Session Debrief"). The
+   * bounded slice(0,80) keeps the regex O(1) even on the ~500KB blobs. Used by
+   * recall() to demote these query-independent aggregates so a focused memory on
+   * the queried topic is not crowded out. See DEBRIEF_DEMOTE_FACTOR.
+   */
+  isDebriefAggregate(m: Pick<Memory, 'agent' | 'category' | 'content'>): boolean {
+    if (m.agent !== 'shared' || m.category !== 'decision') return false
+    return /^Decision\s+#\d+:\s*Session Debrief/.test((m.content ?? '').slice(0, 80))
+  }
+
+  /**
    * recall() — swappable retrieval interface (#10060784).
    *
    * Primary backend: FTS5 BM25 blend. Falls back to the LIKE path when the
@@ -352,11 +387,14 @@ export class MemoryDB {
       // Recency: 1.0 at age 0, halving ~ every 30 days (gentle).
       const ageDays = Number.isFinite(r.age_days) ? Math.max(0, r.age_days) : 0
       const normRecency = Math.pow(0.5, ageDays / 30)
-      const score =
+      const rawScore =
         W.bm25 * normBm25 +
         W.quality * normQuality +
         W.importance * normImportance +
         W.recency * normRecency
+      // GAP-4b (#10060804): demote shared Session-Debrief aggregates so they stop
+      // crowding out the specific gold memory (magnet in 31/36 paraphrase queries).
+      const score = this.isDebriefAggregate(r) ? rawScore * DEBRIEF_DEMOTE_FACTOR : rawScore
       return { row: r as Memory, score }
     })
 
@@ -391,7 +429,12 @@ export class MemoryDB {
       params.push(filter.category)
     }
 
-    const sql = `SELECT * FROM memories WHERE ${conditions.join(' AND ')} ORDER BY quality DESC, importance DESC, last_accessed DESC LIMIT ?`
+    // GAP-4b (#10060804): demote shared Session-Debrief aggregates to the bottom
+    // of the LIKE-path ordering too (parity with the BM25 path), so category-only
+    // / no-query recalls aren't dominated by the high-importance debrief blobs.
+    const debriefDemote =
+      "(CASE WHEN agent = 'shared' AND category = 'decision' AND content LIKE 'Decision%Session Debrief%' THEN 1 ELSE 0 END) ASC"
+    const sql = `SELECT * FROM memories WHERE ${conditions.join(' AND ')} ORDER BY ${debriefDemote}, quality DESC, importance DESC, last_accessed DESC LIMIT ?`
     params.push(limit)
 
     const results = db.prepare(sql).all(...params) as Memory[]
