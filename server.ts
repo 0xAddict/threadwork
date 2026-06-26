@@ -25,6 +25,7 @@ import {
 import { DB_PATH, SELF_LABEL, AGENT_SESSIONS, TMUX_PATH, TEAM_AGENTS, assertAgentIdentity } from './config'
 
 import { MemoryDB } from './memory'
+import { isDenseEnabled } from './dense'
 import { DecisionDB, expireStaleDecisions } from './decision'
 import { forceDebrief } from './debrief'
 import { AuditLog } from './audit'
@@ -1003,6 +1004,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         })
         audit.log(SELF_LABEL, 'memory_saved', { category, importance: memory.importance }, undefined, memory.id)
 
+        // GAP-4b Phase-2 (#10060808): keep the dense index in sync on write. Only
+        // when the flag is ON (default OFF → zero ML cost). A dense-index failure
+        // must NEVER fail the memory save, so it is fully isolated in try/catch.
+        if (isDenseEnabled()) {
+          try {
+            await mem.indexMemoryVector(memory.id, memory.content)
+          } catch (e) {
+            console.warn('[task-board] dense index-on-save failed (memory still saved):', (e as Error)?.message)
+          }
+        }
+
         return { content: [{ type: 'text', text: `Memory #${memory.id} saved (importance: ${memory.importance}${memory.pinned ? ', pinned' : ''})` }] }
       }
 
@@ -1011,7 +1023,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const category = args.category as string | undefined
         const limit = args.limit as number | undefined
 
-        const memories = mem.recallMemories(SELF_LABEL, { query, category, limit })
+        // GAP-4b Phase-2 (#10060808): dense AUGMENTS BM25 behind the flag. When the
+        // flag is OFF or there is no query, recallAugmented() returns the sync BM25
+        // recall() byte-identically; any dense failure degrades to BM25 internally.
+        const memories = (isDenseEnabled() && query)
+          ? await mem.recallAugmented(SELF_LABEL, { query, category, limit })
+          : mem.recallMemories(SELF_LABEL, { query, category, limit })
         audit.log(SELF_LABEL, 'memory_recalled', { query: query ?? null, results_count: memories.length })
 
         if (memories.length === 0) {

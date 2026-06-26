@@ -970,6 +970,41 @@ export class TaskDB {
       console.warn('[task-board] memories_fts (migration 0014) setup skipped:', (err as Error)?.message)
     }
 
+    // Migration 0015 (#10060808, GAP-4b Phase-2): dense (semantic) retrieval index.
+    //
+    // Sidecar table holding one L2-normalized bge-small-en-v1.5 int8 vector
+    // (384×float32 BLOB) per memory, consumed by recallAugmented() ONLY when the
+    // TASKBOARD_DENSE_RECALL flag is ON. ADDITIVE + SAFE: only CREATEs the table +
+    // a delete-sync trigger; does NOT touch memories rows/columns and is fully inert
+    // when dense is OFF. The vectors are populated OUT-OF-BAND (incremental embed on
+    // save_memory + a one-time guarded backfill script) — never here, because
+    // embedding is an ML forward pass that must not run inside migrate()/boot.
+    //
+    // Delete-sync via an AFTER DELETE trigger (NOT ON DELETE CASCADE): this DB does
+    // not set PRAGMA foreign_keys=ON, so the FK reference is documentation only and
+    // the trigger is what actually keeps the index from drifting (mirrors the FTS
+    // delete-trigger pattern). Wrapped in try/catch so a healthy boot never crashes.
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_vectors (
+          memory_id    INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+          dim          INTEGER NOT NULL,
+          model        TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          vec          BLOB NOT NULL,
+          updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_memory_vectors_ad
+        AFTER DELETE ON memories
+        BEGIN
+          DELETE FROM memory_vectors WHERE memory_id = old.id;
+        END;
+      `)
+    } catch (err) {
+      console.warn('[task-board] memory_vectors (migration 0015) setup skipped:', (err as Error)?.message)
+    }
+
   }
 
   createTask(input: CreateTaskInput): Task {

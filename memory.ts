@@ -1,4 +1,8 @@
 import type { TaskDB, Task } from './db'
+import {
+  isDenseEnabled, denseMode, embedOne, putVector, getVectors,
+  cosineNormalized, rrfFuse, vectorTableExists, DENSE_RRF_K,
+} from './dense'
 
 export type Classification = 'foundational' | 'strategic' | 'operational' | 'observational' | 'ephemeral'
 export type MemoryState = 'proposed' | 'active' | 'disputed' | 'superseded' | 'archived'
@@ -323,6 +327,101 @@ export class MemoryDB {
   /** Backward-compatible alias. server.ts calls recallMemories(); now routed through recall(). */
   recallMemories(agent: string, filter: RecallFilter): Memory[] {
     return this.recall(agent, filter)
+  }
+
+  /**
+   * Dense-AUGMENTED recall (#10060808, GAP-4b Phase-2). ASYNC because embedding
+   * the query is an ONNX forward pass. The FIRST ML dependency on the recall path.
+   *
+   * Contract (guardrails for the first ML dep):
+   *   - dense flag OFF or empty query → returns the sync BM25/LIKE recall() EXACTLY
+   *     (byte-identical to today; zero ML cost — fastembed is never even imported).
+   *   - flag ON → blends dense (semantic) ranking with the BM25 base. Default mode
+   *     'rrf' fuses BM25 ∪ dense via Reciprocal Rank Fusion (AUGMENT: every BM25 hit
+   *     participates, dense never replaces it). Mode 'dense' = pure dense ranking
+   *     (the arm validated to reproduce +0.250 / recall@10=1.0).
+   *   - ANY dense failure (model load, embed, missing index) → silently returns the
+   *     BM25 base. Recall can never break because of dense (mirrors the existing
+   *     ftsAvailable()/try-catch-degrade discipline).
+   *
+   * Scope + ranking mirror arms_dense.py: candidates = (agent==self OR shared) AND
+   * non-superseded (+ optional category), cosine over L2-normalized vectors,
+   * deterministic (-score, id) tiebreak.
+   */
+  async recallAugmented(agent: string, filter: RecallFilter): Promise<Memory[]> {
+    const limit = filter.limit ?? 10
+    const base = this.recall(agent, filter) // sync BM25/LIKE — current behavior AND the fallback
+    if (!isDenseEnabled() || !filter.query || filter.query.trim().length === 0) return base
+
+    let queryVec: Float32Array
+    try {
+      queryVec = await embedOne(filter.query)
+    } catch (err) {
+      console.warn('[task-board] dense query-embed failed; BM25 base only:', (err as Error)?.message)
+      return base
+    }
+
+    try {
+      return this.taskDb.run(db => {
+        if (!vectorTableExists(db)) return base
+
+        // Candidate scope identical to recallBm25/recallLike.
+        const conditions = ["(m.agent = ? OR m.agent = 'shared')", "m.state != 'superseded'"]
+        const params: unknown[] = [agent]
+        if (filter.category) { conditions.push('m.category = ?'); params.push(filter.category) }
+        const candIds = (db.prepare(
+          `SELECT m.id AS id FROM memories m WHERE ${conditions.join(' AND ')}`,
+        ).all(...params) as Array<{ id: number }>).map(r => r.id)
+
+        const vmap = getVectors(db, candIds)
+        if (vmap.size === 0) return base // index not built/empty → safe BM25 fallback
+
+        const scored = candIds
+          .filter(id => vmap.has(id))
+          .map(id => ({ id, score: cosineNormalized(vmap.get(id)!, queryVec) }))
+        scored.sort((a, b) => b.score - a.score || a.id - b.id) // deterministic (-score, id)
+        const denseOrder = scored.map(s => s.id)
+
+        let orderedIds: number[]
+        if (denseMode() === 'dense') {
+          orderedIds = denseOrder.slice(0, limit)
+        } else {
+          // RRF AUGMENT: fuse BM25 base order ∪ dense order — every BM25 hit survives the fuse.
+          orderedIds = rrfFuse([base.map(m => m.id), denseOrder], DENSE_RRF_K).slice(0, limit)
+        }
+
+        // Materialize Memory rows in fused order: reuse the base rows, fetch dense-only ids.
+        const byId = new Map(base.map(m => [m.id, m]))
+        const missing = orderedIds.filter(id => !byId.has(id))
+        if (missing.length > 0) {
+          const rows = db.prepare(
+            `SELECT * FROM memories WHERE id IN (${missing.map(() => '?').join(',')})`,
+          ).all(...missing) as Memory[]
+          for (const r of rows) byId.set(r.id, r)
+        }
+        const result = orderedIds.map(id => byId.get(id)).filter((m): m is Memory => !!m)
+
+        // touchRecalled side-effects: base rows were already touched by this.recall();
+        // only touch the dense-only rows newly surfaced here so nothing is double-counted.
+        const baseIds = new Set(base.map(m => m.id))
+        this.touchRecalled(db, result.map(r => r.id).filter(id => !baseIds.has(id)))
+        return result
+      })
+    } catch (err) {
+      console.warn('[task-board] dense augmentation failed; BM25 base only:', (err as Error)?.message)
+      return base
+    }
+  }
+
+  /**
+   * Embed + persist one memory's vector into memory_vectors (#10060808). ASYNC
+   * (ONNX forward pass). Called by the save_memory write path when dense is enabled,
+   * and by the one-time backfill script. Caller wraps in try/catch — a dense index
+   * failure must NEVER fail the underlying memory write.
+   */
+  async indexMemoryVector(id: number, content: string): Promise<void> {
+    const vec = await embedOne(content)
+    this.taskDb.run(db => putVector(db, id, vec, content))
   }
 
   /** Cheap check that the FTS index exists in this DB (false on pre-0014 DBs). */
