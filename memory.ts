@@ -1,7 +1,8 @@
 import type { TaskDB, Task } from './db'
 import {
   isDenseEnabled, denseMode, embedOne, putVector, getVectors,
-  cosineNormalized, rrfFuse, vectorTableExists, DENSE_RRF_K,
+  cosineNormalized, rrfFuse, vectorTableExists,
+  denseRrfK, denseBm25K, denseDenseK,
 } from './dense'
 
 export type Classification = 'foundational' | 'strategic' | 'operational' | 'observational' | 'ephemeral'
@@ -365,6 +366,7 @@ export class MemoryDB {
       return this.taskDb.run(db => {
         if (!vectorTableExists(db)) return base
 
+        // ---- dense channel: cosine over candidate vectors, top-K_d ----
         // Candidate scope identical to recallBm25/recallLike.
         const conditions = ["(m.agent = ? OR m.agent = 'shared')", "m.state != 'superseded'"]
         const params: unknown[] = [agent]
@@ -380,26 +382,46 @@ export class MemoryDB {
           .filter(id => vmap.has(id))
           .map(id => ({ id, score: cosineNormalized(vmap.get(id)!, queryVec) }))
         scored.sort((a, b) => b.score - a.score || a.id - b.id) // deterministic (-score, id)
-        const denseOrder = scored.map(s => s.id)
+        const denseTopK = scored.slice(0, denseDenseK()).map(s => s.id)
 
+        // ---- fuse, OR pure dense ----
         let orderedIds: number[]
         if (denseMode() === 'dense') {
-          orderedIds = denseOrder.slice(0, limit)
+          orderedIds = denseTopK
         } else {
-          // RRF AUGMENT: fuse BM25 base order ∪ dense order — every BM25 hit survives the fuse.
-          orderedIds = rrfFuse([base.map(m => m.id), denseOrder], DENSE_RRF_K).slice(0, limit)
+          // TRUE UNION-FUSION HYBRID (#10060816). The PRE-fix bug double-counted:
+          // it fused `base` (BM25 sliced to the OUTPUT limit) against denseOrder=ALL,
+          // so a semantic-only gold (dense-found, BM25 rank > limit) only ever got a
+          // single (dense) RRF contribution and was buried just past the slice.
+          // Fix: fuse the UNION of a DECOUPLED BM25 top-K_bm window ∪ a dense top-K_d
+          // window — both independent of `limit` — so the gold participates in BOTH
+          // channels. recallBm25Ids is side-effect-free (no touchRecalled). When FTS
+          // is unavailable / the query has no usable MATCH expr, fall back to the LIKE
+          // base order as the BM25 channel (preserves the degrade discipline).
+          const matchExpr = filter.query ? this.sanitizeFtsQuery(filter.query) : ''
+          const bm25TopK = (matchExpr.length > 0 && this.ftsAvailable(db))
+            ? this.recallBm25Ids(db, agent, filter, matchExpr, denseBm25K())
+            : base.map(m => m.id)
+          orderedIds = rrfFuse([bm25TopK, denseTopK], denseRrfK())
         }
 
-        // Materialize Memory rows in fused order: reuse the base rows, fetch dense-only ids.
+        // ---- Phase-1 re-assert (#10060804) on the FUSED ordering, THEN slice ----
+        // The dense channel bypasses recallBm25/recallLike's debrief demote; without
+        // this, a Session-Debrief aggregate surfaced via dense would silently regress
+        // Phase-1. Demote aggregates to the bottom of the fused order, then slice to
+        // limit — so Phase-1 holds regardless of which channel surfaced a row.
+        const finalIds = this.demoteDebriefAndSlice(db, orderedIds, limit)
+
+        // Materialize ONLY the final `limit` rows: reuse base rows, fetch the rest.
         const byId = new Map(base.map(m => [m.id, m]))
-        const missing = orderedIds.filter(id => !byId.has(id))
+        const missing = finalIds.filter(id => !byId.has(id))
         if (missing.length > 0) {
           const rows = db.prepare(
             `SELECT * FROM memories WHERE id IN (${missing.map(() => '?').join(',')})`,
           ).all(...missing) as Memory[]
           for (const r of rows) byId.set(r.id, r)
         }
-        const result = orderedIds.map(id => byId.get(id)).filter((m): m is Memory => !!m)
+        const result = finalIds.map(id => byId.get(id)).filter((m): m is Memory => !!m)
 
         // touchRecalled side-effects: base rows were already touched by this.recall();
         // only touch the dense-only rows newly surfaced here so nothing is double-counted.
@@ -411,6 +433,31 @@ export class MemoryDB {
       console.warn('[task-board] dense augmentation failed; BM25 base only:', (err as Error)?.message)
       return base
     }
+  }
+
+  /**
+   * Re-assert Phase-1 (#10060804) on a FUSED/dense id ordering (#10060816), then
+   * slice to limit. Stable-demotes shared Session-Debrief aggregates to the BOTTOM
+   * of the ordering (mirroring the BM25/LIKE demote) so the dense channel can't let
+   * them crowd out the gold. Metadata is fetched via substr(content,1,80) so the
+   * ~500KB debrief blobs never enter memory; isDebriefAggregate only inspects the
+   * first ~30 chars. Side-effect-free.
+   */
+  private demoteDebriefAndSlice(db: any, orderedIds: number[], limit: number): number[] {
+    if (orderedIds.length === 0) return orderedIds
+    const meta = new Map<number, Pick<Memory, 'agent' | 'category' | 'content'>>()
+    const rows = db.prepare(
+      `SELECT id, agent, category, substr(content,1,80) AS content
+       FROM memories WHERE id IN (${orderedIds.map(() => '?').join(',')})`,
+    ).all(...orderedIds) as Array<{ id: number; agent: string; category: string; content: string }>
+    for (const r of rows) meta.set(r.id, { agent: r.agent, category: r.category, content: r.content })
+    const isAgg = (id: number): boolean => {
+      const m = meta.get(id)
+      return m ? this.isDebriefAggregate(m) : false
+    }
+    const keep = orderedIds.filter(id => !isAgg(id))
+    const demoted = orderedIds.filter(id => isAgg(id))
+    return [...keep, ...demoted].slice(0, limit)
   }
 
   /**
@@ -433,15 +480,20 @@ export class MemoryDB {
   }
 
   /**
-   * BM25 relevance path. Joins memories_fts on rowid=memories.id, orders by a
-   * blend of normalized bm25 + quality + importance + recency.
+   * Side-effect-free BM25 ranking CORE (#10060816). Joins memories_fts on
+   * rowid=memories.id, pulls a candidate window ranked by raw bm25, applies the
+   * quality/importance/recency blend + Phase-1 debrief demote, and returns the
+   * blended-scored rows in rank order (best first). Does NOT touchRecalled and does
+   * NOT slice to the output limit — callers slice to their own window. Shared by
+   * recallBm25 (output path) and recallBm25Ids (the RRF BM25 top-K window) so both
+   * rank identically.
    *
    * bm25() returns a score where MORE-NEGATIVE = MORE-relevant. We negate it so
    * larger = better, then min-max normalize across the candidate window to
    * [0,1]. quality is already ~[0,1]; importance is mapped from its [0,5] range;
    * recency is exp-style decay on age in days computed in SQL via julianday.
    */
-  private recallBm25(db: any, agent: string, filter: RecallFilter, matchExpr: string, limit: number): Memory[] {
+  private rankBm25(db: any, agent: string, filter: RecallFilter, matchExpr: string, windowLimit: number): Array<{ row: Memory; score: number }> {
     const conditions = ['(m.agent = ? OR m.agent = ?)', "m.state != 'superseded'"]
     const params: unknown[] = [agent, 'shared']
 
@@ -450,10 +502,6 @@ export class MemoryDB {
       params.push(filter.category)
     }
 
-    // Pull a generous candidate window (limit*5, min 50) ranked by raw bm25, so
-    // the quality/importance/recency blend can re-rank within a relevant set
-    // rather than the whole table. Then blend + re-sort + slice in JS.
-    const candidateWindow = Math.max(limit * 5, 50)
     const W = RECALL_BLEND_WEIGHTS
 
     const sql = `
@@ -467,7 +515,7 @@ export class MemoryDB {
       ORDER BY bm25(memories_fts)
       LIMIT ?
     `
-    const rows = db.prepare(sql).all(matchExpr, ...params, candidateWindow) as Array<
+    const rows = db.prepare(sql).all(matchExpr, ...params, windowLimit) as Array<
       Memory & { bm25_raw: number; age_days: number }
     >
 
@@ -498,10 +546,34 @@ export class MemoryDB {
     })
 
     blended.sort((a, b) => b.score - a.score)
-    const top = blended.slice(0, limit).map(b => b.row)
+    return blended
+  }
 
+  /**
+   * BM25 relevance path (OUTPUT). Ranks via the shared rankBm25 core over the
+   * generous candidate window (limit*5, min 50), slices to the output limit, applies
+   * the recall side-effects, and returns rows. Byte-identical to the pre-#10060816
+   * inline implementation (same window, blend, sort, slice, touchRecalled).
+   */
+  private recallBm25(db: any, agent: string, filter: RecallFilter, matchExpr: string, limit: number): Memory[] {
+    const candidateWindow = Math.max(limit * 5, 50)
+    const ranked = this.rankBm25(db, agent, filter, matchExpr, candidateWindow)
+    if (ranked.length === 0) return []
+    const top = ranked.slice(0, limit).map(b => b.row)
     this.touchRecalled(db, top.map(r => r.id))
     return top
+  }
+
+  /**
+   * SIDE-EFFECT-FREE BM25 id window for RRF fusion (#10060816). Returns up to K top
+   * BM25 ids in rank order WITHOUT touchRecalled — the fused output path applies the
+   * recall side-effects to the final `limit` ids only. Pulls a candidate window of at
+   * least K so the top-K is meaningful, and is DECOUPLED from the output limit (the
+   * whole point of the union-fusion fix).
+   */
+  private recallBm25Ids(db: any, agent: string, filter: RecallFilter, matchExpr: string, K: number): number[] {
+    const ranked = this.rankBm25(db, agent, filter, matchExpr, Math.max(K, 50))
+    return ranked.slice(0, K).map(b => b.row.id)
   }
 
   /**

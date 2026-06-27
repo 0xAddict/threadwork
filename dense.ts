@@ -34,6 +34,15 @@ export const DENSE_DIM = 384
 export const DENSE_TRUNC_CHARS = 2000
 export const DENSE_RRF_K = 60
 
+// #10060816 union-fusion hybrid: BM25 and dense top-K windows fed into RRF, BOTH
+// DECOUPLED from the output limit (so a semantic-only gold beyond the BM25 top-limit
+// is no longer double-counted out of the result). All config-overridable.
+export const DENSE_BM25_K = 50
+export const DENSE_DENSE_K = 50
+export const DENSE_RRF_K_ENV = 'TASKBOARD_DENSE_RRF_K'
+export const DENSE_BM25_K_ENV = 'TASKBOARD_DENSE_BM25_K'
+export const DENSE_DENSE_K_ENV = 'TASKBOARD_DENSE_DENSE_K'
+
 /**
  * Memoized read of the task-board server's env block from the on-disk mcp.json —
  * the authoritative, operator/Boss-gated source of truth. Located module-relatively
@@ -95,6 +104,25 @@ export function isDenseEnabled(): boolean {
 export function denseMode(): 'rrf' | 'dense' {
   return (resolveSetting(DENSE_MODE_ENV) ?? 'rrf').toLowerCase() === 'dense' ? 'dense' : 'rrf'
 }
+
+/**
+ * Positive-int setting via resolveSetting (process env first, else mcp.json), else
+ * the given default. REUSES the single _mcpEnv/resolveSetting cache from #10060814 —
+ * no second config reader. Non-numeric / non-positive values fall back to the default.
+ */
+function intSetting(key: string, dflt: number): number {
+  const raw = resolveSetting(key)
+  if (raw === undefined) return dflt
+  const n = Number.parseInt(raw, 10)
+  return Number.isFinite(n) && n > 0 ? n : dflt
+}
+
+/** RRF rank-bias constant k (#10060816). Config-overridable (TASKBOARD_DENSE_RRF_K); default 60. */
+export function denseRrfK(): number { return intSetting(DENSE_RRF_K_ENV, DENSE_RRF_K) }
+/** BM25 top-K id window fed into RRF, decoupled from output limit. Config-overridable; default 50. */
+export function denseBm25K(): number { return intSetting(DENSE_BM25_K_ENV, DENSE_BM25_K) }
+/** Dense top-K id window fed into RRF. Config-overridable; default 50. */
+export function denseDenseK(): number { return intSetting(DENSE_DENSE_K_ENV, DENSE_DENSE_K) }
 
 /** Where the int8 ONNX model + tokenizer cache lives (next to the DB). Override via env. */
 export function denseCacheDir(): string {

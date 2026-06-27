@@ -2,7 +2,8 @@
   "mcpServers": {
     "task-board": {
       "command": "bun",
-      "args": ["run", "/Users/coachstokes/.claude/mcp-servers/task-board/server.ts"]
+      "args": ["run", "/Users/coachstokes/.claude/mcp-servers/task-board/server.ts"],
+      "env": { "TASKBOARD_DENSE_RECALL": "on", "TASKBOARD_DENSE_MODE": "rrf", "TASKBOARD_DENSE_RRF_K": "10" }
     },
     "amazon-ads-mcp": {
       "command": "node",

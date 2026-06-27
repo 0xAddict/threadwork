@@ -180,3 +180,53 @@ test('(6b) flag ON but no vectors stored: degrades to BM25 base', async () => {
   const aug = await mem.recallAugmented(a, { query: 'pear', limit: 10 })
   expect(aug.map(m => m.id)).toEqual(base.map(m => m.id))
 })
+
+// ---- (7) BURIAL REGRESSION: union-fusion surfaces a semantic-only gold ---------
+// (#10060816) Fixture: 12 vectorized rows that DOMINATE BM25 (5x the query token,
+// short docs) + exactly 1 GOLD that is a WEAK BM25 hit (token once, long doc → BM25
+// rank 13, i.e. > limit) but is the TOP dense hit (vector == query). Pre-fix fused
+// `base`(BM25 top-limit) ∪ denseOrder(ALL): gold got only a single (dense) RRF
+// contribution and landed at fused pos 11 → sliced off. Post-fix fuses the decoupled
+// UNION (BM25 top-K_bm ∪ dense top-K_d): gold is in BOTH channels → surfaces in
+// top-limit. This test FAILS on pre-fix recallAugmented and PASSES on the fix.
+// (test (5) can't catch this: its BM25 base size < limit, so nothing is sliced off.)
+test('(7) burial regression: semantic-only gold (BM25 rank > limit) lands in fused top-limit', async () => {
+  const a = 'burialagent'
+  const limit = 10
+  const FILLERS = 12 // > limit, so the BM25 base window is full and the gold is sliced out pre-fix
+
+  // 12 fillers DOMINATE BM25 (5x token, short doc) but are dense-orthogonal to the query.
+  const fillerIds: number[] = []
+  for (let i = 0; i < FILLERS; i++) {
+    const m = mem.saveMemory({
+      agent: a,
+      content: `burialtoken burialtoken burialtoken burialtoken burialtoken row${i}`,
+      category: 'fact',
+    })
+    putVector(raw(), m.id, Float32Array.from([0, 1, 0, 0]), m.content) // cosine 0 to query
+    fillerIds.push(m.id)
+  }
+  // GOLD: WEAK BM25 hit (token once + long unrelated doc → ranks below all fillers,
+  // BM25 rank 13 > limit) but the TOP dense hit (vector == query → cosine 1).
+  const gold = mem.saveMemory({
+    agent: a,
+    content:
+      'burialtoken goldrow alpha beta gamma delta epsilon zeta eta theta iota kappa ' +
+      'lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega distinct',
+    category: 'fact',
+  })
+  putVector(raw(), gold.id, Float32Array.from([1, 0, 0, 0]), gold.content)
+  __setTestEmbedder(async () => [Float32Array.from([1, 0, 0, 0])]) // query embeds onto the gold
+
+  // Precondition: pure BM25 base buries the gold beyond the output limit.
+  const baseBm25 = mem.recallMemories(a, { query: 'burialtoken', limit })
+  expect(baseBm25.length).toBe(limit)
+  expect(baseBm25.map(m => m.id)).not.toContain(gold.id) // gold NOT in BM25 top-limit
+
+  // Post-fix: union-fusion (mode=rrf) surfaces the semantic-only gold into top-limit.
+  process.env[DENSE_FLAG_ENV] = 'on'
+  process.env[DENSE_MODE_ENV] = 'rrf'
+  const aug = await mem.recallAugmented(a, { query: 'burialtoken', limit })
+  expect(aug.length).toBe(limit)
+  expect(aug.map(m => m.id)).toContain(gold.id) // FAILS pre-fix (buried at pos 11), PASSES on the fix
+})
