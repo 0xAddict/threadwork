@@ -106,7 +106,10 @@ test('(4) flag OFF: recallAugmented == recallMemories (byte-identical ids)', asy
   mem.saveMemory({ agent: a, content: 'banana ripening curve', category: 'fact' })
   mem.saveMemory({ agent: a, content: 'grape vineyard pruning', category: 'fact' })
 
-  // flag unset (OFF)
+  // Force flag OFF explicitly. With the #10060814 mcp.json fallback, an UNSET flag
+  // no longer means OFF (it resolves from mcp.json, where the flag is now 'on'); so
+  // the "flag OFF == BM25" regression guard must force process.env to 'off'.
+  process.env[DENSE_FLAG_ENV] = 'off'
   const base = mem.recallMemories(a, { query: 'apple', limit: 10 })
   const aug = await mem.recallAugmented(a, { query: 'apple', limit: 10 })
   expect(aug.map(m => m.id)).toEqual(base.map(m => m.id))
@@ -131,6 +134,10 @@ test('(5) flag ON: dense surfaces a semantic hit BM25 missed, keeps the BM25 hit
   expect(bm25.map(m => m.id)).not.toContain(m3.id)
 
   process.env[DENSE_FLAG_ENV] = 'on'
+  // Pin mode=rrf: this test verifies RRF augmentation specifically. With the
+  // #10060814 mcp.json fallback an unset mode would resolve to mcp.json's 'dense'
+  // and silently stop exercising RRF — pin it so the guard stays real.
+  process.env[DENSE_MODE_ENV] = 'rrf'
   const aug = await mem.recallAugmented(a, { query: 'apple', limit: 10 })
   const ids = aug.map(m => m.id)
   expect(ids).toContain(m1.id)  // BM25 hit retained (never replaced)

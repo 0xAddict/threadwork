@@ -23,6 +23,7 @@
  * so this file (and the server) load fine even if `fastembed` is absent or the
  * flag is OFF.
  */
+import { readFileSync } from 'fs'
 import { dirname, join } from 'path'
 import { DB_PATH } from './config'
 
@@ -33,14 +34,66 @@ export const DENSE_DIM = 384
 export const DENSE_TRUNC_CHARS = 2000
 export const DENSE_RRF_K = 60
 
-/** Dense recall is OFF unless explicitly enabled. Default OFF until validated + Boss-gated deploy. */
-export function isDenseEnabled(): boolean {
-  return (process.env[DENSE_FLAG_ENV] ?? '').toLowerCase() === 'on'
+/**
+ * Memoized read of the task-board server's env block from the on-disk mcp.json —
+ * the authoritative, operator/Boss-gated source of truth. Located module-relatively
+ * (next to the DB, which is anchored on $HOME — NOT cwd), so this is cwd-independent.
+ * Read ONCE and cached: a /mcp reconnect respawns the module (fresh code → fresh
+ * cache), which is exactly the intended deploy boundary. Fail-safe: any missing or
+ * invalid mcp.json yields an empty env (today's safe defaults).
+ */
+let _mcpEnv: Record<string, string> | null = null
+function mcpJsonEnv(): Record<string, string> {
+  if (_mcpEnv !== null) return _mcpEnv
+  _mcpEnv = {}
+  try {
+    const cfg = JSON.parse(readFileSync(join(dirname(DB_PATH), 'mcp.json'), 'utf-8'))
+    const env = cfg?.mcpServers?.['task-board']?.env
+    if (env && typeof env === 'object') _mcpEnv = env as Record<string, string>
+  } catch {
+    /* no/invalid mcp.json → empty env (safe default, byte-identical to pre-fix) */
+  }
+  return _mcpEnv
 }
 
-/** Live blend mode. 'rrf' (default) fuses BM25 ∪ dense (augment, never replaces). 'dense' = pure dense ranking. */
+/**
+ * Resolve a TASKBOARD_* setting with the #10060814 fallback chain:
+ *   1. process.env[key] (non-empty) — primary (a /mcp reconnect's cached env, or a
+ *      full-restart's fresh env). An explicit value here always wins.
+ *   2. else the on-disk mcp.json task-board env block — authoritative config.
+ *
+ * Why the on-disk fallback: a Claude Code `/mcp` reconnect respawns FRESH CODE but
+ * REUSES the cached env captured at SESSION-START. A session that started before a
+ * setting was added to mcp.json would otherwise run without it (e.g. dense silently
+ * OFF → pure BM25; the exact production symptom). Reading the authoritative on-disk
+ * mcp.json as a fallback makes a cheap /mcp reconnect — not a heavyweight full
+ * session restart — sufficient to pick the setting up.
+ */
+function resolveSetting(key: string): string | undefined {
+  const fromEnv = process.env[key]
+  if (fromEnv !== undefined && fromEnv !== '') return fromEnv
+  return mcpJsonEnv()[key]
+}
+
+/**
+ * Dense recall is OFF unless explicitly enabled. Default OFF until validated +
+ * Boss-gated deploy. Resolves TASKBOARD_DENSE_RECALL via resolveSetting (process env
+ * first, else mcp.json). An explicit process-env 'off' still wins (force-disable),
+ * since it is returned as a non-empty value and is simply not 'on'.
+ */
+export function isDenseEnabled(): boolean {
+  return (resolveSetting(DENSE_FLAG_ENV) ?? '').toLowerCase() === 'on'
+}
+
+/**
+ * Live blend mode. CODE DEFAULT is 'rrf' (augment: fuse BM25 ∪ dense, never replaces);
+ * 'dense' = pure dense ranking (the validated arm). Resolves TASKBOARD_DENSE_MODE via
+ * resolveSetting (process env first, else mcp.json), then falls back to the 'rrf' code
+ * default. NOTE (#10060814): dense mode is turned on ONLY via config — the code default
+ * intentionally stays 'rrf' (a later Option B may flip the code default to hybrid).
+ */
 export function denseMode(): 'rrf' | 'dense' {
-  return (process.env[DENSE_MODE_ENV] ?? 'rrf').toLowerCase() === 'dense' ? 'dense' : 'rrf'
+  return (resolveSetting(DENSE_MODE_ENV) ?? 'rrf').toLowerCase() === 'dense' ? 'dense' : 'rrf'
 }
 
 /** Where the int8 ONNX model + tokenizer cache lives (next to the DB). Override via env. */
@@ -107,20 +160,34 @@ export function rrfFuse(rankings: number[][], k: number = DENSE_RRF_K): number[]
 type Embedder = { embed: (texts: string[], batch?: number) => AsyncGenerator<number[][]> }
 let _embedderPromise: Promise<Embedder> | null = null
 
+let _denseInitLogged = false
 /** Lazy singleton fastembed embedder (int8 bge-small). Throws if fastembed/onnxruntime unavailable. */
 export async function getEmbedder(): Promise<Embedder> {
   if (!_embedderPromise) {
     _embedderPromise = (async () => {
       // Dynamic import: a flag-OFF server never touches fastembed/onnxruntime-node.
       const { FlagEmbedding, EmbeddingModel } = (await import('fastembed')) as any
-      return (await FlagEmbedding.init({
+      const embedder = (await FlagEmbedding.init({
         model: EmbeddingModel.BGESmallENV15, // qdrant onnx-q int8 model_optimized.onnx, 384-dim
         cacheDir: denseCacheDir(),
         maxLength: 512,
         showDownloadProgress: false,
       })) as Embedder
+      // One-time success breadcrumb on stderr (safe for stdio MCP) so future canaries
+      // can confirm dense actually initialized rather than silently degrading.
+      if (!_denseInitLogged) {
+        _denseInitLogged = true
+        console.error(`[task-board] dense init OK — ${DENSE_MODEL_ID}, cacheDir=${denseCacheDir()}`)
+      }
+      return embedder
     })().catch((err) => {
       _embedderPromise = null // allow retry on a later call
+      // #10060814: NEVER swallow silently again. Surface the FULL reason dense
+      // degraded to BM25 (this catch previously hid the only signal of a degrade).
+      console.error(
+        `[task-board] dense init FAILED — degrading to BM25 (cacheDir=${denseCacheDir()}, cwd=${process.cwd()}):\n`,
+        (err as Error)?.stack ?? err,
+      )
       throw err
     })
   }
