@@ -66,3 +66,8 @@ system/secrets.env
 system/**/.env
 system/**/*.token
 system/**/access.json
+
+# transient caches / config backups / archives (backup-push hygiene, Gwei TG 7392)
+.fastembed_cache/
+mcp.json.bak-*
+.harness-archive-*/
