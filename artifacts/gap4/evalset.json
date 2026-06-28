@@ -1,0 +1,872 @@
+[
+  {
+    "qid": "SP-A01",
+    "query": "what's the takeaway from building a separate google sheet watcher to catch fresh sign-ups when the reservation system could already alert us directly?",
+    "gold_ids": [
+      14
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A01",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-A02",
+    "query": "in the unreleased always-on assistant mode, when a terminal command runs long enough that it would stall the developer, is it killed outright or just pushed into the background?",
+    "gold_ids": [
+      111
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A02",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-A03",
+    "query": "what's that leaked Claude Code capability that tidies and merges saved notes across sessions, the way sleep is said to clean up the brain?",
+    "gold_ids": [
+      112
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A03",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-A04",
+    "query": "which fields can a PreToolUse hook read from the event it's handed \u2014 does it include the child-agent identifier?",
+    "gold_ids": [
+      234
+    ],
+    "recall_agent": "snoopy",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A04",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-A05",
+    "query": "which of our Two8 web addresses is the real storefront we push search rankings for, versus the one that only exists to send mail?",
+    "gold_ids": [
+      284
+    ],
+    "recall_agent": "boss",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A05",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-A06",
+    "query": "the write-up on how a bot read a loose 'just take care of it' instruction as license to set up an unattended recurring job that wrecked the ad account \u2014 what was the underlying cause?",
+    "gold_ids": [
+      290
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A06",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-A07",
+    "query": "when I'm asked to check on what another agent is currently doing, is looking at the board sufficient or should I also inspect their live terminal?",
+    "gold_ids": [
+      298
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A07",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-A08",
+    "query": "why would a spawned helper claim it succeeded saving into a restricted directory while the file never actually lands on disk?",
+    "gold_ids": [
+      545
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 0.5,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A08",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-A09",
+    "query": "what were the underlying causes behind agents getting wrongly flagged as not-running and then missing their wake-up messages even though their sessions were alive?",
+    "gold_ids": [
+      373
+    ],
+    "recall_agent": "sadie",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A09",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-A10",
+    "query": "what made it so only the most recently launched agent could use Telegram while the earlier ones went silent, and what resolved it?",
+    "gold_ids": [
+      472
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A10",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-A11",
+    "query": "when I need a teammate to actually take action on something, is firing off a quick ping enough, or do I have to log it somewhere formal so it surfaces for them?",
+    "gold_ids": [
+      226
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A11",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-A12",
+    "query": "the genuine GitHub command-line tool keeps erroring out with a type error \u2014 could a second conflicting install be shadowing it on the PATH?",
+    "gold_ids": [
+      730
+    ],
+    "recall_agent": "kiera",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:A12",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B01",
+    "query": "scheduled background job garbles text with odd spacing even though the exact same script parses fine when I run it by hand in my terminal",
+    "gold_ids": [
+      2211
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B01",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B02",
+    "query": "my always-on service can't find the helper command-line tools it calls once the OS launches it automatically at boot \u2014 what's the correct way to architect it",
+    "gold_ids": [
+      2198
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B02",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B03",
+    "query": "is it safe to give a temporary throwaway test record in the task table a made-up huge number for its key, or could that confuse the data mirroring",
+    "gold_ids": [
+      2158
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B03",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B04",
+    "query": "I need to auto-dismiss a browser security consent popup but normal page-driving automation can't touch it \u2014 any workaround",
+    "gold_ids": [
+      1677
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B04",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B05",
+    "query": "preferred way to pull messages and supplier invoices out of the company mailbox without resorting to clicking around in a browser",
+    "gold_ids": [
+      2499
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B05",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B06",
+    "query": "where is the credential stored for our cold-outreach email sending platform, and does the lapsed subscription stop the API from working",
+    "gold_ids": [
+      2528
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B06",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B07",
+    "query": "which provider hosts the shared inbox the agents send mail from, and what are the daily and monthly send caps",
+    "gold_ids": [
+      2171
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B07",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B08",
+    "query": "can we wire up an automated server-side model call inside the booking site so it generates the briefs for us instead of an agent doing it",
+    "gold_ids": [
+      2536
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B08",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B09",
+    "query": "a worker reported that it copied a file into place but the file isn't actually there and no error was ever shown \u2014 what causes this",
+    "gold_ids": [
+      545
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 0.5,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B09",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B10",
+    "query": "if I merge a change to the booking dashboard repo, does it publish to production on its own or do I have to run the deploy myself",
+    "gold_ids": [
+      1295
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B10",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B11",
+    "query": "I nudged a teammate and got back a scary retry-failure warning \u2014 should I assume my message never actually reached them",
+    "gold_ids": [
+      1111
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B11",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-B12",
+    "query": "which folder holds the real running threadwork codebase versus the stale lookalike copies I should never benchmark against",
+    "gold_ids": [
+      2565
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:B12",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C01",
+    "query": "my hook pipes JSON into a python snippet but the script ends up reading its own code instead of the data, why",
+    "gold_ids": [
+      610
+    ],
+    "recall_agent": "snoopy",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C01",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C02",
+    "query": "what made the board throw a type error when someone added an unassigned card to the backlog column",
+    "gold_ids": [
+      1226
+    ],
+    "recall_agent": "sadie",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C02",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C03",
+    "query": "can someone pull our store's real customer names and addresses by hitting an endpoint with no token",
+    "gold_ids": [
+      2077
+    ],
+    "recall_agent": "snoopy",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C03",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C04",
+    "query": "Stokes's standing rule that every project writeup should spell out what it is, why it matters, and the payoff",
+    "gold_ids": [
+      2469
+    ],
+    "recall_agent": "boss",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C04",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C05",
+    "query": "where should a sub-agent put generated report files so the mac doesn't garbage-collect them after a few days",
+    "gold_ids": [
+      1497
+    ],
+    "recall_agent": "boss",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C05",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C06",
+    "query": "automating the booking site, the inputs look filled but clicking submit just hangs and never posts, what's going on",
+    "gold_ids": [
+      1058
+    ],
+    "recall_agent": "snoopy",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C06",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C07",
+    "query": "which ad campaigns are off for good and should never be suggested as candidates to switch back on",
+    "gold_ids": [
+      1382
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C07",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C08",
+    "query": "the two separate database tables that split ad-strategy ideas still awaiting a yes-or-no from ones already approved but not yet pushed",
+    "gold_ids": [
+      1346
+    ],
+    "recall_agent": "shared",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C08",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C09",
+    "query": "for medium-sized jobs does Gwei want his custom build-and-verify workflow or the built-in superpower skills",
+    "gold_ids": [
+      492
+    ],
+    "recall_agent": "boss",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C09",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C10",
+    "query": "the runbook for getting the GAM command-line tool working against Google Workspace, including which admin permissions the setup account needs",
+    "gold_ids": [
+      1827
+    ],
+    "recall_agent": "kiera",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C10",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C11",
+    "query": "what's the name on our Facebook advertising account and which single campaign is running all the spend right now",
+    "gold_ids": [
+      2477
+    ],
+    "recall_agent": "steve",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C11",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "SP-C12",
+    "query": "which file on the machine is the canonical Two8 growth and go-to-market roadmap to cite for outreach strategy questions",
+    "gold_ids": [
+      2530
+    ],
+    "recall_agent": "sadie",
+    "stratum": "semantic-paraphrase",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2a:C12",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "BR-A12",
+    "query": "the genuine GitHub command-line tool gh keeps erroring out with a type error \u2014 could a second conflicting install be shadowing it on the PATH?",
+    "gold_ids": [
+      730
+    ],
+    "recall_agent": "kiera",
+    "stratum": "brand-bearing",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2b-brand:A12",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "BR-B01",
+    "query": "scheduled launchd background job garbles text with odd spacing even though the exact same script parses fine when I run it by hand in my terminal",
+    "gold_ids": [
+      2211
+    ],
+    "recall_agent": "shared",
+    "stratum": "brand-bearing",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2b-brand:B01",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "BR-B02",
+    "query": "my always-on launchd service can't find the helper command-line tools it calls once the OS launches it automatically at boot \u2014 what's the correct way to architect it",
+    "gold_ids": [
+      2198
+    ],
+    "recall_agent": "shared",
+    "stratum": "brand-bearing",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2b-brand:B02",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "BR-B05",
+    "query": "preferred way to pull messages and supplier invoices out of the company Gmail / Google Workspace mailbox without resorting to clicking around in a browser",
+    "gold_ids": [
+      2499
+    ],
+    "recall_agent": "shared",
+    "stratum": "brand-bearing",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2b-brand:B05",
+    "overlap_bucket": "med"
+  },
+  {
+    "qid": "BR-B06",
+    "query": "where is the credential stored for our cold-outreach email sending platform Smartlead, and does the lapsed subscription stop the API from working",
+    "gold_ids": [
+      2528
+    ],
+    "recall_agent": "shared",
+    "stratum": "brand-bearing",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2b-brand:B06",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "BR-B08",
+    "query": "can we wire up an automated server-side model call inside the booking site on Netlify so it generates the briefs for us instead of an agent doing it",
+    "gold_ids": [
+      2536
+    ],
+    "recall_agent": "shared",
+    "stratum": "brand-bearing",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2b-brand:B08",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "BR-B10",
+    "query": "if I merge a change to the booking dashboard repo, does it publish to production on Netlify on its own or do I have to run the netlify deploy myself",
+    "gold_ids": [
+      1295
+    ],
+    "recall_agent": "shared",
+    "stratum": "brand-bearing",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "kiera-stage2b-brand:B10",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "KW-camo",
+    "gold_ids": [
+      1382
+    ],
+    "recall_agent": "shared",
+    "query": "Camo SD SP-PAT-COMPETITOR campaign 435425421867687 PAUSED PERMANENTLY do not unpause",
+    "stratum": "keyword-exact",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "gap4-authored-keyword",
+    "overlap_bucket": "high"
+  },
+  {
+    "qid": "KW-smartlead",
+    "gold_ids": [
+      2528
+    ],
+    "recall_agent": "shared",
+    "query": "smartlead-key-persisted SMARTLEAD_API_KEY ~/.claude/.env expired trial",
+    "stratum": "keyword-exact",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "gap4-authored-keyword",
+    "overlap_bucket": "high"
+  },
+  {
+    "qid": "KW-amazon",
+    "gold_ids": [
+      1327
+    ],
+    "recall_agent": "shared",
+    "query": "Amazon Ads SP campaigns PROFILE 1592800217706640 vnd.spcampaign.v3 ENABLED write API",
+    "stratum": "keyword-exact",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "gap4-authored-keyword",
+    "overlap_bucket": "high"
+  },
+  {
+    "qid": "KW-trello",
+    "gold_ids": [
+      1730
+    ],
+    "recall_agent": "shared",
+    "query": "Trello Agent Taskboard board_id 69fb292 attachment cap MCP claude_ai_tasks-MCP",
+    "stratum": "keyword-exact",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "gap4-authored-keyword",
+    "overlap_bucket": "high"
+  },
+  {
+    "qid": "KW-tts",
+    "gold_ids": [
+      18
+    ],
+    "recall_agent": "shared",
+    "query": "ElevenLabs voice persona Telegram TTS Boss Steve Kiera Sadie",
+    "stratum": "keyword-exact",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "gap4-authored-keyword",
+    "overlap_bucket": "high"
+  },
+  {
+    "qid": "KW-kairos",
+    "gold_ids": [
+      66
+    ],
+    "recall_agent": "shared",
+    "query": "Kairos Productivity Monitor kairos-monitor.sh daemon /Users/coachstokes/bin",
+    "stratum": "keyword-exact",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "gap4-authored-keyword",
+    "overlap_bucket": "high"
+  },
+  {
+    "qid": "KW-gh",
+    "gold_ids": [
+      730
+    ],
+    "recall_agent": "kiera",
+    "query": "gh CLI .volta/bin/gh PATH two binaries broken type error",
+    "stratum": "keyword-exact",
+    "weight": 1.0,
+    "distractor_ids": [],
+    "source": "gap4-authored-keyword",
+    "overlap_bucket": "high"
+  },
+  {
+    "qid": "ADV-domains",
+    "query": "which of our web addresses is the real storefront we push search rankings for, versus the one that only exists to send mail?",
+    "gold_ids": [
+      284
+    ],
+    "recall_agent": "boss",
+    "stratum": "adversarial-distractor",
+    "weight": 1.0,
+    "distractor_ids": [
+      1597,
+      2303
+    ],
+    "distractor_justification": [
+      {
+        "id": 1597,
+        "mined_dense_rank": 2,
+        "why_irrelevant": "operational email-ROUTING fact (xavier@repthea.com ownership) \u2014 about an email address, not which Two8 DOMAIN is the SEO storefront vs mail-only"
+      },
+      {
+        "id": 2303,
+        "mined_dense_rank": 10,
+        "why_irrelevant": "Google Workspace topology fact \u2014 email/domain infra adjacent but does NOT state which domain is the primary SEO storefront vs mail-only"
+      }
+    ],
+    "source": "gap4-authored-adversarial",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "ADV-smartlead-cred",
+    "query": "where is the API credential stored for our cold-outreach email sending platform, and does the lapsed subscription stop the API from working?",
+    "gold_ids": [
+      2528
+    ],
+    "recall_agent": "shared",
+    "stratum": "adversarial-distractor",
+    "weight": 1.0,
+    "distractor_ids": [
+      1308,
+      2536,
+      1675
+    ],
+    "distractor_justification": [
+      {
+        "id": 1308,
+        "mined_dense_rank": 1,
+        "why_irrelevant": "GMAIL credential digest-silence root cause \u2014 a DIFFERENT credential/system (Gmail), not the Smartlead cold-outreach API key"
+      },
+      {
+        "id": 2536,
+        "mined_dense_rank": 8,
+        "why_irrelevant": "infra-constraint: no LLM/model API key in Netlify \u2014 a different missing credential entirely"
+      },
+      {
+        "id": 1675,
+        "mined_dense_rank": 12,
+        "why_irrelevant": "generic credential-HYGIENE rule (don't echo passwords) \u2014 not where the Smartlead key is stored"
+      }
+    ],
+    "source": "gap4-authored-adversarial",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "ADV-campaign-off",
+    "query": "which ad campaign is permanently switched off for good and must never be suggested to turn back on?",
+    "gold_ids": [
+      1382
+    ],
+    "recall_agent": "shared",
+    "stratum": "adversarial-distractor",
+    "weight": 1.0,
+    "distractor_ids": [
+      1346,
+      1344,
+      1327
+    ],
+    "distractor_justification": [
+      {
+        "id": 1346,
+        "mined_dense_rank": 4,
+        "why_irrelevant": "Two8 ads 'pending' two-table mental model \u2014 ad-domain adjacent, not the permanently-paused campaign"
+      },
+      {
+        "id": 1344,
+        "mined_dense_rank": 11,
+        "why_irrelevant": "May SP campaigns PARKED for human pickup (do not flag broken) \u2014 parked/transient, NOT 'permanently off forever'"
+      },
+      {
+        "id": 1327,
+        "mined_dense_rank": 14,
+        "why_irrelevant": "Amazon Ads write API ENABLE shapes \u2014 about ENABLING campaigns, the opposite of the permanently-off rule"
+      }
+    ],
+    "source": "gap4-authored-adversarial",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "ADV-gh-path",
+    "query": "the genuine GitHub command-line tool keeps erroring with a type error \u2014 could a second conflicting install be shadowing it on the PATH?",
+    "gold_ids": [
+      730
+    ],
+    "recall_agent": "kiera",
+    "stratum": "adversarial-distractor",
+    "weight": 1.0,
+    "distractor_ids": [
+      1295,
+      718,
+      2565
+    ],
+    "distractor_justification": [
+      {
+        "id": 1295,
+        "mined_dense_rank": 7,
+        "why_irrelevant": "two8-book dashboard repo paths/Netlify \u2014 a github REPO fact, not the gh-binary PATH-shadowing gotcha"
+      },
+      {
+        "id": 718,
+        "mined_dense_rank": 9,
+        "why_irrelevant": "two8-book canonical DEPLOY path \u2014 deploy/path adjacent, not the duplicate-gh-binary issue"
+      },
+      {
+        "id": 2565,
+        "mined_dense_rank": 12,
+        "why_irrelevant": "canonical threadwork repo path/remote \u2014 repo path fact, not the gh CLI shadowing"
+      }
+    ],
+    "source": "gap4-authored-adversarial",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "ADV-launchd-locale",
+    "query": "my scheduled background job garbles text with odd spacing even though the exact same script parses fine when I run it by hand?",
+    "gold_ids": [
+      2211
+    ],
+    "recall_agent": "shared",
+    "stratum": "adversarial-distractor",
+    "weight": 1.0,
+    "distractor_ids": [
+      340,
+      1303
+    ],
+    "distractor_justification": [
+      {
+        "id": 340,
+        "mined_dense_rank": 2,
+        "why_irrelevant": "watchdog/heartbeat rewrite decision \u2014 scheduled/daemon adjacent, not the launchd C-locale multibyte-whitespace cause"
+      },
+      {
+        "id": 1303,
+        "mined_dense_rank": 12,
+        "why_irrelevant": "Netlify Scheduled Functions silently throttled on free tier \u2014 a different scheduled-job problem and cause"
+      }
+    ],
+    "source": "gap4-authored-adversarial",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "ADV-team-email",
+    "query": "what is the shared email inbox address the agent team sends and receives mail from?",
+    "gold_ids": [
+      2171
+    ],
+    "recall_agent": "shared",
+    "stratum": "adversarial-distractor",
+    "weight": 1.0,
+    "distractor_ids": [
+      2474,
+      1597,
+      375
+    ],
+    "distractor_justification": [
+      {
+        "id": 2474,
+        "mined_dense_rank": 2,
+        "why_irrelevant": "shared TELEGRAM bot mapping \u2014 a shared-comms identity fact but Telegram, not the team EMAIL inbox"
+      },
+      {
+        "id": 1597,
+        "mined_dense_rank": 3,
+        "why_irrelevant": "xavier@repthea.com belongs to GweiSprayer ONLY \u2014 an email-ownership fact, explicitly NOT the team inbox"
+      },
+      {
+        "id": 375,
+        "mined_dense_rank": 5,
+        "why_irrelevant": "GweiSprayer's email for test sends/redirects \u2014 a person's email, not the team's shared inbox"
+      }
+    ],
+    "source": "gap4-authored-adversarial",
+    "overlap_bucket": "low"
+  },
+  {
+    "qid": "ADV-no-llm-key",
+    "query": "can the booking website call an LLM model server-side to generate briefs, or is there simply no model API key available to it?",
+    "gold_ids": [
+      2536
+    ],
+    "recall_agent": "shared",
+    "stratum": "adversarial-distractor",
+    "weight": 1.0,
+    "distractor_ids": [
+      131,
+      14
+    ],
+    "distractor_justification": [
+      {
+        "id": 131,
+        "mined_dense_rank": 2,
+        "why_irrelevant": "pre-call-brief role/workflow instruction \u2014 about who writes briefs, not whether a model API key exists for the site"
+      },
+      {
+        "id": 14,
+        "mined_dense_rank": 3,
+        "why_irrelevant": "two8-book booking system webhook-settings note \u2014 booking-site adjacent, does not address LLM/model API key availability"
+      }
+    ],
+    "source": "gap4-authored-adversarial",
+    "overlap_bucket": "low"
+  }
+]
