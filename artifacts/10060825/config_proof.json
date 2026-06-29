@@ -1,0 +1,9 @@
+{
+  "isDenseEnabled": true,
+  "denseMode": "rrf",
+  "denseRrfK": 5,
+  "denseBm25K": 50,
+  "denseDenseK": 50,
+  "vectorsPresent": true,
+  "recall_limit": 12
+}
