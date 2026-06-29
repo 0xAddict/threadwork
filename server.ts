@@ -28,6 +28,13 @@ import { MemoryDB } from './memory'
 import { isDenseEnabled } from './dense'
 import { DecisionDB, expireStaleDecisions } from './decision'
 import { forceDebrief } from './debrief'
+import {
+  DELEGATION_BRIEFS_FLAG,
+  assembleDelegationBrief,
+  buildExplicitBrief,
+  DelegationBriefTooLargeError,
+  type DelegationBrief,
+} from './delegation-brief'
 import { AuditLog } from './audit'
 import { MemoryConsolidator } from './consolidator'
 
@@ -128,6 +135,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           description: { type: 'string', description: 'What needs to be done' },
           priority: { type: 'string', enum: ['low', 'normal', 'high', 'urgent'], description: 'Task priority (default: normal)' },
           parent_task_id: { type: 'number', description: 'Optional parent task ID to create a child task' },
+          brief: { type: 'string', description: 'Optional curated delegation brief — a FILTERED SUBSET of relevant facts/constraints for the delegatee (NOT a full context dump). Only used when the delegation_briefs feature is enabled; otherwise ignored. If omitted while the feature is enabled, a curated brief is auto-assembled from relevant memories + parent context.' },
           heartbeat_timeout_sec: { type: 'number', description: `Seconds before heartbeat is considered overdue (default: 120)` },
           progress_timeout_sec: { type: 'number', description: `Seconds before progress is considered stale (default: 600)` },
         },
@@ -736,6 +744,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const description = args.description as string
         const priority = (args.priority as string) ?? 'normal'
         const parentTaskId = args.parent_task_id as number | undefined
+        const explicitBrief = args.brief as string | undefined
         const heartbeatTimeoutSec = args.heartbeat_timeout_sec as number | undefined
         const progressTimeoutSec = args.progress_timeout_sec as number | undefined
 
@@ -758,6 +767,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         try {
+          // P3 (#10060822): curated delegation brief. Entirely gated by the default-OFF
+          // `delegation_briefs_enabled` flag, so with the flag OFF this whole block is a
+          // no-op — no recall() call, no brief, NULL column, unchanged nudge → the
+          // delegation is byte-for-byte identical to pre-P3 (AC-5). Explicit brief wins;
+          // otherwise auto-assemble (relevance-gated → may be none for self-contained tasks).
+          let brief: DelegationBrief | null = null
+          if (db.isFeatureEnabled(DELEGATION_BRIEFS_FLAG)) {
+            if (explicitBrief && explicitBrief.trim().length > 0) {
+              brief = buildExplicitBrief(explicitBrief) // throws if it exceeds the anti-dump cap (AC-8)
+            } else {
+              brief = await assembleDelegationBrief(mem, db, {
+                from: SELF_LABEL,
+                taskDescription: description,
+                parentTaskId,
+              })
+            }
+          }
+
           const task = db.delegateTask({
             from: SELF_LABEL,
             to,
@@ -767,9 +794,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             parent_task_id: parentTaskId,
             heartbeat_timeout_sec: heartbeatTimeoutSec,
             progress_timeout_sec: progressTimeoutSec,
+            delegation_brief: brief?.text ?? null,
           })
 
-          const nudgeMsg = `You have a new delegated task (#${task.id}) from ${SELF_LABEL}. Run list_tasks(filter="mine") for details.`
+          // Surfacing pointer (PC-4): keep the nudge small; the full brief is shown on
+          // claim_task / list_tasks / boot. No brief ⇒ unchanged nudge (AC-5).
+          const briefHint = brief ? ' A curated delegation brief is attached (shown when you claim_task).' : ''
+          const nudgeMsg = `You have a new delegated task (#${task.id}) from ${SELF_LABEL}. Run list_tasks(filter="mine") for details.${briefHint}`
           const [nudgeResult] = await Promise.all([
             dispatchAgentNudge(to, nudgeMsg, { source: SELF_LABEL }),
             postToGroup(formatTaskCreated(task)),
@@ -780,12 +811,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             parent_task_id: parentTaskId ?? null,
             heartbeat_timeout_sec: task.heartbeat_timeout_sec,
             progress_timeout_sec: task.progress_timeout_sec,
+            // Audit the brief only when one was produced (AC-7); absent ⇒ identical payload (AC-5).
+            ...(brief ? { delegation_brief_mode: brief.mode, delegation_brief_bytes: brief.bytes } : {}),
           }, task.id)
 
           const nudgeWarning = nudgeResult.ok ? '' : ` (warning: nudge failed — ${nudgeResult.error})`
           const parentInfo = parentTaskId ? ` (child of #${parentTaskId})` : ''
-          return { content: [{ type: 'text', text: `Task #${task.id} delegated to ${to}${parentInfo}. Supervisor: ${SELF_LABEL}. Next check: ${task.next_check_at}.${nudgeWarning}` }] }
+          const briefNote = brief ? ` Delegation brief attached (${brief.bytes}B${brief.mode === 'auto' ? `, ${brief.memoryIds.length} memories` : ', explicit'}).` : ''
+          return { content: [{ type: 'text', text: `Task #${task.id} delegated to ${to}${parentInfo}. Supervisor: ${SELF_LABEL}. Next check: ${task.next_check_at}.${briefNote}${nudgeWarning}` }] }
         } catch (err: any) {
+          if (err instanceof DelegationBriefTooLargeError) {
+            return { content: [{ type: 'text', text: `Delegation rejected: ${err.message}`, isError: true }] }
+          }
           return { content: [{ type: 'text', text: `Delegation failed: ${err.message}`, isError: true }] }
         }
       }
@@ -811,7 +848,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         await postToGroupThreaded(formatTaskClaimed(task), task.id)
         audit.log(SELF_LABEL, 'task_claimed', { task_id: taskId, session_id: sessionId ?? agentSession ?? null }, taskId)
-        return { content: [{ type: 'text', text: `Claimed task #${task.id}: ${task.description}` }] }
+        // P3 (#10060822): surface the curated delegation brief to the delegatee on claim
+        // (PC-4/AC-6). Flag-gated + brief-present ⇒ when OFF (or no brief) output is identical.
+        const claimBrief = (db.isFeatureEnabled(DELEGATION_BRIEFS_FLAG) && task.delegation_brief)
+          ? `\n\n${task.delegation_brief}`
+          : ''
+        return { content: [{ type: 'text', text: `Claimed task #${task.id}: ${task.description}${claimBrief}` }] }
       }
 
       case 'complete_task': {
@@ -934,9 +976,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: 'No tasks found.' }] }
         }
 
-        const lines = tasks.map(
-          (t) => `#${t.id} [${t.status}] ${t.from_agent}→${t.to_agent}: ${t.description}${t.result ? ` | Result: ${t.result}` : ''}`,
-        )
+        // P3 (#10060822): render the curated brief CONTENT in the list so it is visible to
+        // the delegatee (PC-4/AC-6), not merely a pointer. The brief is byte-capped (<=8KB).
+        // Flag-gated ⇒ when OFF the line is byte-identical to pre-P3 (AC-5).
+        const briefsOn = db.isFeatureEnabled(DELEGATION_BRIEFS_FLAG)
+        const lines = tasks.map((t) => {
+          const base = `#${t.id} [${t.status}] ${t.from_agent}→${t.to_agent}: ${t.description}${t.result ? ` | Result: ${t.result}` : ''}`
+          return (briefsOn && t.delegation_brief) ? `${base}\n${t.delegation_brief}` : base
+        })
         return { content: [{ type: 'text', text: lines.join('\n') }] }
       }
 
@@ -1085,6 +1132,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         if (briefing.recentTasks.length > 0) {
           sections.push('== RECENT TASKS ==\n' + briefing.recentTasks.map(t => `#${t.id} ${t.description} → ${t.result}`).join('\n'))
+        }
+        // P3 (#10060822): surface curated briefs for the agent's open delegated tasks at
+        // boot (PC-4/AC-6). Flag-gated ⇒ OFF leaves the boot output byte-identical (AC-5).
+        if (db.isFeatureEnabled(DELEGATION_BRIEFS_FLAG)) {
+          const openBriefs = db.getActiveDelegationBriefs(SELF_LABEL)
+          if (openBriefs.length > 0) {
+            sections.push(
+              '== DELEGATION BRIEFS (your open delegated tasks) ==\n' +
+                openBriefs.map(b => `#${b.id} ${b.description}\n${b.delegation_brief}`).join('\n\n'),
+            )
+          }
         }
 
         audit.log(SELF_LABEL, 'boot_briefing', {

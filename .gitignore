@@ -54,6 +54,9 @@ bin/*.bak-*
 skills/**/*.placeholder-bak-*
 *.placeholder-bak-*
 
+# Eval raw memory dumps — NEVER commit (anti-dump hygiene; #10060825 memdump.json leak @637ace1)
+artifacts/**/memdump.json
+
 # system/ backup namespace — guard against accidental secret/runtime leakage.
 # (Curated structure files are added explicitly; these patterns block the rest.)
 system/**/*.bak
@@ -71,3 +74,8 @@ system/**/access.json
 .fastembed_cache/
 mcp.json.bak-*
 .harness-archive-*/
+
+# P3 study raw dumps — memory row-content, NEVER commit/push (boss, post-Stage-2a memdump leak)
+artifacts/10060825/memdump.json
+artifacts/10060825/sample.json
+artifacts/10060825/per_instance.json

@@ -1,5 +1,9 @@
 import { Database } from 'bun:sqlite'
 import { DB_PATH, SUPERVISION_DEFAULTS, UNCLAIMED_CHECK_SEC } from './config'
+// P3 (#10060822): anti-dump byte cap, enforced here too so a DIRECT db.delegateTask
+// caller cannot persist an over-cap brief that bypassed the server-layer guard.
+// delegation-brief.ts has only type-only imports back ⇒ no runtime import cycle.
+import { BRIEF_MAX_BYTES, byteLen } from './delegation-brief'
 
 export interface Task {
   id: number
@@ -69,6 +73,11 @@ export interface Task {
   // leave it NULL. `complete_task` on a CARD row routes to 'review' (human
   // [Accept] gate) instead of jumping to 'completed'. See isCardLifecycleRow().
   complexity_user: string | null
+  // P3 (#10060822): curated, bookended delegation brief handed to the delegatee at
+  // delegation time. NULL for every task created with the delegation_briefs_enabled
+  // flag OFF (the default) and for self-contained delegations (relevance gate →
+  // no brief). Additive nullable column; see delegation-brief.ts.
+  delegation_brief: string | null
 }
 
 export interface Note {
@@ -105,6 +114,10 @@ export interface DelegateTaskInput {
   heartbeat_timeout_sec?: number
   progress_timeout_sec?: number
   kind?: string
+  // P3 (#10060822): optional curated delegation brief to persist with the task.
+  // Caller supplies this ONLY when delegation_briefs_enabled is ON; otherwise it is
+  // omitted/null and the row is byte-identical to the pre-P3 behavior (AC-5).
+  delegation_brief?: string | null
 }
 
 export type BlockedOn = 'human' | 'external_api' | 'upstream_task' | 'agent'
@@ -314,6 +327,10 @@ export class TaskDB {
     // sent, and reset to 0 when a heartbeat lands AFTER blocked_at. The
     // watchdog escalates-once-and-stops once the cap is reached.
     try { this.db.exec('ALTER TABLE tasks ADD COLUMN blocked_relay_count INTEGER NOT NULL DEFAULT 0') } catch { /* column already exists */ }
+
+    // P3 (#10060822): curated delegation brief column (safe migration for existing DBs).
+    // Additive + nullable; written only when delegation_briefs_enabled is ON.
+    try { this.db.exec('ALTER TABLE tasks ADD COLUMN delegation_brief TEXT') } catch { /* column already exists */ }
 
     // Migration 0011 (#1624): is_addendum marker for post-acceptance addenda.
     // A synthetic sub-agent row spawned under a COMPLETED/CANCELLED parent (a
@@ -539,6 +556,9 @@ export class TaskDB {
     } catch { /* index already exists */ }
     this.db.exec("UPDATE agent_sessions SET state_changed_at = last_seen_at WHERE state_changed_at IS NULL")
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('heartbeat_v2_enabled', 0)")
+    // P3 (#10060822): curated delegation briefs. DEFAULT OFF — flip on only after the
+    // pre-deploy gate. While OFF, delegate_task is byte-identical to pre-P3 (AC-5).
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('delegation_briefs_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
@@ -1099,10 +1119,49 @@ export class TaskDB {
   }
 
   /**
+   * P3 (#10060822): open delegated tasks for `agent` that carry a curated brief, for
+   * boot-time surfacing (PC-4/AC-6). Caller gates this on delegation_briefs_enabled.
+   */
+  getActiveDelegationBriefs(agent: string): Array<{ id: number; description: string; delegation_brief: string }> {
+    // Bounded for safety, but high enough to cover every realistic open-delegation count
+    // (an agent rarely holds >a few open briefed tasks). claim_task + list_tasks render the
+    // brief for ALL the agent's tasks regardless, so coverage is complete even past this cap.
+    return this.run(db => db.prepare(`
+      SELECT id, description, delegation_brief
+      FROM tasks
+      WHERE to_agent = ? AND delegation_brief IS NOT NULL
+        AND status IN ('pending', 'in_progress', 'claimed')
+      ORDER BY created_at DESC
+      LIMIT 20
+    `).all(agent) as Array<{ id: number; description: string; delegation_brief: string }>)
+  }
+
+  /**
+   * P3 (#10060822): finding summaries from the parent task AND its sibling children
+   * (tasks sharing this parent), for delegation-brief parent context (PC-1). Gated by
+   * blackboard_enabled; caller gates on delegation_briefs_enabled.
+   */
+  readParentAndSiblingFindings(parentTaskId: number, limit = 4): Array<{ finding_type: string; summary: string; task_id: number }> {
+    if (!this.isFeatureEnabled('blackboard_enabled')) return []
+    return this.run(db => db.prepare(`
+      SELECT finding_type, summary, task_id
+      FROM findings
+      WHERE task_id = ? OR task_id IN (SELECT id FROM tasks WHERE parent_task_id = ?)
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(parentTaskId, parentTaskId, limit) as Array<{ finding_type: string; summary: string; task_id: number }>)
+  }
+
+  /**
    * Create a delegated task with full supervision fields.
    * Sets supervisor_agent, next_check_at, heartbeat/progress timeouts, kind, and parent_task_id.
    */
   delegateTask(input: DelegateTaskInput): Task {
+    // P3 anti-dump (AC-8/PC-5) defense-in-depth: reject an over-cap brief even when a
+    // direct caller bypasses the server-layer guard. NULL/omitted ⇒ no-op (AC-5 unaffected).
+    if (input.delegation_brief != null && byteLen(input.delegation_brief) > BRIEF_MAX_BYTES) {
+      throw new Error(`delegation_brief exceeds the ${BRIEF_MAX_BYTES}-byte anti-dump cap (got ${byteLen(input.delegation_brief)} bytes)`)
+    }
     return this.run(db => {
       const hbTimeout = input.heartbeat_timeout_sec ?? SUPERVISION_DEFAULTS.heartbeat_timeout_sec
       const progTimeout = input.progress_timeout_sec ?? SUPERVISION_DEFAULTS.progress_timeout_sec
@@ -1124,12 +1183,12 @@ export class TaskDB {
           from_agent, to_agent, description, priority,
           supervisor_agent, kind, parent_task_id,
           heartbeat_timeout_sec, progress_timeout_sec,
-          next_check_at
+          next_check_at, delegation_brief
         ) VALUES (
           $from, $to, $description, $priority,
           $supervisor_agent, $kind, $parent_task_id,
           $heartbeat_timeout_sec, $progress_timeout_sec,
-          datetime('now', '+' || $unclaimed_check_sec || ' seconds')
+          datetime('now', '+' || $unclaimed_check_sec || ' seconds'), $delegation_brief
         )
         RETURNING *
       `)
@@ -1144,6 +1203,8 @@ export class TaskDB {
         $heartbeat_timeout_sec: hbTimeout,
         $progress_timeout_sec: progTimeout,
         $unclaimed_check_sec: UNCLAIMED_CHECK_SEC,
+        // P3: NULL whenever the flag is OFF (caller omits it) ⇒ byte-identical row (AC-5).
+        $delegation_brief: input.delegation_brief ?? null,
       }) as Task
     })
   }
