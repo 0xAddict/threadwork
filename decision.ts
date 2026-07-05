@@ -1,5 +1,6 @@
 import type { TaskDB } from './db'
 import type { MemoryDB, Memory } from './memory'
+import { sanitizeMemoryContent } from './memory-integrity'
 
 export type DecisionStatus = 'open' | 'positions' | 'critique' | 'finalized' | 'expired' | 'cancelled'
 export type CritiqueSeverity = 'observation' | 'concern' | 'blocker'
@@ -166,11 +167,65 @@ export class DecisionDB {
           'SELECT agent, position FROM decision_positions WHERE decision_id = ? ORDER BY created_at ASC'
         ).all(decisionId) as { agent: string; position: string }[]
 
-        const positionSummary = positions.length > 0
-          ? '\nPositions: ' + positions.map(p => `${p.agent}: ${p.position}`).join('; ')
-          : ''
+        // P4 (#10376048/ATM-027): flag-gated REQ-021 two-stage sanitize for the
+        // decision-finalization write-through. Flag OFF -> byte-parity with the
+        // pre-P4 memoryContent assembly below (plain positionSummary, raw
+        // title/outcome/rationale, hardcoded state='active', no audit row).
+        // Stays entirely inside the existing BEGIN IMMEDIATE/COMMIT — no new
+        // transaction/lock/ordering primitive is introduced (P5 territory).
+        const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
 
-        const memoryContent = `Decision #${decisionId}: ${decision.title}\nOutcome: ${outcome}\nRationale: ${rationale}${positionSummary}`
+        let agentStageNeutralized = false
+        let effectiveTitle = decision.title
+        let effectiveOutcome = outcome
+        let effectiveRationale = rationale
+        let positionSummary: string
+
+        if (sanitizeOn) {
+          // (a) Sanitize each agent-authored fragment INDIVIDUALLY before
+          // assembling anything, so forged markers/directives never survive
+          // long enough to be diluted by the surrounding template text.
+          const titleSr = sanitizeMemoryContent(decision.title, { sourceType: 'agent' })
+          effectiveTitle = titleSr.text
+          agentStageNeutralized = agentStageNeutralized || titleSr.neutralized
+
+          const outcomeSr = sanitizeMemoryContent(outcome, { sourceType: 'agent' })
+          effectiveOutcome = outcomeSr.text
+          agentStageNeutralized = agentStageNeutralized || outcomeSr.neutralized
+
+          const rationaleSr = sanitizeMemoryContent(rationale, { sourceType: 'agent' })
+          effectiveRationale = rationaleSr.text
+          agentStageNeutralized = agentStageNeutralized || rationaleSr.neutralized
+
+          // (b) Attribution-fence each sanitized position line so a later
+          // consumer can tell "the agent said this" from real system prose.
+          const sanitizedPositions = positions.map(p => {
+            const posSr = sanitizeMemoryContent(p.position, { sourceType: 'agent' })
+            agentStageNeutralized = agentStageNeutralized || posSr.neutralized
+            return `<agent-said agent="${p.agent}">${posSr.text}</agent-said>`
+          })
+          positionSummary = sanitizedPositions.length > 0
+            ? '\nPositions: ' + sanitizedPositions.join('; ')
+            : ''
+        } else {
+          positionSummary = positions.length > 0
+            ? '\nPositions: ' + positions.map(p => `${p.agent}: ${p.position}`).join('; ')
+            : ''
+        }
+
+        let memoryContent = `Decision #${decisionId}: ${effectiveTitle}\nOutcome: ${effectiveOutcome}\nRationale: ${effectiveRationale}${positionSummary}`
+
+        let state: 'active' | 'proposed' = 'active'
+        let neutralized = agentStageNeutralized
+        let systemStageNeutralized = false
+        if (sanitizeOn) {
+          // (c) Defense-in-depth second pass over the fully assembled content.
+          const finalSr = sanitizeMemoryContent(memoryContent, { sourceType: 'system' })
+          memoryContent = finalSr.text
+          systemStageNeutralized = finalSr.neutralized
+          neutralized = neutralized || systemStageNeutralized
+          state = neutralized ? 'proposed' : 'active'
+        }
 
         // 1. Update decision status
         db.prepare(`
@@ -187,9 +242,19 @@ export class DecisionDB {
         // 2. Create memory (inline, same db handle — atomic)
         const memory = db.prepare(`
           INSERT INTO memories (agent, content, category, importance, pinned, classification, quality, state, source_type)
-          VALUES ('shared', ?, 'decision', 4, 0, 'strategic', 0.8, 'active', 'system')
+          VALUES ('shared', ?, 'decision', 4, 0, 'strategic', 0.8, ?, 'system')
           RETURNING *
-        `).get(memoryContent) as Memory
+        `).get(memoryContent, state) as Memory
+
+        if (sanitizeOn && neutralized) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'decision_content_sanitized', ?, ?)
+          `).run(
+            `finalizeDecision #${decisionId}; agent-stage=${agentStageNeutralized ? 'neutralized' : 'clean'}; system-stage=${systemStageNeutralized ? 'neutralized' : 'clean'}`,
+            memory.id,
+          )
+        }
 
         // 3. Link memory_id back to decision
         db.prepare('UPDATE decisions SET memory_id = ? WHERE id = ?').run(memory.id, decisionId)
@@ -243,11 +308,46 @@ export class DecisionDB {
           'SELECT agent, position FROM decision_positions WHERE decision_id = ? ORDER BY created_at ASC'
         ).all(decisionId) as { agent: string; position: string }[]
 
-        const positionSummary = positions.length > 0
-          ? '\nPositions: ' + positions.map(p => `${p.agent}: ${p.position}`).join('; ')
-          : ''
+        // P4 (#10376048/ATM-027): same REQ-021 two-stage sanitize contract as
+        // finalizeDecision — see that method for the full rationale. This path
+        // has no outcome/rationale, only title + positions are agent-authored.
+        const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
 
-        const memoryContent = `Decision #${decisionId} EXPIRED: ${decision.title}\nExpired without finalization.${positionSummary}`
+        let agentStageNeutralized = false
+        let effectiveTitle = decision.title
+        let positionSummary: string
+
+        if (sanitizeOn) {
+          const titleSr = sanitizeMemoryContent(decision.title, { sourceType: 'agent' })
+          effectiveTitle = titleSr.text
+          agentStageNeutralized = agentStageNeutralized || titleSr.neutralized
+
+          const sanitizedPositions = positions.map(p => {
+            const posSr = sanitizeMemoryContent(p.position, { sourceType: 'agent' })
+            agentStageNeutralized = agentStageNeutralized || posSr.neutralized
+            return `<agent-said agent="${p.agent}">${posSr.text}</agent-said>`
+          })
+          positionSummary = sanitizedPositions.length > 0
+            ? '\nPositions: ' + sanitizedPositions.join('; ')
+            : ''
+        } else {
+          positionSummary = positions.length > 0
+            ? '\nPositions: ' + positions.map(p => `${p.agent}: ${p.position}`).join('; ')
+            : ''
+        }
+
+        let memoryContent = `Decision #${decisionId} EXPIRED: ${effectiveTitle}\nExpired without finalization.${positionSummary}`
+
+        let state: 'active' | 'proposed' = 'active'
+        let neutralized = agentStageNeutralized
+        let systemStageNeutralized = false
+        if (sanitizeOn) {
+          const finalSr = sanitizeMemoryContent(memoryContent, { sourceType: 'system' })
+          memoryContent = finalSr.text
+          systemStageNeutralized = finalSr.neutralized
+          neutralized = neutralized || systemStageNeutralized
+          state = neutralized ? 'proposed' : 'active'
+        }
 
         // 1. Update decision status
         db.prepare(`
@@ -262,9 +362,19 @@ export class DecisionDB {
         // 2. Create memory
         const memory = db.prepare(`
           INSERT INTO memories (agent, content, category, importance, pinned, classification, quality, state, source_type)
-          VALUES ('shared', ?, 'decision', 4, 0, 'strategic', 0.8, 'active', 'system')
+          VALUES ('shared', ?, 'decision', 4, 0, 'strategic', 0.8, ?, 'system')
           RETURNING *
-        `).get(memoryContent) as Memory
+        `).get(memoryContent, state) as Memory
+
+        if (sanitizeOn && neutralized) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'decision_content_sanitized', ?, ?)
+          `).run(
+            `expireDecision #${decisionId}; agent-stage=${agentStageNeutralized ? 'neutralized' : 'clean'}; system-stage=${systemStageNeutralized ? 'neutralized' : 'clean'}`,
+            memory.id,
+          )
+        }
 
         // 3. Link memory_id
         db.prepare('UPDATE decisions SET memory_id = ? WHERE id = ?').run(memory.id, decisionId)

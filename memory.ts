@@ -309,11 +309,44 @@ export class MemoryDB {
         RETURNING *
       `).get(oldId) as Memory
 
+      // P4 (#10376048/ATM-025): flag-gated write-through sanitize for the supersede
+      // path. Flag OFF -> byte-parity with pre-P4 behavior (raw content, hardcoded
+      // state='active', no audit rows beyond the pre-existing memory_superseded one).
+      const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
+
+      let sr: { text: string; neutralized: boolean; tripped?: string[] } | undefined
+      let effectiveContent = newContent
+      if (sanitizeOn) {
+        sr = sanitizeMemoryContent(newContent, { sourceType: 'agent' })
+        effectiveContent = sr.text
+      }
+
+      // Mirrors saveMemory's agent+foundational->proposed guard, which this path
+      // otherwise bypasses since it hardcodes source_type='agent' and copies
+      // existing.classification straight through.
+      const foundationalDowngrade = sanitizeOn && existing.classification === 'foundational'
+      const state: MemoryState = sanitizeOn && (sr!.neutralized || foundationalDowngrade) ? 'proposed' : 'active'
+
       const replacement = db.prepare(`
         INSERT INTO memories (agent, content, category, classification, quality, state, source_type, support_count, supersedes_memory_id)
-        VALUES (?, ?, ?, ?, 0.5, 'active', 'agent', 0, ?)
+        VALUES (?, ?, ?, ?, 0.5, ?, 'agent', 0, ?)
         RETURNING *
-      `).get(existing.agent, newContent, existing.category, existing.classification, oldId) as Memory
+      `).get(existing.agent, effectiveContent, existing.category, existing.classification, state, oldId) as Memory
+
+      if (sanitizeOn) {
+        if (sr!.neutralized) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'memory_content_neutralized', ?, ?)
+          `).run(`tripped=${(sr!.tripped ?? []).join(',')}`, replacement.id)
+        }
+        if (foundationalDowngrade) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'memory_durability_clamped', ?, ?)
+          `).run('superseded foundational -> state proposed', replacement.id)
+        }
+      }
 
       db.prepare(`
         INSERT INTO audit_log (agent, action, detail, memory_id)
