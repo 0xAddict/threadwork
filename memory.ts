@@ -4,6 +4,7 @@ import {
   cosineNormalized, rrfFuse, vectorTableExists,
   denseRrfK, denseBm25K, denseDenseK,
 } from './dense'
+import { sanitizeMemoryContent } from './memory-integrity'
 
 export type Classification = 'foundational' | 'strategic' | 'operational' | 'observational' | 'ephemeral'
 export type MemoryState = 'proposed' | 'active' | 'disputed' | 'superseded' | 'archived'
@@ -129,8 +130,29 @@ export class MemoryDB {
 
   saveMemory(input: SaveMemoryInput): Memory {
     return this.taskDb.run(db => {
+      // P4 (#10376048): flag-gated anti-laundering hardening. When OFF, every
+      // branch below is a strict no-op and this function is byte-for-byte the
+      // pre-P4 implementation (same INSERT values, same state, no sanitize, no
+      // clamp, no audit rows). See build brief Stage 2a for the full contract.
+      const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
+
+      // ATM-002: resolve source_type FIRST — caller-identity-only trust
+      // resolution must be decided before any content is touched, and BEFORE
+      // the dedup-normalize step (moved ahead of where it used to sit).
+      const sourceType = input.source_type ?? this.inferSourceType(input.agent)
+
+      // ATM-002: sanitize (flag ON) before dedup-normalize, so both the dedup
+      // check and the persisted row see the neutralized text. Flag OFF ->
+      // effectiveContent is the raw input, unchanged (byte parity).
+      let sanitizeResult: { text: string; neutralized: boolean; tripped?: string[] } | undefined
+      let effectiveContent = input.content
+      if (sanitizeOn) {
+        sanitizeResult = sanitizeMemoryContent(input.content, { sourceType })
+        effectiveContent = sanitizeResult.text
+      }
+
       // Dedup check: normalize content and look for existing active memory
-      const normalized = this.normalizeContent(input.content)
+      const normalized = this.normalizeContent(effectiveContent)
       const existing = db.prepare(`
         SELECT * FROM memories
         WHERE agent = ? AND state = 'active'
@@ -138,6 +160,7 @@ export class MemoryDB {
       `).get(input.agent, normalized) as Memory | null
 
       if (existing) {
+        // No new INSERT happens on this path -> no P4 audit rows (flag OFF or ON).
         return db.prepare(`
           UPDATE memories SET support_count = support_count + 1, last_accessed = datetime('now')
           WHERE id = ?
@@ -145,8 +168,8 @@ export class MemoryDB {
         `).get(existing.id) as Memory
       }
 
+      // === ATM-006 classification/state block start ===
       const classification = input.classification ?? this.inferClassification(input.content, input.category)
-      const sourceType = input.source_type ?? this.inferSourceType(input.agent)
       const quality = input.quality ?? 0.5
       const evidence = input.evidence ?? null
       const supersedes = input.supersedes_memory_id ?? null
@@ -157,18 +180,47 @@ export class MemoryDB {
         state = 'proposed'
       }
 
+      // ATM-003: a neutralized (laundered) memory can never look active,
+      // regardless of source_type/classification — applies even to
+      // source_type:'human'. Flag-gated only.
+      if (sanitizeOn && sanitizeResult?.neutralized) {
+        state = 'proposed'
+      }
+      // === ATM-006 classification/state block end ===
+
+      // ATM-009: agent-tier durability clamp. A sanitized agent-authored write
+      // cannot self-grant durability (high importance / pinned survival).
+      // Flag OFF -> no clamp, values pass through exactly as before.
+      let importance = input.importance ?? 3
+      let pinned = input.pinned ? 1 : 0
+      let durabilityClampDetail: string | null = null
+      if (sanitizeOn && sourceType === 'agent') {
+        const clampedImportance = Math.min(importance, 3)
+        const clampedPinned = 0
+        const parts: string[] = []
+        if (clampedImportance !== importance) {
+          parts.push(`importance ${importance}->${clampedImportance}`)
+        }
+        if (pinned !== clampedPinned) {
+          parts.push(`pinned ${pinned ? 'true' : 'false'}->${clampedPinned ? 'true' : 'false'}`)
+        }
+        importance = clampedImportance
+        pinned = clampedPinned
+        if (parts.length > 0) durabilityClampDetail = parts.join(', ')
+      }
+
       const stmt = db.prepare(`
         INSERT INTO memories (agent, content, category, importance, pinned, source_task_id,
           classification, quality, state, source_type, evidence, supersedes_memory_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING *
       `)
-      return stmt.get(
+      const saved = stmt.get(
         input.agent,
-        input.content,
+        effectiveContent,
         input.category,
-        input.importance ?? 3,
-        input.pinned ? 1 : 0,
+        importance,
+        pinned,
         input.source_task_id ?? null,
         classification,
         quality,
@@ -177,6 +229,36 @@ export class MemoryDB {
         evidence,
         supersedes,
       ) as Memory
+
+      // P4 audit trail (flag ON only; only reached on a genuine new INSERT —
+      // the dedup early-return above never runs this).
+      if (sanitizeOn) {
+        if (sanitizeResult?.neutralized) {
+          // ATM-018
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'memory_content_neutralized', ?, ?)
+          `).run(`tripped=${(sanitizeResult.tripped ?? []).join(',')}`, saved.id)
+
+          // ATM-019
+          if (sanitizeResult.tripped?.includes('forged-trust-marker')) {
+            db.prepare(`
+              INSERT INTO audit_log (agent, action, detail, memory_id)
+              VALUES ('system', 'memory_marker_neutralized', ?, ?)
+            `).run(`tripped=${(sanitizeResult.tripped ?? []).join(',')}`, saved.id)
+          }
+        }
+
+        // ATM-020
+        if (durabilityClampDetail) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'memory_durability_clamped', ?, ?)
+          `).run(durabilityClampDetail, saved.id)
+        }
+      }
+
+      return saved
     })
   }
 
