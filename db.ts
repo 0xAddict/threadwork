@@ -559,6 +559,10 @@ export class TaskDB {
     // P3 (#10060822): curated delegation briefs. DEFAULT OFF — flip on only after the
     // pre-deploy gate. While OFF, delegate_task is byte-identical to pre-P3 (AC-5).
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('delegation_briefs_enabled', 0)")
+    // P4 (#10376048): anti-laundering memory sanitization. DEFAULT OFF — Stage 0 scaffold only;
+    // sanitizeMemoryContent() (memory-integrity.ts) is not yet wired into any save/consolidate
+    // path in this stage.
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('memory_sanitization_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
