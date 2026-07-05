@@ -19,6 +19,8 @@
     "memory-integrity-patterns.ts",
     "tests/memory-integrity-signature.test.ts",
     "memory.ts",
+    "memory-handlers.ts",
+    "tests/memory-handlers.test.ts",
     "decision.ts",
     "debrief.ts",
     "consolidate.ts",

@@ -128,6 +128,12 @@ export class MemoryDB {
     return 'agent'
   }
 
+  /** ATM-026: exposes the P4 sanitization flag so extracted handlers (memory-handlers.ts)
+   * can gate their own behavior without importing TaskDB directly. */
+  isSanitizationEnabled(): boolean {
+    return this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
+  }
+
   saveMemory(input: SaveMemoryInput): Memory {
     return this.taskDb.run(db => {
       // P4 (#10376048): flag-gated anti-laundering hardening. When OFF, every
@@ -695,16 +701,54 @@ export class MemoryDB {
     return results
   }
 
-  promoteMemory(id: number): Memory | null {
-    return this.taskDb.run(db => db.prepare(`
-      UPDATE memories SET agent = 'shared' WHERE id = ? RETURNING *
-    `).get(id) as Memory | null)
+  /**
+   * ATM-029 (REQ-023): authority guard, flag-gated. An agent-authored memory
+   * still sitting in 'proposed' state (i.e. not yet reviewed/accepted) cannot
+   * be self- or peer-promoted to 'shared' by another agent — only a 'system'
+   * or 'human' caller may do so. Flag OFF -> guard is skipped entirely and
+   * behavior is byte-identical to pre-P4 (unconditional UPDATE).
+   */
+  promoteMemory(id: number, callerSourceType: SourceType): Memory | null {
+    return this.taskDb.run(db => {
+      if (this.isSanitizationEnabled()) {
+        const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as Memory | null
+        if (
+          row && row.source_type === 'agent' && row.state === 'proposed' &&
+          callerSourceType !== 'system' && callerSourceType !== 'human'
+        ) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'pin_promote_authority_denied', ?, ?)
+          `).run(`promote denied: memory #${id} is agent-authored/proposed; caller source_type=${callerSourceType}`, id)
+          return null
+        }
+      }
+      return db.prepare(`
+        UPDATE memories SET agent = 'shared' WHERE id = ? RETURNING *
+      `).get(id) as Memory | null
+    })
   }
 
-  pinMemory(id: number): Memory | null {
-    return this.taskDb.run(db => db.prepare(`
-      UPDATE memories SET pinned = CASE WHEN pinned = 0 THEN 1 ELSE 0 END WHERE id = ? RETURNING *
-    `).get(id) as Memory | null)
+  /** ATM-029 (REQ-023): same authority guard as promoteMemory, for pin. */
+  pinMemory(id: number, callerSourceType: SourceType): Memory | null {
+    return this.taskDb.run(db => {
+      if (this.isSanitizationEnabled()) {
+        const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as Memory | null
+        if (
+          row && row.source_type === 'agent' && row.state === 'proposed' &&
+          callerSourceType !== 'system' && callerSourceType !== 'human'
+        ) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'pin_promote_authority_denied', ?, ?)
+          `).run(`pin denied: memory #${id} is agent-authored/proposed; caller source_type=${callerSourceType}`, id)
+          return null
+        }
+      }
+      return db.prepare(`
+        UPDATE memories SET pinned = CASE WHEN pinned = 0 THEN 1 ELSE 0 END WHERE id = ? RETURNING *
+      `).get(id) as Memory | null
+    })
   }
 
   /**
