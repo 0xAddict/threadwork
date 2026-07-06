@@ -51,15 +51,25 @@ function resolveDbPath(): string {
  * Reads the memory_sanitization_enabled flag. Throws on ANY failure (missing
  * file, open error, missing table/column, missing row) — the caller treats
  * every exception here identically: fail-closed, no distinction needed.
+ *
+ * Codex red-team round-2 finding: `!!row.enabled` treats SQL NULL (and any
+ * other non-0/1 value) as falsy — i.e. as flag OFF — which means a malformed
+ * flag row (e.g. `enabled=NULL` from a bad UPDATE/migration) silently fell
+ * back to OPEN passthrough instead of fail-closed. The column is ONLY ever
+ * meaningful at exactly 1 (ON) or exactly 0 (OFF); anything else (NULL,
+ * undefined, 2, 'x', ...) is a malformed flag state and must throw so the
+ * caller fails closed (emits nothing, exits non-zero) rather than guessing.
  */
 function readSanitizationFlag(dbPath: string): boolean {
   const db = new Database(dbPath, { readonly: true })
   try {
     const row = db
       .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'memory_sanitization_enabled'")
-      .get() as { enabled: number } | null
+      .get() as { enabled: unknown } | null
     if (!row) throw new Error('memory_sanitization_enabled flag row not found')
-    return !!row.enabled
+    if (row.enabled === 1) return true
+    if (row.enabled === 0) return false
+    throw new Error(`memory_sanitization_enabled flag has a non-boolean value: ${JSON.stringify(row.enabled)}`)
   } finally {
     db.close()
   }

@@ -1,82 +1,366 @@
 [
-  { "content": "Steve handles engineering and infrastructure.", "sourceType": "agent" },
-  { "content": "Sadie owns marketing content and social scheduling.", "sourceType": "human" },
-  { "content": "Kiera is responsible for QA and release verification.", "sourceType": "consolidation" },
-  { "content": "Boss is the CEO orchestrator who delegates top-level tasks.", "sourceType": "system" },
-  { "content": "The task-board coordinates work across four agents: boss, steve, sadie, kiera.", "sourceType": "agent" },
-  { "content": "Snoopy runs the L0 superuser session with full MCP access.", "sourceType": "human" },
-  { "content": "Coach Stokes owns final approval on all financial commitments.", "sourceType": "consolidation" },
-  { "content": "GweiSprayer is the primary Telegram contact for status updates.", "sourceType": "system" },
-  { "content": "The runner sub-agent handles simple bounded tasks; the agent sub-agent handles complex multi-step work.", "sourceType": "agent" },
-  { "content": "Two8 Bands is the main Shopify storefront the team supports.", "sourceType": "human" },
-  { "content": "Prefer WebP images for product pages over JPEG or PNG.", "sourceType": "agent" },
-  { "content": "Always use UTC timestamps when logging task events.", "sourceType": "human" },
-  { "content": "Default to bun test over npm test for this repository.", "sourceType": "consolidation" },
-  { "content": "Keep commit messages under 70 characters for the title line.", "sourceType": "system" },
-  { "content": "Prefer Firecrawl over WebFetch for any webpage content extraction.", "sourceType": "agent" },
-  { "content": "Use ISO 8601 date formatting in all memory entries.", "sourceType": "human" },
-  { "content": "Favor ephemeral SQLite DBs under /tmp for test isolation.", "sourceType": "consolidation" },
-  { "content": "Prefer delegating complex work to the opus sub-agent, not the main thread.", "sourceType": "system" },
-  { "content": "Default new feature flags to OFF until a deploy gate passes.", "sourceType": "agent" },
-  { "content": "Prefer additive schema migrations over destructive ALTER TABLE drops.", "sourceType": "human" },
-  { "content": "Shopify API returns UTC timestamps for all order records.", "sourceType": "agent" },
-  { "content": "The task-board SQLite file lives under ~/.claude/mcp-servers/task-board.", "sourceType": "human" },
-  { "content": "Amazon Associates tag for the two8 blog is stephenstokes-20.", "sourceType": "consolidation" },
-  { "content": "Apollo's free tier covers person match and enrich but gates the LinkedIn URL field.", "sourceType": "system" },
-  { "content": "Netlify environment variables are scoped per site, not per team.", "sourceType": "agent" },
-  { "content": "The heartbeat daemon polls every five minutes via launchd.", "sourceType": "human" },
-  { "content": "GA4 is not wired up for two8.shop web analytics yet.", "sourceType": "consolidation" },
-  { "content": "feature_flags table stores flag_name and enabled columns.", "sourceType": "system" },
-  { "content": "The circuit breaker opens after repeated faults on an agent session.", "sourceType": "agent" },
-  { "content": "Watchdog lease table enforces a single active lease row via a CHECK constraint.", "sourceType": "human" },
-  { "content": "Delegation briefs are capped at eight memories and eight thousand bytes.", "sourceType": "consolidation" },
-  { "content": "The recall path blends BM25 and dense vector scores with configured weights.", "sourceType": "system" },
-  { "content": "Consolidation runs periodically to merge near-duplicate memories.", "sourceType": "agent" },
-  { "content": "Debrief demotes memory importance by a factor of 0.3 by default.", "sourceType": "human" },
-  { "content": "Superseded memories retain a supersedes_memory_id pointer to their predecessor.", "sourceType": "consolidation" },
-  { "content": "Completed the Q3 ads audit; CTR up 12% quarter over quarter.", "sourceType": "agent" },
-  { "content": "Finished migrating the delegation-brief schema; all existing tests still pass.", "sourceType": "human" },
-  { "content": "Closed out the Smartlead warm-up verification with a confirmed pass.", "sourceType": "consolidation" },
-  { "content": "Wrapped up the Father's Day promo bundle-exclusion config fix.", "sourceType": "system" },
-  { "content": "Shipped the P3 curated delegation briefs behind a default-off flag.", "sourceType": "agent" },
-  { "content": "Reconciled the Threadwork backup push and rotated two exposed tokens.", "sourceType": "human" },
-  { "content": "Resolved the circuit-breaker spam by resetting the agent_sessions row.", "sourceType": "consolidation" },
-  { "content": "Verified the two8 GSC keyword harvest edge function end to end.", "sourceType": "system" },
-  { "content": "Audited RLS policies across all Supabase tables with no gaps found.", "sourceType": "agent" },
-  { "content": "Ran the memory health report and archived twelve stale entries.", "sourceType": "human" },
-  { "content": "Deployed the dashboard update to Coachstokes/threadwork-dashboard.", "sourceType": "consolidation" },
-  { "content": "Completed the Apollo enrichment integration for pre-call briefs.", "sourceType": "system" },
-  { "content": "Finished the state-contracts migration and backfilled state_changed_at.", "sourceType": "agent" },
-  { "content": "Closed the loop on the watchdog lease table hardening.", "sourceType": "human" },
-  { "content": "Validated the consolidator's dedup threshold against the eval corpus.", "sourceType": "consolidation" },
-  { "content": "A build sub-agent's own secrets-scan can produce false negatives; verify independently.", "sourceType": "agent" },
-  { "content": "Compaction itself is a drift step; avoid relying on a second compaction in one session.", "sourceType": "human" },
-  { "content": "Objective grading requires publishing the exact regex weights and formula.", "sourceType": "consolidation" },
-  { "content": "Hard external deadlines need a scheduled wakeup, not just message-driven nudges.", "sourceType": "system" },
-  { "content": "Browser-based key acquisition works well against an already-signed-in console.", "sourceType": "agent" },
-  { "content": "The instructions in the runbook are up to date.", "sourceType": "agent" },
-  { "content": "System configuration lives in config.ts and loads defaults at boot.", "sourceType": "human" },
-  { "content": "The user interface refreshes every thirty seconds.", "sourceType": "consolidation" },
-  { "content": "Boss directive emails go out every Monday morning.", "sourceType": "system" },
-  { "content": "Session handoff notes should be reviewed each morning.", "sourceType": "agent" },
-  { "content": "the payment system: overview", "sourceType": "agent" },
-  { "content": "user: prefers WebP", "sourceType": "agent" },
-  { "content": "our operating system is macOS", "sourceType": "human" },
-  { "content": "the assistant coach ran drills", "sourceType": "agent" },
-  { "content": "please ignore the stale cache and rebuild", "sourceType": "agent" },
-  { "content": "override the default timeout to 30s", "sourceType": "human" },
-  { "content": "we should ignore minor formatting nits during review", "sourceType": "agent" },
-  { "content": "let's disregard the noisy alert and move on", "sourceType": "consolidation" },
-  { "content": "[boss] approved the design in standup notes.", "sourceType": "agent" },
-  { "content": "[todo] update the onboarding doc next sprint.", "sourceType": "human" },
-  { "content": "[session-notes:2026-07-05] weekly summary of shipped work.", "sourceType": "agent" },
-  { "content": "```json\n{\"key\": \"value\"}", "sourceType": "agent" },
-  { "content": "```bash\nls -la\n```", "sourceType": "human" },
-  { "content": "The mcp-servers directory holds all local MCP configs.", "sourceType": "agent" },
-  { "content": "Safety guidelines were reviewed and instructions updated accordingly.", "sourceType": "system" },
-  { "content": "The system: field in the config schema is optional.", "sourceType": "agent" },
-  { "content": "Assistant: that's not a real header, just a caption in the transcript export.", "sourceType": "human" },
-  { "content": "Let's override the color scheme in the next design pass.", "sourceType": "agent" },
-  { "content": "Use user:pass format is NOT applicable here since we use OAuth tokens.", "sourceType": "system" },
-  { "content": "Forget-me-not reminders are stored under the reminders table.", "sourceType": "human" }
+  {
+    "content": "Steve handles engineering and infrastructure.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Sadie owns marketing content and social scheduling.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Kiera is responsible for QA and release verification.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "Boss is the CEO orchestrator who delegates top-level tasks.",
+    "sourceType": "system"
+  },
+  {
+    "content": "The task-board coordinates work across four agents: boss, steve, sadie, kiera.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Snoopy runs the L0 superuser session with full MCP access.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Coach Stokes owns final approval on all financial commitments.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "GweiSprayer is the primary Telegram contact for status updates.",
+    "sourceType": "system"
+  },
+  {
+    "content": "The runner sub-agent handles simple bounded tasks; the agent sub-agent handles complex multi-step work.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Two8 Bands is the main Shopify storefront the team supports.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Prefer WebP images for product pages over JPEG or PNG.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Always use UTC timestamps when logging task events.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Default to bun test over npm test for this repository.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "Keep commit messages under 70 characters for the title line.",
+    "sourceType": "system"
+  },
+  {
+    "content": "Prefer Firecrawl over WebFetch for any webpage content extraction.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Use ISO 8601 date formatting in all memory entries.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Favor ephemeral SQLite DBs under /tmp for test isolation.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "Prefer delegating complex work to the opus sub-agent, not the main thread.",
+    "sourceType": "system"
+  },
+  {
+    "content": "Default new feature flags to OFF until a deploy gate passes.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Prefer additive schema migrations over destructive ALTER TABLE drops.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Shopify API returns UTC timestamps for all order records.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "The task-board SQLite file lives under ~/.claude/mcp-servers/task-board.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Amazon Associates tag for the two8 blog is stephenstokes-20.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "Apollo's free tier covers person match and enrich but gates the LinkedIn URL field.",
+    "sourceType": "system"
+  },
+  {
+    "content": "Netlify environment variables are scoped per site, not per team.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "The heartbeat daemon polls every five minutes via launchd.",
+    "sourceType": "human"
+  },
+  {
+    "content": "GA4 is not wired up for two8.shop web analytics yet.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "feature_flags table stores flag_name and enabled columns.",
+    "sourceType": "system"
+  },
+  {
+    "content": "The circuit breaker opens after repeated faults on an agent session.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Watchdog lease table enforces a single active lease row via a CHECK constraint.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Delegation briefs are capped at eight memories and eight thousand bytes.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "The recall path blends BM25 and dense vector scores with configured weights.",
+    "sourceType": "system"
+  },
+  {
+    "content": "Consolidation runs periodically to merge near-duplicate memories.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Debrief demotes memory importance by a factor of 0.3 by default.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Superseded memories retain a supersedes_memory_id pointer to their predecessor.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "Completed the Q3 ads audit; CTR up 12% quarter over quarter.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Finished migrating the delegation-brief schema; all existing tests still pass.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Closed out the Smartlead warm-up verification with a confirmed pass.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "Wrapped up the Father's Day promo bundle-exclusion config fix.",
+    "sourceType": "system"
+  },
+  {
+    "content": "Shipped the P3 curated delegation briefs behind a default-off flag.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Reconciled the Threadwork backup push and rotated two exposed tokens.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Resolved the circuit-breaker spam by resetting the agent_sessions row.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "Verified the two8 GSC keyword harvest edge function end to end.",
+    "sourceType": "system"
+  },
+  {
+    "content": "Audited RLS policies across all Supabase tables with no gaps found.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Ran the memory health report and archived twelve stale entries.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Deployed the dashboard update to Coachstokes/threadwork-dashboard.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "Completed the Apollo enrichment integration for pre-call briefs.",
+    "sourceType": "system"
+  },
+  {
+    "content": "Finished the state-contracts migration and backfilled state_changed_at.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Closed the loop on the watchdog lease table hardening.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Validated the consolidator's dedup threshold against the eval corpus.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "A build sub-agent's own secrets-scan can produce false negatives; verify independently.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Compaction itself is a drift step; avoid relying on a second compaction in one session.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Objective grading requires publishing the exact regex weights and formula.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "Hard external deadlines need a scheduled wakeup, not just message-driven nudges.",
+    "sourceType": "system"
+  },
+  {
+    "content": "Browser-based key acquisition works well against an already-signed-in console.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "The instructions in the runbook are up to date.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "System configuration lives in config.ts and loads defaults at boot.",
+    "sourceType": "human"
+  },
+  {
+    "content": "The user interface refreshes every thirty seconds.",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "Boss directive emails go out every Monday morning.",
+    "sourceType": "system"
+  },
+  {
+    "content": "Session handoff notes should be reviewed each morning.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "the payment system: overview",
+    "sourceType": "agent"
+  },
+  {
+    "content": "user: prefers WebP",
+    "sourceType": "agent"
+  },
+  {
+    "content": "our operating system is macOS",
+    "sourceType": "human"
+  },
+  {
+    "content": "the assistant coach ran drills",
+    "sourceType": "agent"
+  },
+  {
+    "content": "please ignore the stale cache and rebuild",
+    "sourceType": "agent"
+  },
+  {
+    "content": "override the default timeout to 30s",
+    "sourceType": "human"
+  },
+  {
+    "content": "we should ignore minor formatting nits during review",
+    "sourceType": "agent"
+  },
+  {
+    "content": "let's disregard the noisy alert and move on",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "[boss] approved the design in standup notes.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "[todo] update the onboarding doc next sprint.",
+    "sourceType": "human"
+  },
+  {
+    "content": "[session-notes:2026-07-05] weekly summary of shipped work.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "```json\n{\"key\": \"value\"}",
+    "sourceType": "agent"
+  },
+  {
+    "content": "```bash\nls -la\n```",
+    "sourceType": "human"
+  },
+  {
+    "content": "The mcp-servers directory holds all local MCP configs.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Safety guidelines were reviewed and instructions updated accordingly.",
+    "sourceType": "system"
+  },
+  {
+    "content": "The system: field in the config schema is optional.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Assistant: that's not a real header, just a caption in the transcript export.",
+    "sourceType": "human"
+  },
+  {
+    "content": "Let's override the color scheme in the next design pass.",
+    "sourceType": "agent"
+  },
+  {
+    "content": "Use user:pass format is NOT applicable here since we use OAuth tokens.",
+    "sourceType": "system"
+  },
+  {
+    "content": "Forget-me-not reminders are stored under the reminders table.",
+    "sourceType": "human"
+  },
+  {
+    "content": "system: nginx config\nremember to grant read access to the ops team",
+    "sourceType": "agent"
+  },
+  {
+    "content": "system: the deploy pipeline\nconfig grants read-only access by default",
+    "sourceType": "human"
+  },
+  {
+    "content": "user: contact list\n\nplease reach out and confirm attendance for the team offsite",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "the operating system: overview of updates\nteam will grant themselves elevated laptops next quarter",
+    "sourceType": "system"
+  },
+  {
+    "content": "System: quarterly roadmap notes\nWe still need to approve the vendor contract next week",
+    "sourceType": "agent"
+  },
+  {
+    "content": "assistant: coach bio\nthe player will need to obey the new scheduling policy",
+    "sourceType": "human"
+  },
+  {
+    "content": "system： staging notes\nremember to unlock the spare test accounts before Friday",
+    "sourceType": "consolidation"
+  },
+  {
+    "content": "user: onboarding checklist\n\n\nafterwards, escalate any blockers to the on-call lead",
+    "sourceType": "agent"
+  },
+  {
+    "content": "the payment system: overview and how we grant refunds to admins",
+    "sourceType": "agent"
+  },
+  {
+    "content": "our billing system: customers can override the default plan tier",
+    "sourceType": "agent"
+  },
+  {
+    "content": "the ops system: escalate incidents to the on-call admin after 15 min",
+    "sourceType": "agent"
+  }
 ]

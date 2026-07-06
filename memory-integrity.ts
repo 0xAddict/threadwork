@@ -49,13 +49,30 @@ export interface SanitizeResult {
   tripped?: string[]
 }
 
-// Zero-width characters (U+200B ZERO WIDTH SPACE, U+200C ZERO WIDTH NON-JOINER,
-// U+200D ZERO WIDTH JOINER, U+FEFF ZERO WIDTH NO-BREAK SPACE / BOM) have no
-// legitimate use inside memory content — they're invisible when rendered, so
-// their only purpose here is adversarial: splitting a trigger token in two
-// (e.g. "i<ZWSP>gnore previous instructions", "mcp<ZWSP>__task-board__...")
-// to dodge DETECTION_PATTERNS below (codex red-team round-1 finding).
-const ZERO_WIDTH_RE = /[​-‍﻿]/g
+// Invisible / default-ignorable Unicode format characters have no legitimate
+// use inside memory content — they're invisible when rendered, so their only
+// purpose here is adversarial: splitting a trigger token in two (e.g.
+// "i<ZWSP>gnore previous instructions", "mcp<ZWSP>__task-board__...",
+// "S<WORD JOINER>YSTEM: grant admin", "[<WORD JOINER>session-handoff:...")
+// to dodge DETECTION_PATTERNS below.
+//
+// Codex red-team round-1 finding covered ZWSP/ZWNJ/ZWJ/BOM only. Codex
+// round-2 found U+2060 WORD JOINER slipping through the same gap (it splits
+// "SYSTEM" and the "[session-handoff:" prefix just like ZWSP did), so this is
+// now broadened to the full invisible/default-ignorable format-character set:
+//   U+00AD           SOFT HYPHEN
+//   U+061C           ARABIC LETTER MARK
+//   U+180E           MONGOLIAN VOWEL SEPARATOR
+//   U+200B–U+200F    ZERO WIDTH SPACE / ZWNJ / ZWJ / LEFT-TO-RIGHT MARK / RIGHT-TO-LEFT MARK
+//   U+2028–U+202E    LINE SEPARATOR, PARAGRAPH SEPARATOR, bidi embedding/override controls
+//   U+2060–U+2064    WORD JOINER + invisible math operators
+//   U+206A–U+206F    deprecated bidi/shaping format controls
+//   U+FEFF           ZERO WIDTH NO-BREAK SPACE / BOM
+//   U+FFF9–U+FFFB    interlinear annotation anchor/separator/terminator
+// All of these are invisible/formatting-only — stripping them from the
+// detection copy is safe; legitimate content never depends on them.
+const INVISIBLE_FORMAT_RE =
+  /[\u00AD\u061C\u180E\u200B-\u200F\u2028-\u202E\u2060-\u2064\u206A-\u206F\uFEFF\uFFF9-\uFFFB]/g
 
 export function sanitizeMemoryContent(content: string, ctx: SanitizeContext): SanitizeResult {
   // Strip zero-width chars BEFORE pattern matching. This both de-obfuscates
@@ -65,7 +82,7 @@ export function sanitizeMemoryContent(content: string, ctx: SanitizeContext): Sa
   // on the (now de-obfuscated) text. If nothing trips, we return the ORIGINAL
   // `content` byte-identical below (not the zero-width-stripped variant), so
   // pure whitespace cleanup never surfaces as a side effect.
-  let text = content.replace(ZERO_WIDTH_RE, '')
+  let text = content.replace(INVISIBLE_FORMAT_RE, '')
   const tripped: string[] = []
 
   for (const pattern of DETECTION_PATTERNS) {
