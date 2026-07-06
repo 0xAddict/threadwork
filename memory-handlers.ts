@@ -120,6 +120,20 @@ export function handleGetBootBriefing(
  * (unsanitized) body — byte-parity with what the pre-P4 recycle SOP's
  * save_memory call wrote for the same body (marker + raw body, source_type
  * 'system'; only the ts naturally differs run-to-run).
+ *
+ * Stage 7 KO-3 quarantine (#10376063, structural defense-in-depth): the body
+ * above is sanitized best-effort (detector-based) at agent tier before being
+ * wrapped — but a DETECTOR MISS in that body is the one path where a miss
+ * would still reach source_type:'system' state:'active' importance:5 memory,
+ * i.e. active/trusted recall. So independent of detection, when the flag is
+ * ON we force the written row to state:'proposed' via markMemoryProposed().
+ * 'proposed' rows are excluded from every active-filtered trusted section
+ * (topMemories/sharedMemories/getBootBriefing all filter state='active'),
+ * so a missed payload cannot ride along into trusted recall even if no
+ * pattern trips. session-boot.sh — the sole legitimate handoff consumer —
+ * is widened to match state IN ('active','proposed') so the quarantined
+ * handoff is still found and rehydrated. Flag OFF -> state stays 'active',
+ * byte-parity with the pre-P4 recycle SOP's save_memory write.
  */
 export function handleWriteHandoff(
   args: { body: string },
@@ -135,11 +149,13 @@ export function handleWriteHandoff(
 
   const content = `[session-handoff:${deps.selfLabel}:${ts}] ${safeBody}`
 
-  return deps.mem.saveMemory({
+  const memory = deps.mem.saveMemory({
     agent: deps.selfLabel,
     content,
     category: 'fact',
     importance: 5,
     source_type: 'system',
   })
+
+  return flagOn ? deps.mem.markMemoryProposed(memory.id) : memory
 }

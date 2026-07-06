@@ -22,11 +22,18 @@
 // $HOME/.claude/mcp-servers/task-board/tasks.db — so byte-parity comparisons
 // never touch live infra either.
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach, setDefaultTimeout } from 'bun:test'
 import { unlinkSync, mkdtempSync, mkdirSync, copyFileSync, existsSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { TaskDB } from '../../db'
+
+// These integration tests spawn several bun/sqlite subprocesses per case (hook
+// run + backup-hook run + diff); under concurrent load a single case can exceed
+// bun's default 5s test timeout (observed ~5.3s). Raise the per-test default so
+// the subprocess-heavy byte-parity comparisons don't flake. Not a correctness
+// change — assertions are unchanged.
+setDefaultTimeout(20000)
 
 const TEST_DB = '/tmp/task-board-hook-sanitization-test.db'
 const CLI_PATH = new URL('../../memory-integrity-cli.ts', import.meta.url).pathname

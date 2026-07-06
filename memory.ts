@@ -772,6 +772,25 @@ export class MemoryDB {
     })
   }
 
+  /**
+   * Stage 7 KO-3 quarantine (P4 defense-in-depth, #10376063): force a
+   * memory's state to 'proposed', regardless of its current state.
+   *
+   * Used by handleWriteHandoff (memory-handlers.ts) so a DETECTOR MISS in
+   * an agent-tier-sanitized handoff body cannot reach active-filtered
+   * trusted recall (topMemories/sharedMemories/getBootBriefing all filter
+   * state='active') — the one path where a miss would otherwise elevate
+   * trust+durability, since write_handoff itself asserts source_type:
+   * 'system'/importance:5. session-boot.sh (the sole legitimate handoff
+   * consumer) is widened to match state IN ('active','proposed') so a
+   * quarantined handoff is still found for rehydration.
+   */
+  markMemoryProposed(id: number): Memory {
+    return this.taskDb.run(db => db.prepare(`
+      UPDATE memories SET state = 'proposed' WHERE id = ? RETURNING *
+    `).get(id) as Memory)
+  }
+
   /** ATM-029 (REQ-023): same authority guard as promoteMemory, for pin. */
   pinMemory(id: number, callerSourceType: SourceType): Memory | null {
     return this.taskDb.run(db => {
@@ -874,18 +893,31 @@ export class MemoryDB {
 
         const seen = new Set<number>()
         const merged: Memory[] = []
-        // 1. Relevance-led: BM25 hits first (pinned-or-not).
+        // 1. Relevance-led: BM25 hits first (pinned-or-not). ACTIVE-ONLY: this
+        //    is a TRUSTED boot-briefing section, so it must match the same
+        //    state='active' filter as role/topMemories/sharedMemories. recall()
+        //    is a general-purpose retrieval API whose candidate pool is the
+        //    broader state != 'superseded' (it may surface proposed/disputed/
+        //    archived rows to callers who want them), so we filter to 'active'
+        //    HERE at the trusted surface. Without this, the P4 Stage-7 KO-3
+        //    write_handoff quarantine (state='proposed', #10376063) leaks: a
+        //    quarantined handoff whose body overlaps the agent's active-task
+        //    query would otherwise ride into this trusted section, defeating
+        //    the "a detector miss can't reach active/trusted recall" guarantee.
         for (const m of ranked) {
           if (merged.length >= RELEVANT_LIMIT) break
+          if (m.state !== 'active') continue
           if (!seen.has(m.id)) { seen.add(m.id); merged.push(m) }
         }
         // 2. Backfill any leftover slots with top pinned/role rows so a slow day
         //    (few/no relevant hits) still yields a useful section. Ordered by
-        //    quality/importance; capped by the leftover slot count.
+        //    quality/importance; capped by the leftover slot count. ACTIVE-ONLY
+        //    for the same trusted-surface reason as (1) — a pinned-but-proposed/
+        //    disputed row must not backfill into trusted recall either.
         if (merged.length < RELEVANT_LIMIT) {
           const pinned = db.prepare(
             `SELECT * FROM memories
-             WHERE (agent = ? OR agent = 'shared') AND pinned = 1 AND state != 'superseded'
+             WHERE (agent = ? OR agent = 'shared') AND pinned = 1 AND state = 'active'
              ORDER BY quality DESC, importance DESC
              LIMIT ?`
           ).all(agent, RELEVANT_LIMIT) as Memory[]

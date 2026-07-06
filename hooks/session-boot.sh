@@ -43,7 +43,7 @@ row = db.execute("""
   SELECT id, created_at, content, source_type FROM memories
   WHERE (agent = ? OR agent = 'shared')
     AND content LIKE ?
-    AND state = 'active'
+    AND state IN ('active','proposed')
     AND created_at > datetime('now', '-24 hours')
   ORDER BY created_at DESC LIMIT 1
 """, ("${LABEL}", "[session-handoff:${LABEL}:%")).fetchone()

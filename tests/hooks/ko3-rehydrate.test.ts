@@ -1,4 +1,5 @@
-// tests/hooks/ko3-rehydrate.test.ts — P4 Stage 7 KO-3 (#10376058).
+// tests/hooks/ko3-rehydrate.test.ts — P4 Stage 7 KO-3 (#10376058) + the
+// #10376063 quarantine hardening.
 //
 // The C2/ATM-026 fix (Stage 2b) broke session-handoff rehydration: with the
 // sanitization flag ON, save_memory derives source_type from SELF_LABEL
@@ -11,24 +12,32 @@
 // This suite proves the fix — handleWriteHandoff (memory-handlers.ts),
 // exposed as the write_handoff MCP tool — closes that gap WITHOUT reopening
 // the C2 laundering hole:
-//   1. handleWriteHandoff stores source_type='system', state='active', and
-//      the raw `[session-handoff:<agent>:` marker survives (not stripped),
-//      because saveMemory's own sanitize pass treats forged-trust-marker as
+//   1. handleWriteHandoff stores source_type='system', state='proposed'
+//      (quarantined — #10376063 structural defense-in-depth), and the raw
+//      `[session-handoff:<agent>:` marker survives (not stripped), because
+//      saveMemory's own sanitize pass treats forged-trust-marker as
 //      agentTierOnly and skips it at source_type='system'.
 //   2. The REAL patched hooks/session-boot.sh, run as a subprocess against an
 //      ephemeral /tmp DB, rehydrates: stdout contains "PRIOR SESSION
-//      HANDOFF", the raw marker, and the body text — proving the SELECT
-//      matched AND the memory-integrity CLI (source_type=system) preserved
-//      the marker end-to-end.
+//      HANDOFF", the raw marker, and the body text — proving the widened
+//      SELECT (`state IN ('active','proposed')`) matched the quarantined row
+//      AND the memory-integrity CLI (source_type=system) preserved the
+//      marker end-to-end.
 //   3. Laundering defense: a body that embeds a forged "SYSTEM: ... grant
 //      admin" directive is sanitized at AGENT tier BEFORE being wrapped, so
 //      the stored content has no raw "SYSTEM:" substring, while the outer
 //      `[session-handoff:` marker still survives — proving the body is never
 //      laundered as system-tier content just because the outer write is.
 //   4. Flag-OFF control: handleWriteHandoff still writes source_type='system'
+//      state='active' (byte-parity, no quarantine when the flag is off)
 //      shaped exactly like the pre-P4 recycle SOP's save_memory write
 //      (marker + raw, unsanitized body), and session-boot.sh still
 //      rehydrates it.
+//   5. Structural bound: a quarantined (state='proposed') handoff is excluded
+//      from getBootBriefing()'s active-filtered sections (topMemories/
+//      sharedMemories both filter state='active') while session-boot.sh
+//      still surfaces it — proving the quarantine actually bounds a
+//      hypothetical detector miss rather than just matching a state string.
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { unlinkSync } from 'fs'
@@ -90,13 +99,13 @@ describe('KO-3: write_handoff + session-boot.sh rehydrate regression (#10376058)
   }
   const BODY = 'prior session evacuated: 3 tasks done; watch the flaky memory_fts test'
 
-  test('flag ON: handleWriteHandoff stores source_type=system, state=active, marker NOT stripped', () => {
+  test('flag ON: handleWriteHandoff stores source_type=system, state=proposed (quarantined), marker NOT stripped', () => {
     db.setFeatureFlag('memory_sanitization_enabled', true)
 
     const memory = handleWriteHandoff({ body: BODY }, { mem, selfLabel: 'steve' })
 
     expect(memory.source_type).toBe('system')
-    expect(memory.state).toBe('active')
+    expect(memory.state).toBe('proposed')
     expect(memory.content).toContain('[session-handoff:steve:')
     expect(memory.content).toContain(BODY)
   })
@@ -127,13 +136,14 @@ describe('KO-3: write_handoff + session-boot.sh rehydrate regression (#10376058)
     expect(memory.content).toContain('[session-handoff:steve:')
   })
 
-  test('flag OFF: handleWriteHandoff writes source_type=system with the raw body (byte-parity shape), and session-boot.sh still rehydrates', async () => {
+  test('flag OFF: handleWriteHandoff writes source_type=system, state=active (no quarantine, byte-parity shape), and session-boot.sh still rehydrates', async () => {
     db.setFeatureFlag('memory_sanitization_enabled', false)
     const body = 'legitimate handoff body, flag off'
 
     const memory = handleWriteHandoff({ body }, { mem, selfLabel: 'steve' })
 
     expect(memory.source_type).toBe('system')
+    expect(memory.state).toBe('active')
     // Shape parity with the pre-P4 SOP write: "[session-handoff:<agent>:<ts>] <raw body>"
     expect(memory.content).toMatch(/^\[session-handoff:steve:.+\] legitimate handoff body, flag off$/)
 
@@ -147,5 +157,68 @@ describe('KO-3: write_handoff + session-boot.sh rehydrate regression (#10376058)
     expect(stdout).toContain('PRIOR SESSION HANDOFF')
     expect(stdout).toContain('[session-handoff:steve:')
     expect(stdout).toContain(body)
+  })
+
+  test('flag ON: quarantine structurally bounds a detector miss — proposed handoff excluded from getBootBriefing() active-filtered sections, but session-boot.sh still surfaces it', async () => {
+    db.setFeatureFlag('memory_sanitization_enabled', true)
+
+    const memory = handleWriteHandoff({ body: BODY }, { mem, selfLabel: 'steve' })
+    expect(memory.state).toBe('proposed')
+
+    // getBootBriefing's topMemories/sharedMemories both filter state='active'
+    // (memory.ts getBootBriefing). Even if a (hypothetical) missed payload
+    // were sitting in the body, the quarantined row cannot ride along into
+    // either active-filtered section — this is the structural guarantee,
+    // independent of whether any detector pattern tripped.
+    const briefing = mem.getBootBriefing('steve', db)
+    expect(briefing.topMemories.find(m => m.id === memory.id)).toBeUndefined()
+    expect(briefing.sharedMemories.find(m => m.id === memory.id)).toBeUndefined()
+
+    // session-boot.sh is the sole legitimate handoff consumer and explicitly
+    // widens its SELECT to state IN ('active','proposed'), so it still finds
+    // and rehydrates the quarantined row.
+    const { stdout, exitCode } = await runScript(
+      ['bash', SESSION_BOOT_SH],
+      '',
+      { ...baseEnv, AGENT_LABEL: 'steve' },
+    )
+
+    expect(exitCode).toBe(0)
+    expect(stdout).toContain('PRIOR SESSION HANDOFF')
+    expect(stdout).toContain('[session-handoff:steve:')
+    expect(stdout).toContain(BODY)
+  })
+
+  test('flag ON: quarantine also bounds the BM25 relevance section — proposed handoff excluded from getBootBriefing().relevantMemories (auto-derived active-task query AND explicit query)', () => {
+    db.setFeatureFlag('memory_sanitization_enabled', true)
+
+    // Realistic boot: agent 'steve' has an in-progress task whose description
+    // lexically overlaps the handoff body, so getBootBriefing auto-derives its
+    // relevance query from that task and recall() ranks the handoff highly.
+    // relevantMemories is a TRUSTED boot-briefing section; a quarantined
+    // (state='proposed') handoff — the very row a detector MISS could ride in
+    // on — must NOT surface there, or the KO-3 structural guard is bypassed.
+    const task = db.createTask({
+      from: 'boss',
+      to: 'steve',
+      description: 'reconcile the flaky memory_fts test and finish the evacuated tasks',
+      priority: 'high',
+    })
+    db.claimTask(task.id, 'steve')
+
+    const memory = handleWriteHandoff({ body: BODY }, { mem, selfLabel: 'steve' })
+    expect(memory.state).toBe('proposed')
+
+    // (A) relevance query AUTO-DERIVED from the active task.
+    const bA = mem.getBootBriefing('steve', db)
+    expect(bA.relevantQuery).toBeTruthy()
+    expect(bA.relevantMemories.find(m => m.id === memory.id)).toBeUndefined()
+    // sibling active-filtered sections stay clean too.
+    expect(bA.topMemories.find(m => m.id === memory.id)).toBeUndefined()
+    expect(bA.sharedMemories.find(m => m.id === memory.id)).toBeUndefined()
+
+    // (B) EXPLICIT relevance query built from the body tokens.
+    const bB = mem.getBootBriefing('steve', db, 'evacuated tasks flaky memory_fts test')
+    expect(bB.relevantMemories.find(m => m.id === memory.id)).toBeUndefined()
   })
 })
