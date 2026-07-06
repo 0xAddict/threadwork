@@ -227,6 +227,18 @@ describe('sanitizeBootBriefing (ATM-030 / ATM-016, pure, side-effect-free)', () 
     // Input object was NOT mutated by sanitizeBootBriefing.
     expect(raw).toEqual(rawSnapshot)
   })
+
+  // FOLD #7 (P5 shape-drift guard): sanitizeBootBriefing must SPREAD the input
+  // rather than reconstruct a fixed 6-field object literal, so an additive
+  // field a later stage (P5) puts on BootBriefing survives sanitization
+  // untouched instead of silently being dropped.
+  test('an additive/unknown field on the briefing (P5 shape drift) survives sanitizeBootBriefing untouched', () => {
+    const raw = mem.getBootBriefing('steve', taskDb)
+    const withExtra = { ...raw, p5Field: 'x' }
+
+    const sanitized = sanitizeBootBriefing(withExtra)
+    expect((sanitized as typeof withExtra).p5Field).toBe('x')
+  })
 })
 
 describe('generateBriefing flag-gated sanitization wiring (ATM-016, ATM-030, ATM-017)', () => {

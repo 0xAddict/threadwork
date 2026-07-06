@@ -180,6 +180,11 @@ export class DecisionDB {
         let effectiveOutcome = outcome
         let effectiveRationale = rationale
         let positionSummary: string
+        // REQ-016 (call-site-agnostic): aggregate every tripped pattern id
+        // across all sanitize stages so we can tell, after the fact, whether
+        // 'forged-trust-marker' was among them — mirrors saveMemory's ATM-019
+        // audit row for this same signal.
+        const allTripped: string[] = []
 
         if (sanitizeOn) {
           // (a) Sanitize each agent-authored fragment INDIVIDUALLY before
@@ -188,20 +193,24 @@ export class DecisionDB {
           const titleSr = sanitizeMemoryContent(decision.title, { sourceType: 'agent' })
           effectiveTitle = titleSr.text
           agentStageNeutralized = agentStageNeutralized || titleSr.neutralized
+          allTripped.push(...(titleSr.tripped ?? []))
 
           const outcomeSr = sanitizeMemoryContent(outcome, { sourceType: 'agent' })
           effectiveOutcome = outcomeSr.text
           agentStageNeutralized = agentStageNeutralized || outcomeSr.neutralized
+          allTripped.push(...(outcomeSr.tripped ?? []))
 
           const rationaleSr = sanitizeMemoryContent(rationale, { sourceType: 'agent' })
           effectiveRationale = rationaleSr.text
           agentStageNeutralized = agentStageNeutralized || rationaleSr.neutralized
+          allTripped.push(...(rationaleSr.tripped ?? []))
 
           // (b) Attribution-fence each sanitized position line so a later
           // consumer can tell "the agent said this" from real system prose.
           const sanitizedPositions = positions.map(p => {
             const posSr = sanitizeMemoryContent(p.position, { sourceType: 'agent' })
             agentStageNeutralized = agentStageNeutralized || posSr.neutralized
+            allTripped.push(...(posSr.tripped ?? []))
             return `<agent-said agent="${p.agent}">${posSr.text}</agent-said>`
           })
           positionSummary = sanitizedPositions.length > 0
@@ -223,6 +232,7 @@ export class DecisionDB {
           const finalSr = sanitizeMemoryContent(memoryContent, { sourceType: 'system' })
           memoryContent = finalSr.text
           systemStageNeutralized = finalSr.neutralized
+          allTripped.push(...(finalSr.tripped ?? []))
           neutralized = neutralized || systemStageNeutralized
           state = neutralized ? 'proposed' : 'active'
         }
@@ -254,6 +264,16 @@ export class DecisionDB {
             `finalizeDecision #${decisionId}; agent-stage=${agentStageNeutralized ? 'neutralized' : 'clean'}; system-stage=${systemStageNeutralized ? 'neutralized' : 'clean'}`,
             memory.id,
           )
+
+          // REQ-016 (call-site-agnostic): a forged trust marker anywhere in
+          // the tripped set (title/outcome/rationale/position/final pass)
+          // also gets its own memory_marker_neutralized row.
+          if (allTripped.includes('forged-trust-marker')) {
+            db.prepare(`
+              INSERT INTO audit_log (agent, action, detail, memory_id)
+              VALUES ('system', 'memory_marker_neutralized', ?, ?)
+            `).run(`finalizeDecision #${decisionId}; tripped=${allTripped.join(',')}`, memory.id)
+          }
         }
 
         // 3. Link memory_id back to decision
@@ -316,15 +336,19 @@ export class DecisionDB {
         let agentStageNeutralized = false
         let effectiveTitle = decision.title
         let positionSummary: string
+        // REQ-016 (call-site-agnostic): see finalizeDecision for rationale.
+        const allTripped: string[] = []
 
         if (sanitizeOn) {
           const titleSr = sanitizeMemoryContent(decision.title, { sourceType: 'agent' })
           effectiveTitle = titleSr.text
           agentStageNeutralized = agentStageNeutralized || titleSr.neutralized
+          allTripped.push(...(titleSr.tripped ?? []))
 
           const sanitizedPositions = positions.map(p => {
             const posSr = sanitizeMemoryContent(p.position, { sourceType: 'agent' })
             agentStageNeutralized = agentStageNeutralized || posSr.neutralized
+            allTripped.push(...(posSr.tripped ?? []))
             return `<agent-said agent="${p.agent}">${posSr.text}</agent-said>`
           })
           positionSummary = sanitizedPositions.length > 0
@@ -345,6 +369,7 @@ export class DecisionDB {
           const finalSr = sanitizeMemoryContent(memoryContent, { sourceType: 'system' })
           memoryContent = finalSr.text
           systemStageNeutralized = finalSr.neutralized
+          allTripped.push(...(finalSr.tripped ?? []))
           neutralized = neutralized || systemStageNeutralized
           state = neutralized ? 'proposed' : 'active'
         }
@@ -374,6 +399,15 @@ export class DecisionDB {
             `expireDecision #${decisionId}; agent-stage=${agentStageNeutralized ? 'neutralized' : 'clean'}; system-stage=${systemStageNeutralized ? 'neutralized' : 'clean'}`,
             memory.id,
           )
+
+          // REQ-016 (call-site-agnostic): mirror finalizeDecision's dedicated
+          // memory_marker_neutralized row when a forged trust marker tripped.
+          if (allTripped.includes('forged-trust-marker')) {
+            db.prepare(`
+              INSERT INTO audit_log (agent, action, detail, memory_id)
+              VALUES ('system', 'memory_marker_neutralized', ?, ?)
+            `).run(`expireDecision #${decisionId}; tripped=${allTripped.join(',')}`, memory.id)
+          }
         }
 
         // 3. Link memory_id

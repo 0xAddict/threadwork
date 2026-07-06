@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "start": "bun server.ts",
-    "test": "bun test"
+    "test": "bun run typecheck:p4 && bun test",
+    "test:unit": "bun test",
+    "typecheck:p4": "./scripts/typecheck-p4.sh"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.82.0",

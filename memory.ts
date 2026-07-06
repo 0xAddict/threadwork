@@ -339,6 +339,16 @@ export class MemoryDB {
             INSERT INTO audit_log (agent, action, detail, memory_id)
             VALUES ('system', 'memory_content_neutralized', ?, ?)
           `).run(`tripped=${(sr!.tripped ?? []).join(',')}`, replacement.id)
+
+          // REQ-016 (call-site-agnostic): whenever a forged trust marker is
+          // among the tripped patterns, ALSO emit memory_marker_neutralized —
+          // mirrors saveMemory's ATM-019 audit row for this same signal.
+          if (sr!.tripped?.includes('forged-trust-marker')) {
+            db.prepare(`
+              INSERT INTO audit_log (agent, action, detail, memory_id)
+              VALUES ('system', 'memory_marker_neutralized', ?, ?)
+            `).run(`tripped=${(sr!.tripped ?? []).join(',')}`, replacement.id)
+          }
         }
         if (foundationalDowngrade) {
           db.prepare(`

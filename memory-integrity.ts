@@ -49,8 +49,23 @@ export interface SanitizeResult {
   tripped?: string[]
 }
 
+// Zero-width characters (U+200B ZERO WIDTH SPACE, U+200C ZERO WIDTH NON-JOINER,
+// U+200D ZERO WIDTH JOINER, U+FEFF ZERO WIDTH NO-BREAK SPACE / BOM) have no
+// legitimate use inside memory content — they're invisible when rendered, so
+// their only purpose here is adversarial: splitting a trigger token in two
+// (e.g. "i<ZWSP>gnore previous instructions", "mcp<ZWSP>__task-board__...")
+// to dodge DETECTION_PATTERNS below (codex red-team round-1 finding).
+const ZERO_WIDTH_RE = /[​-‍﻿]/g
+
 export function sanitizeMemoryContent(content: string, ctx: SanitizeContext): SanitizeResult {
-  let text = content
+  // Strip zero-width chars BEFORE pattern matching. This both de-obfuscates
+  // split tokens (so the existing patterns can trip on them) and is itself a
+  // benign cleanup. Per the fold contract: stripping alone must NOT count as
+  // "neutralized" — only set neutralized when a DETECTION_PATTERN also trips
+  // on the (now de-obfuscated) text. If nothing trips, we return the ORIGINAL
+  // `content` byte-identical below (not the zero-width-stripped variant), so
+  // pure whitespace cleanup never surfaces as a side effect.
+  let text = content.replace(ZERO_WIDTH_RE, '')
   const tripped: string[] = []
 
   for (const pattern of DETECTION_PATTERNS) {
@@ -110,7 +125,13 @@ export function sanitizeBootBriefing(briefing: BootBriefing): BootBriefing {
     ? null
     : sanitizeMemoryContent(briefing.relevantQuery, { sourceType: 'agent' }).text
 
+  // ATM-034/FOLD #7: SPREAD the input rather than reconstructing a fixed
+  // 6-field object literal. A hardcoded reconstruction silently drops any
+  // additive field a later stage (P5) adds to BootBriefing — this way,
+  // whatever the caller passed through (known fields OR future ones) survives
+  // untouched except for the specific fields we deliberately re-sanitize below.
   return {
+    ...briefing,
     role: sanitizeMemories(briefing.role),
     topMemories: sanitizeMemories(briefing.topMemories),
     sharedMemories: sanitizeMemories(briefing.sharedMemories),
