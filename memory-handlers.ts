@@ -9,7 +9,7 @@
 // line 1892 top-level `await mcp.connect(...)`).
 import type { MemoryDB, SaveMemoryInput, Memory, SourceType, Classification, BootBriefing } from './memory'
 import type { TaskDB } from './db'
-import { sanitizeBootBriefing } from './memory-integrity'
+import { sanitizeBootBriefing, sanitizeMemoryContent } from './memory-integrity'
 
 /**
  * Extracted body of server.ts `case 'save_memory':` (C2 crux). Parses the
@@ -75,4 +75,71 @@ export function handleGetBootBriefing(
   const query = args.query as string | undefined
   const raw = deps.mem.getBootBriefing(deps.selfLabel, deps.taskDb, query)
   return deps.mem.isSanitizationEnabled() ? sanitizeBootBriefing(raw) : raw
+}
+
+/**
+ * Stage 7 KO-3 (#10376058): the AUTHORIZED system-tier session-handoff write
+ * path. Fixes the rehydrate break caused by the C2/ATM-026 fix: the recycle
+ * SOP used to write handoffs via save_memory, but with the sanitization flag
+ * ON, save_memory now derives source_type from SELF_LABEL ('agent') — so the
+ * forged-trust-marker pattern (agentTierOnly, memory-integrity-patterns.ts)
+ * strips the `[session-handoff:` marker at write time, and session-boot.sh's
+ * `content LIKE '[session-handoff:LABEL:%'` SELECT no longer matches.
+ *
+ * write_handoff is a NARROW, trusted server-internal callsite — NOT a general
+ * laundering escape hatch. It enforces all three of:
+ *
+ *   1. The `[session-handoff:<agent>:<ts>]` marker is SERVER-CONSTRUCTED from
+ *      the authenticated deps.selfLabel and a server-generated timestamp.
+ *      Neither is taken from caller args — the agent cannot forge the agent
+ *      id or the ts embedded in its own marker.
+ *   2. The agent-authored body is sanitized at AGENT tier
+ *      (sanitizeMemoryContent(body, { sourceType: 'agent' })) BEFORE it is
+ *      wrapped in the marker. An embedded forged marker / SYSTEM: header /
+ *      directive in the body is neutralized here — it is never laundered as
+ *      system-tier content just because the outer write is source_type:
+ *      'system'.
+ *   3. saveMemory() is called with source_type: 'system' hardcoded in this
+ *      function — never derived from caller args — and this handler writes
+ *      ONLY handoff-category memories (fixed category: 'fact', fixed
+ *      marker shape), not arbitrary agent-supplied content/category/
+ *      source_type combinations. This is a trusted in-process construction of
+ *      SaveMemoryInput (allowed to assert source_type: 'system' per REQ-020);
+ *      it is NOT the save_memory MCP tool, so it is exempt from the ATM-026
+ *      SELF_LABEL-derivation that handler applies to caller-facing saves.
+ *
+ * Because the assembled content is written at source_type: 'system', its own
+ * saveMemory-internal sanitize pass (flag ON) treats forged-trust-marker as
+ * agentTierOnly and skips it — the outer `[session-handoff:` marker survives.
+ * Every OTHER pattern (fake-role-header, ignore-instructions, fenced-directive,
+ * embedded-tool-call) is not agentTierOnly and still sweeps the assembled
+ * content regardless of tier; the body was already agent-tier sanitized above,
+ * so in practice nothing new should trip there.
+ *
+ * Flag OFF: this function still writes source_type: 'system' with the RAW
+ * (unsanitized) body — byte-parity with what the pre-P4 recycle SOP's
+ * save_memory call wrote for the same body (marker + raw body, source_type
+ * 'system'; only the ts naturally differs run-to-run).
+ */
+export function handleWriteHandoff(
+  args: { body: string },
+  deps: { mem: MemoryDB; selfLabel: string },
+): Memory {
+  const ts = new Date().toISOString()
+  const flagOn = deps.mem.isSanitizationEnabled()
+
+  const rawBody = String(args.body ?? '')
+  const safeBody = flagOn
+    ? sanitizeMemoryContent(rawBody, { sourceType: 'agent' }).text
+    : rawBody
+
+  const content = `[session-handoff:${deps.selfLabel}:${ts}] ${safeBody}`
+
+  return deps.mem.saveMemory({
+    agent: deps.selfLabel,
+    content,
+    category: 'fact',
+    importance: 5,
+    source_type: 'system',
+  })
 }

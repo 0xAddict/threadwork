@@ -25,7 +25,7 @@ import {
 import { DB_PATH, SELF_LABEL, AGENT_SESSIONS, TMUX_PATH, TEAM_AGENTS, assertAgentIdentity } from './config'
 
 import { MemoryDB } from './memory'
-import { handleSaveMemory, handleGetBootBriefing } from './memory-handlers'
+import { handleSaveMemory, handleGetBootBriefing, handleWriteHandoff } from './memory-handlers'
 import { isDenseEnabled } from './dense'
 import { DecisionDB, expireStaleDecisions } from './decision'
 import { forceDebrief } from './debrief'
@@ -240,6 +240,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['content', 'category'],
+      },
+    },
+    {
+      name: 'write_handoff',
+      description: 'Write an authorized session-handoff memory (recycle SOP). Wraps your body in a server-constructed [session-handoff:<you>:<ts>] marker at source_type=system, so it survives sanitization and session-boot.sh can rehydrate it. Use this instead of save_memory for handoff writes.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', description: 'The handoff body text (what the next session should know). Do NOT include the [session-handoff:...] marker yourself — it is server-constructed.' },
+        },
+        required: ['content'],
       },
     },
     {
@@ -1049,6 +1060,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         return { content: [{ type: 'text', text: `Memory #${memory.id} saved (importance: ${memory.importance}${memory.pinned ? ', pinned' : ''})` }] }
+      }
+
+      case 'write_handoff': {
+        // Stage 7 KO-3 (#10376058): authorized system-tier handoff write path.
+        // handleWriteHandoff (memory-handlers.ts) constructs the
+        // [session-handoff:<SELF_LABEL>:<server-ts>] marker itself — the caller
+        // supplies ONLY the body text. See that function's doc comment for the
+        // full anti-laundering contract (server-constructed marker, agent-tier
+        // body sanitize before wrap, hardcoded source_type: 'system').
+        const body = (args.content ?? args.body) as string
+        const memory = handleWriteHandoff({ body }, { mem, selfLabel: SELF_LABEL })
+        audit.log(SELF_LABEL, 'handoff_written', { importance: memory.importance }, undefined, memory.id)
+        return { content: [{ type: 'text', text: `Handoff memory #${memory.id} written for ${SELF_LABEL}.` }] }
       }
 
       case 'recall_memories': {
