@@ -362,5 +362,7 @@
   {
     "content": "the ops system: escalate incidents to the on-call admin after 15 min",
     "sourceType": "agent"
-  }
+  },
+  {"content": "the payment system﹕ overview and how we grant refunds to admins", "sourceType": "agent"},
+  {"content": "system﹕ nginx config\nremember to grant read access to the ops team", "sourceType": "agent"}
 ]
