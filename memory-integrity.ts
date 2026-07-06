@@ -29,7 +29,8 @@
  *     otherwise.
  */
 import type { Database } from 'bun:sqlite'
-import type { SourceType, Classification } from './memory'
+import type { SourceType, Classification, Memory, BootBriefing } from './memory'
+import type { Task } from './db'
 import { DETECTION_PATTERNS, type DetectionPattern } from './memory-integrity-patterns'
 
 // Most-privileged-first. Index 0 is the most privileged tier; a lower index
@@ -77,6 +78,46 @@ export function sanitizeMemoryContent(content: string, ctx: SanitizeContext): Sa
   }
 
   return { text, neutralized: true, tripped }
+}
+
+/**
+ * ATM-030 / ATM-016: sanitizes every free-text field carried by a boot
+ * briefing before it can be echoed back to an agent (or written to a
+ * consolidated briefing file). PURE + side-effect-free: no db, no audit —
+ * KO-2 narrowed REQ-016 to write-time, so the read path here stays pure.
+ * Returns a NEW BootBriefing; the input is never mutated.
+ *
+ * Each memory row is sanitized with its OWN source_type (reused, not
+ * reassigned) — sanitizeMemoryContent is idempotent, so this is safe to run
+ * again on rows that were already sanitized at write-time. Tasks carry no
+ * stored source_type, so recentTasks/relevantQuery free-text is sanitized
+ * conservatively as sourceType: 'agent'.
+ */
+export function sanitizeBootBriefing(briefing: BootBriefing): BootBriefing {
+  const sanitizeMemories = (memories: Memory[]): Memory[] =>
+    memories.map((m) => ({
+      ...m,
+      content: sanitizeMemoryContent(m.content, { sourceType: m.source_type }).text,
+    }))
+
+  const recentTasks: Task[] = briefing.recentTasks.map((t) => ({
+    ...t,
+    description: sanitizeMemoryContent(t.description, { sourceType: 'agent' }).text,
+    result: t.result === null ? null : sanitizeMemoryContent(t.result, { sourceType: 'agent' }).text,
+  }))
+
+  const relevantQuery = briefing.relevantQuery === null
+    ? null
+    : sanitizeMemoryContent(briefing.relevantQuery, { sourceType: 'agent' }).text
+
+  return {
+    role: sanitizeMemories(briefing.role),
+    topMemories: sanitizeMemories(briefing.topMemories),
+    sharedMemories: sanitizeMemories(briefing.sharedMemories),
+    recentTasks,
+    relevantMemories: sanitizeMemories(briefing.relevantMemories),
+    relevantQuery,
+  }
 }
 
 /**

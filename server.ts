@@ -25,7 +25,7 @@ import {
 import { DB_PATH, SELF_LABEL, AGENT_SESSIONS, TMUX_PATH, TEAM_AGENTS, assertAgentIdentity } from './config'
 
 import { MemoryDB } from './memory'
-import { handleSaveMemory } from './memory-handlers'
+import { handleSaveMemory, handleGetBootBriefing } from './memory-handlers'
 import { isDenseEnabled } from './dense'
 import { DecisionDB, expireStaleDecisions } from './decision'
 import { forceDebrief } from './debrief'
@@ -1093,8 +1093,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           })
         }
 
-        const bootQuery = args.query as string | undefined
-        const briefing = mem.getBootBriefing(SELF_LABEL, db, bootQuery)
+        const briefing = handleGetBootBriefing(args, { mem, taskDb: db, selfLabel: SELF_LABEL })
         const sections: string[] = []
 
         if (briefing.role.length > 0) {

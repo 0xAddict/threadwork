@@ -7,7 +7,9 @@
 // the live MCP connection that server.ts triggers at module-load time
 // (server.ts:41-42 `new TaskDB(DB_PATH)`, line 1890 `assertAgentIdentity()`,
 // line 1892 top-level `await mcp.connect(...)`).
-import type { MemoryDB, SaveMemoryInput, Memory, SourceType, Classification } from './memory'
+import type { MemoryDB, SaveMemoryInput, Memory, SourceType, Classification, BootBriefing } from './memory'
+import type { TaskDB } from './db'
+import { sanitizeBootBriefing } from './memory-integrity'
 
 /**
  * Extracted body of server.ts `case 'save_memory':` (C2 crux). Parses the
@@ -51,4 +53,26 @@ export function handleSaveMemory(
   }
 
   return deps.mem.saveMemory(input)
+}
+
+/**
+ * Extracted body of server.ts `case 'get_boot_briefing':` (ATM-032), mirroring
+ * handleSaveMemory above. SIDE-EFFECT-FREE ON IMPORT — same rationale as the
+ * module header: no connect()/assertAgentIdentity(), no new TaskDB constructed
+ * here, so tests can import this directly without standing up the live MCP
+ * connection server.ts triggers at module-load time.
+ *
+ * REQ-016 (ATM-030/ATM-016/ATM-017): when the P4 sanitization flag is ON, the
+ * raw briefing is passed through sanitizeBootBriefing() before being returned
+ * — every free-text field (memory content, task descriptions/results, the
+ * relevance query) is neutralized. When the flag is OFF, the raw briefing is
+ * returned untouched (byte-parity with pre-P4 behavior).
+ */
+export function handleGetBootBriefing(
+  args: Record<string, unknown>,
+  deps: { mem: MemoryDB; taskDb: TaskDB; selfLabel: string },
+): BootBriefing {
+  const query = args.query as string | undefined
+  const raw = deps.mem.getBootBriefing(deps.selfLabel, deps.taskDb, query)
+  return deps.mem.isSanitizationEnabled() ? sanitizeBootBriefing(raw) : raw
 }
