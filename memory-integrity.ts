@@ -144,6 +144,20 @@ export function sanitizeMemoryContent(content: string, ctx: SanitizeContext): Sa
 }
 
 /**
+ * Codex R4 F1 fold: make the <agent-said> attribution fence UNBREAKABLE.
+ * Escapes angle brackets in an agent-authored fragment before it is
+ * interpolated inside `<agent-said agent="...">…</agent-said>`, so a payload
+ * can never emit a literal `</agent-said>` closing tag (or any tag) and break
+ * out of the fence into what would read as a top-level system directive.
+ * PURE text transform — it does NOT set `neutralized`, so a benign fragment
+ * with no angle brackets is byte-identical and the surrounding decision memory
+ * still lands state='active' (decision-recall semantics preserved).
+ */
+export function escapeFenceFragment(text: string): string {
+  return text.replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/**
  * ATM-030 / ATM-016: sanitizes every free-text field carried by a boot
  * briefing before it can be echoed back to an agent (or written to a
  * consolidated briefing file). PURE + side-effect-free: no db, no audit —

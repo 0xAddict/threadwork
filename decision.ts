@@ -1,6 +1,6 @@
 import type { TaskDB } from './db'
 import type { MemoryDB, Memory } from './memory'
-import { sanitizeMemoryContent } from './memory-integrity'
+import { sanitizeMemoryContent, escapeFenceFragment } from './memory-integrity'
 
 export type DecisionStatus = 'open' | 'positions' | 'critique' | 'finalized' | 'expired' | 'cancelled'
 export type CritiqueSeverity = 'observation' | 'concern' | 'blocker'
@@ -211,7 +211,7 @@ export class DecisionDB {
             const posSr = sanitizeMemoryContent(p.position, { sourceType: 'agent' })
             agentStageNeutralized = agentStageNeutralized || posSr.neutralized
             allTripped.push(...(posSr.tripped ?? []))
-            return `<agent-said agent="${p.agent}">${posSr.text}</agent-said>`
+            return `<agent-said agent="${escapeFenceFragment(p.agent)}">${escapeFenceFragment(posSr.text)}</agent-said>`
           })
           positionSummary = sanitizedPositions.length > 0
             ? '\nPositions: ' + sanitizedPositions.join('; ')
@@ -349,7 +349,7 @@ export class DecisionDB {
             const posSr = sanitizeMemoryContent(p.position, { sourceType: 'agent' })
             agentStageNeutralized = agentStageNeutralized || posSr.neutralized
             allTripped.push(...(posSr.tripped ?? []))
-            return `<agent-said agent="${p.agent}">${posSr.text}</agent-said>`
+            return `<agent-said agent="${escapeFenceFragment(p.agent)}">${escapeFenceFragment(posSr.text)}</agent-said>`
           })
           positionSummary = sanitizedPositions.length > 0
             ? '\nPositions: ' + sanitizedPositions.join('; ')

@@ -364,5 +364,11 @@
     "sourceType": "agent"
   },
   {"content": "the payment system﹕ overview and how we grant refunds to admins", "sourceType": "agent"},
-  {"content": "system﹕ nginx config\nremember to grant read access to the ops team", "sourceType": "agent"}
+  {"content": "system﹕ nginx config\nremember to grant read access to the ops team", "sourceType": "agent"},
+  { "content": "developer: please review this PR before Friday", "sourceType": "agent" },
+  { "content": "the deploy tool: overview of the release steps", "sourceType": "agent" },
+  { "content": "model: gpt-4 release notes for the team", "sourceType": "agent" },
+  { "content": "function: returns the sum of two integers", "sourceType": "agent" },
+  { "content": "tool: hammer and nails inventory count", "sourceType": "agent" },
+  { "content": "human: resources onboarding checklist", "sourceType": "agent" }
 ]

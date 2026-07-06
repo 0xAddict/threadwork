@@ -10,7 +10,7 @@ import { DecisionDB } from './decision'
 import { AuditLog } from './audit'
 import { postToGroup } from './notify'
 import { DEBRIEF_DEFAULTS, TEAM_AGENTS } from './config'
-import { sanitizeMemoryContent } from './memory-integrity'
+import { sanitizeMemoryContent, escapeFenceFragment } from './memory-integrity'
 
 // ---------------------------------------------------------------------------
 // P4 anti-laundering, Stage 4 (#10376048/EPIC-03): defense-in-depth on the
@@ -493,7 +493,7 @@ export class DebriefDaemon {
       for (const [agent, tasks] of byAgent) {
         sections.push(`${agent}: ${tasks.length} tasks completed`)
         for (const t of tasks) {
-          const line = sanitizeOn ? `<agent-said agent="${agent}">${t.description}</agent-said>` : t.description
+          const line = sanitizeOn ? `<agent-said agent="${escapeFenceFragment(agent)}">${escapeFenceFragment(t.description)}</agent-said>` : t.description
           sections.push(`  #${t.id}: ${line}`)
         }
       }
@@ -513,7 +513,7 @@ export class DebriefDaemon {
       }
       for (const [key, details] of uniqueBlockers) {
         const agent = key.slice(0, key.indexOf(':'))
-        const line = sanitizeOn ? `<agent-said agent="${agent}">${details[0]}</agent-said>` : details[0]
+        const line = sanitizeOn ? `<agent-said agent="${escapeFenceFragment(agent)}">${escapeFenceFragment(details[0])}</agent-said>` : details[0]
         sections.push(`${key}: ${line}`)
       }
     }
@@ -653,21 +653,23 @@ export class DebriefDaemon {
           source_type: 'system',
         })
 
-        if (sanitizeOn && spanNeutralized) {
-          // ATM-012 idempotence interaction: saveMemory's own neutralize
-          // detection re-runs sanitizeMemoryContent over content that is
-          // ALREADY clean (we pre-sanitized at agent tier, and every pattern
-          // is idempotent), so it finds nothing new and does NOT set
-          // state='proposed' on its own. persist() owns marking its
-          // neutralized-span memories for review — force it here via a
-          // plain UPDATE (no transaction/lock primitive).
+        if (sanitizeOn) {
+          // codex R4 F2 fold: STRUCTURAL quarantine. When the flag is ON, force
+          // the agent-derived blocker-span memory to state='proposed'
+          // UNCONDITIONALLY — regardless of whether the detector tripped. A
+          // detector MISS must never promote agent-authored blocker text into
+          // active trusted shared recall (mirrors the r3 write_handoff
+          // state='proposed' structural guarantee). The
+          // 'debrief_content_sanitized' audit row still fires ONLY when content
+          // was actually neutralized (semantic accuracy + ATM-021).
           this.taskDb.run(db => {
             db.prepare(`UPDATE memories SET state = 'proposed' WHERE id = ?`).run(saved.id)
-            // ATM-021
-            db.prepare(`
-              INSERT INTO audit_log (agent, action, detail, memory_id)
-              VALUES ('system', 'debrief_content_sanitized', ?, ?)
-            `).run(`persist blocker-span agent=${agent}`, saved.id)
+            if (spanNeutralized) {
+              db.prepare(`
+                INSERT INTO audit_log (agent, action, detail, memory_id)
+                VALUES ('system', 'debrief_content_sanitized', ?, ?)
+              `).run(`persist blocker-span agent=${agent}`, saved.id)
+            }
           })
         }
       }

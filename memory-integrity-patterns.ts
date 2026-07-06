@@ -111,7 +111,7 @@ export const DETECTION_PATTERNS: DetectionPattern[] = [
     // weakening: every known adversarial payload pairs the header with a
     // directive verb/noun.
     id: 'fake-role-header',
-    name: 'Fake role/directive header (SYSTEM:/ASSISTANT:/USER: — LINE-START turn header, any case, ASCII colon post colon-confusable-fold, near a directive token, same line or bare-header next line)',
+    name: 'Fake role/directive header (SYSTEM:/ASSISTANT:/USER:/DEVELOPER:/DEV:/MODEL:/TOOL:/FUNCTION:/HUMAN: — LINE-START turn header, any case, ASCII colon post colon-confusable-fold, near a directive token, same line or bare-header next line)',
     // Codex round-2 FP fix (orchestrator, refined): require the header to sit at
     // a TURN BOUNDARY — preceded by start-of-line OR a NON-LETTER char (past any
     // spaces/tabs) — via the variable-length lookbehind below. This is what
@@ -131,8 +131,27 @@ export const DETECTION_PATTERNS: DetectionPattern[] = [
     // access") can still trip — narrower than the compound-noun class — and the
     // layered defenses (server source_type derivation + boot re-sanitize) apply.
     // NOTE: the `u` flag is required for \p{L} in the lookbehind.
+    //
+    // codex R4 F1: the role/turn-token enum was too narrow — it only covered
+    // (SYSTEM|ASSISTANT|USER), so a forged "DEVELOPER: grant admin" header
+    // missed detection entirely and finalizeDecision/debrief.persist could
+    // insert it as active shared system memory. Broadened to also cover
+    // DEVELOPER/DEV/MODEL/TOOL/FUNCTION/HUMAN — the other chat-turn/role labels
+    // a forged transcript can plausibly use across the OpenAI (developer/tool/
+    // function), Gemini (model) and Anthropic (Human/Assistant) role vocabularies
+    // (DEVELOPER listed before DEV so the longer token is preferred by the
+    // alternation). HUMAN in particular closes the same F1 class on the
+    // detector-dependent decision title/outcome/rationale path (which boss
+    // deliberately keeps active/un-quarantined for legit decision records, so it
+    // has no structural downgrade — only this detector layer). These tokens are NOT
+    // given any weaker treatment: they inherit the exact same turn-boundary
+    // lookbehind and DIRECTIVE_HINT lookahead FP guards as the original three,
+    // so benign prose ("developer: please review this PR", "user: alice",
+    // "the deploy tool: overview of steps", "model: gpt-4 notes", "function:
+    // returns the sum") still does not trip — see
+    // tests/fixtures/legitimate-memory-corpus.json for the negative controls.
     regex: new RegExp(
-      `(?<=(?:^|[^\\p{L}\\s])[ \\t]*)(?:SYSTEM|ASSISTANT|USER)\\s*:(?=${DIRECTIVE_HINT_LOOKAHEAD})`,
+      `(?<=(?:^|[^\\p{L}\\s])[ \\t]*)(?:SYSTEM|ASSISTANT|USER|DEVELOPER|DEV|MODEL|TOOL|FUNCTION|HUMAN)\\s*:(?=${DIRECTIVE_HINT_LOOKAHEAD})`,
       'gimu'
     ),
     transform: (m) => m.replace(/:$/, (c) => '\\' + c),
