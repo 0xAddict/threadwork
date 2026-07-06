@@ -14,12 +14,27 @@
  * This module also re-exports SourceType, Classification, and DetectionPattern
  * so P5 and other consumers can import everything they need from one place.
  *
- * Stage 1 scope: ONLY sanitizeMemoryContent + these types. sanitizeBootBriefing,
- * isClassificationElevation, and guardClassificationElevation are later stages
- * and are deliberately NOT implemented here.
+ * Stage 1 scope: ONLY sanitizeMemoryContent + these types. sanitizeBootBriefing
+ * is a later stage and is deliberately NOT implemented here.
+ *
+ * Stage 5a (#10376048/ATM-015, ATM-033) adds the consolidation trust-tier
+ * ceiling primitives:
+ *   isClassificationElevation(beforeTier, attemptedTier) — pure predicate,
+ *     zero I/O. True iff attemptedTier ranks strictly more privileged than
+ *     beforeTier (tier order most-privileged-first: foundational, strategic,
+ *     operational, observational, ephemeral).
+ *   guardClassificationElevation(beforeTier, attemptedTier, memoryId, ctx) —
+ *     audited wrapper. Blocks (returns false + writes an audit_log row) when
+ *     an elevation is attempted; is a silent no-op (returns true, no row)
+ *     otherwise.
  */
+import type { Database } from 'bun:sqlite'
 import type { SourceType, Classification } from './memory'
 import { DETECTION_PATTERNS, type DetectionPattern } from './memory-integrity-patterns'
+
+// Most-privileged-first. Index 0 is the most privileged tier; a lower index
+// means MORE privileged.
+const TIER_ORDER: Classification[] = ['foundational', 'strategic', 'operational', 'observational', 'ephemeral']
 
 export type { SourceType, Classification, DetectionPattern }
 
@@ -62,4 +77,34 @@ export function sanitizeMemoryContent(content: string, ctx: SanitizeContext): Sa
   }
 
   return { text, neutralized: true, tripped }
+}
+
+/**
+ * ATM-015: pure predicate, zero I/O (no db, no audit). Returns true iff
+ * attemptedTier ranks STRICTLY ABOVE beforeTier (i.e. attempted is more
+ * privileged — a lower index in TIER_ORDER).
+ */
+export function isClassificationElevation(beforeTier: Classification, attemptedTier: Classification): boolean {
+  return TIER_ORDER.indexOf(attemptedTier) < TIER_ORDER.indexOf(beforeTier)
+}
+
+/**
+ * ATM-033: audited wrapper around isClassificationElevation. When an
+ * elevation is attempted, BLOCKS it (returns false) and writes an
+ * audit_log row recording the attempted-vs-actual tier. When there is no
+ * elevation, permits it as a silent no-op (returns true, no audit row).
+ */
+export function guardClassificationElevation(
+  beforeTier: Classification,
+  attemptedTier: Classification,
+  memoryId: number,
+  ctx: { db: Database }
+): boolean {
+  if (isClassificationElevation(beforeTier, attemptedTier)) {
+    ctx.db.prepare(
+      `INSERT INTO audit_log (agent, action, detail, memory_id) VALUES ('consolidator', 'consolidation_survivor_elevation_blocked', ?, ?)`
+    ).run(`Blocked elevation attempt: before=${beforeTier}, attempted=${attemptedTier}`, memoryId)
+    return false
+  }
+  return true
 }

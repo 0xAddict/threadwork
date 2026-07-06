@@ -2,8 +2,11 @@
 // ATM-001 / ATM-007: core sanitizeMemoryContent behavior.
 // ATM-004: idempotence over the adversarial corpus.
 
-import { describe, test, expect } from 'bun:test'
-import { sanitizeMemoryContent } from '../memory-integrity'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { sanitizeMemoryContent, isClassificationElevation, guardClassificationElevation } from '../memory-integrity'
+import type { Classification } from '../memory'
+import { TaskDB } from '../db'
+import { unlinkSync } from 'fs'
 import adversarialCorpus from './fixtures/adversarial-memory-corpus.json'
 
 describe('sanitizeMemoryContent (Stage 1 core)', () => {
@@ -62,5 +65,103 @@ describe('sanitizeMemoryContent (Stage 1 core)', () => {
     const applyTwice = sanitizeMemoryContent(sanitizeMemoryContent(x, ctx).text, ctx).text
     const applyOnce = sanitizeMemoryContent(x, ctx).text
     expect(applyTwice).toBe(applyOnce)
+  })
+})
+
+// Stage 5a (#10376048/ATM-015): consolidation trust-tier ceiling primitives.
+describe('isClassificationElevation (ATM-015, pure predicate)', () => {
+  const ORDER: Classification[] = ['foundational', 'strategic', 'operational', 'observational', 'ephemeral']
+
+  // Hand-authored truth table (NOT derived by reusing the implementation's own
+  // ORDER.indexOf comparison) of the 10 pairs where attemptedTier is strictly
+  // more privileged than beforeTier, per the tier order:
+  // foundational > strategic > operational > observational > ephemeral.
+  const ELEVATION_PAIRS = new Set<string>([
+    'strategic:foundational',
+    'operational:foundational',
+    'operational:strategic',
+    'observational:foundational',
+    'observational:strategic',
+    'observational:operational',
+    'ephemeral:foundational',
+    'ephemeral:strategic',
+    'ephemeral:operational',
+    'ephemeral:observational',
+  ])
+
+  test('true for exactly the 10 strictly-more-privileged pairs across the full 5x5 = 25 matrix, false for the other 15 — direct call, no DB/mock I/O', () => {
+    let trueCount = 0
+    let falseCount = 0
+    for (const beforeTier of ORDER) {
+      for (const attemptedTier of ORDER) {
+        const expected = ELEVATION_PAIRS.has(`${beforeTier}:${attemptedTier}`)
+        const actual = isClassificationElevation(beforeTier, attemptedTier)
+        expect(actual).toBe(expected)
+        actual ? trueCount++ : falseCount++
+      }
+    }
+    expect(trueCount).toBe(10)
+    expect(falseCount).toBe(15)
+  })
+
+  test('equal tiers are never an elevation (the 5 diagonal pairs)', () => {
+    for (const tier of ORDER) {
+      expect(isClassificationElevation(tier, tier)).toBe(false)
+    }
+  })
+
+  test('spot check: ephemeral -> foundational (max possible elevation) is true', () => {
+    expect(isClassificationElevation('ephemeral', 'foundational')).toBe(true)
+  })
+
+  test('spot check: foundational -> ephemeral (a downgrade, not an elevation) is false', () => {
+    expect(isClassificationElevation('foundational', 'ephemeral')).toBe(false)
+  })
+})
+
+describe('guardClassificationElevation (ATM-033, audited wrapper)', () => {
+  const TEST_DB = '/tmp/test-memory-integrity-guard.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(TEST_DB + suffix) } catch {}
+    }
+    taskDb = new TaskDB(TEST_DB)
+  })
+
+  afterEach(() => {
+    taskDb.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(TEST_DB + suffix) } catch {}
+    }
+  })
+
+  function elevationBlockedRows(): Array<{ agent: string; action: string; detail: string; memory_id: number }> {
+    return taskDb.run(db => db.prepare(
+      `SELECT agent, action, detail, memory_id FROM audit_log WHERE action = 'consolidation_survivor_elevation_blocked' ORDER BY id`
+    ).all()) as Array<{ agent: string; action: string; detail: string; memory_id: number }>
+  }
+
+  test('an elevation attempt (observational -> foundational) returns false (BLOCK) and writes an audit_log row referencing memory_id=42', () => {
+    const result = taskDb.run(db => guardClassificationElevation('observational', 'foundational', 42, { db }))
+    expect(result).toBe(false)
+
+    const rows = elevationBlockedRows()
+    expect(rows.length).toBeGreaterThanOrEqual(1)
+    expect(rows.some(r => r.memory_id === 42)).toBe(true)
+    expect(rows.some(r => r.action === 'consolidation_survivor_elevation_blocked')).toBe(true)
+  })
+
+  test('a no-elevation call (equal tiers) returns true (permit/no-op) and writes ZERO audit rows', () => {
+    const result = taskDb.run(db => guardClassificationElevation('operational', 'operational', 99, { db }))
+    expect(result).toBe(true)
+    expect(elevationBlockedRows().length).toBe(0)
+  })
+
+  test('a downgrade attempt (foundational -> ephemeral) is not an elevation: returns true and writes zero rows', () => {
+    const result = taskDb.run(db => guardClassificationElevation('foundational', 'ephemeral', 7, { db }))
+    expect(result).toBe(true)
+    expect(elevationBlockedRows().length).toBe(0)
   })
 })

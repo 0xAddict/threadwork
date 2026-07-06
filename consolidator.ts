@@ -1,6 +1,7 @@
 import type { TaskDB } from './db'
 import type { MemoryDB, Memory, Classification } from './memory'
 import { runDecay, runArchive, runPrune, getDecayWindowDays } from './consolidate'
+import { guardClassificationElevation } from './memory-integrity'
 
 export interface ConsolidationResult {
   runId: number
@@ -518,9 +519,27 @@ export class MemoryConsolidator {
 
       if (action.type === 'merge' && action.survivorId != null) {
         const victim = this.mem.getMemory(action.targetId)
+        const survivorId = action.survivorId
         if (victim) {
-          // Bump survivor support_count, then archive victim
+          // P4 (#10376048/ATM-014, ATM-033): flag-gated. Flag OFF -> the merge
+          // is byte-identical to pre-P4 (same two UPDATEs, same audit row,
+          // no guard call, no extra SELECT). Flag ON -> a live, reachable
+          // seam for the trust-tier ceiling: load the survivor's own
+          // pre-merge classification and self-check it (before === attempted)
+          // via guardClassificationElevation. Merge never proposes a
+          // different classification for the survivor (confirmed: no write
+          // to memories.classification anywhere in this block), so this
+          // self-check always returns true (no-op, no audit row) in
+          // production. Control flow does NOT branch on its return value —
+          // the call exists to make the seam real, not to gate this path.
+          const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
           this.taskDb.run(db => {
+            if (sanitizeOn) {
+              const survivorRow = db.prepare('SELECT classification FROM memories WHERE id = ?').get(survivorId) as { classification: Classification } | null
+              if (survivorRow) {
+                guardClassificationElevation(survivorRow.classification, survivorRow.classification, survivorId, { db })
+              }
+            }
             db.prepare('UPDATE memories SET support_count = support_count + 1 WHERE id = ?').run(action.survivorId)
             db.prepare("UPDATE memories SET state = 'superseded' WHERE id = ?").run(action.targetId)
             db.prepare(`INSERT INTO audit_log (agent, action, detail, memory_id) VALUES ('consolidator', 'consolidation_merge', ?, ?)`).run(

@@ -24,11 +24,13 @@
     "decision.ts",
     "debrief.ts",
     "consolidate.ts",
+    "consolidator.ts",
     "tests/memory-integrity.test.ts",
     "tests/memory-integrity-corpus.test.ts",
     "tests/memory.test.ts",
     "tests/debrief.test.ts",
     "tests/consolidate.test.ts",
-    "tests/decision.test.ts"
+    "tests/decision.test.ts",
+    "tests/consolidator.test.ts"
   ]
 }

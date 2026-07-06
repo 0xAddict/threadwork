@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { TaskDB } from '../db'
 import { MemoryDB } from '../memory'
+import type { Classification } from '../memory'
 import { MemoryConsolidator, buildScopeClause, lockKeyForScope } from '../consolidator'
 import { unlinkSync } from 'fs'
 
@@ -305,5 +306,159 @@ describe('MemoryConsolidator scope filtering', () => {
     allC.releaseLock()
     expect(opC.acquireLock()).toBe(true)
     opC.releaseLock()
+  })
+})
+
+// P4 Stage 5a (#10376048/ATM-014, ATM-033) — consolidation trust-tier ceiling:
+// merge NEVER writes the survivor's classification, and the live
+// guardClassificationElevation callsite in the merge block is reachable but
+// never blocks (equal-tier self-check only).
+describe('MemoryConsolidator merge — trust-tier ceiling (ATM-014 / ATM-033 live callsite)', () => {
+  const TIER_DB = '/tmp/test-autodream-consolidator-tier.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(TIER_DB + suffix) } catch {}
+    }
+    taskDb = new TaskDB(TIER_DB)
+    mem = new MemoryDB(taskDb)
+  })
+
+  afterEach(() => {
+    taskDb.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(TIER_DB + suffix) } catch {}
+    }
+  })
+
+  // Bypasses saveMemory's dedup (raw INSERT) to create a true duplicate pair
+  // with independently-controlled classification/quality on each row, in a
+  // specific insertion order. Order matters: validate()'s duplicate handler
+  // only gates the whole signal on m1 (the lower-id row of the pair)'s
+  // classification being foundational/strategic — it does NOT check m2. So
+  // whichever row we want to end up as m1 must not be foundational/strategic,
+  // or the merge action never gets created at all.
+  function seedPair(
+    content: string,
+    firstInsert: { classification: Classification; quality: number },
+    secondInsert: { classification: Classification; quality: number },
+  ): { id1: number; id2: number } {
+    return taskDb.run(db => {
+      const ins = db.prepare(`
+        INSERT INTO memories (agent, content, category, importance, pinned, classification, quality, state, source_type)
+        VALUES ('tieragent', ?, 'fact', 3, 0, ?, ?, 'active', 'agent')
+      `)
+      const r1 = ins.run(content, firstInsert.classification, firstInsert.quality) as unknown as { lastInsertRowid: number }
+      const r2 = ins.run(content, secondInsert.classification, secondInsert.quality) as unknown as { lastInsertRowid: number }
+      return { id1: Number(r1.lastInsertRowid), id2: Number(r2.lastInsertRowid) }
+    })
+  }
+
+  function classificationOf(id: number): Classification {
+    return taskDb.run(db =>
+      (db.prepare('SELECT classification FROM memories WHERE id = ?').get(id) as { classification: Classification }).classification
+    )
+  }
+
+  function elevationBlockedCount(): number {
+    return taskDb.run(db =>
+      (db.prepare(`SELECT COUNT(*) as cnt FROM audit_log WHERE action = 'consolidation_survivor_elevation_blocked'`).get() as { cnt: number }).cnt
+    )
+  }
+
+  // [survivorTier, victimTier, firstInsertIsSurvivor]. firstInsertIsSurvivor
+  // picks the insertion order so m1 is never foundational/strategic (see
+  // seedPair doc comment). Includes victim tier > survivor tier (the
+  // interesting elevation-risk direction) and one control where victim tier <
+  // survivor tier.
+  const MATRIX: Array<{ survivor: Classification; victim: Classification; firstInsertIsSurvivor: boolean }> = [
+    { survivor: 'observational', victim: 'operational', firstInsertIsSurvivor: false }, // required: victim tier > survivor tier
+    { survivor: 'ephemeral', victim: 'foundational', firstInsertIsSurvivor: true },      // victim tier >> survivor tier
+    { survivor: 'operational', victim: 'strategic', firstInsertIsSurvivor: true },       // victim tier > survivor tier
+    { survivor: 'ephemeral', victim: 'observational', firstInsertIsSurvivor: false },     // victim tier > survivor tier
+    { survivor: 'foundational', victim: 'ephemeral', firstInsertIsSurvivor: false },      // control: victim tier < survivor tier
+  ]
+
+  test('ATM-014: across a matrix of victim/survivor tier pairs (flag ON, live merge), survivor classification is unchanged post-merge — no elevation, no write', async () => {
+    taskDb.setFeatureFlag('memory_sanitization_enabled', true)
+    const consolidator = new MemoryConsolidator(mem, taskDb, false, 50)
+
+    let idx = 0
+    for (const { survivor, victim, firstInsertIsSurvivor } of MATRIX) {
+      idx++
+      const content = `tier-matrix duplicate content #${idx}`
+      const survivorSpec = { classification: survivor, quality: 0.9 }
+      const victimSpec = { classification: victim, quality: 0.1 }
+      const { id1, id2 } = firstInsertIsSurvivor
+        ? seedPair(content, survivorSpec, victimSpec)
+        : seedPair(content, victimSpec, survivorSpec)
+      const survivorId = firstInsertIsSurvivor ? id1 : id2
+      const victimId = firstInsertIsSurvivor ? id2 : id1
+
+      const before = classificationOf(survivorId)
+      expect(before).toBe(survivor)
+
+      const result = await consolidator.run(`tier-matrix-${idx}`)
+      expect(result.dryRun).toBe(false)
+      expect(result.mutations).toBeGreaterThanOrEqual(1)
+
+      const after = classificationOf(survivorId)
+      expect(after).toBe(survivor)
+      expect(after).toBe(before)
+
+      // Victim was actually merged away (sanity: the merge path ran).
+      const victimState = taskDb.run(db =>
+        (db.prepare('SELECT state FROM memories WHERE id = ?').get(victimId) as { state: string }).state
+      )
+      expect(victimState).toBe('superseded')
+    }
+
+    // Across the whole matrix, the live guardClassificationElevation callsite
+    // is a self-check (survivor's own tier vs itself) and must never block.
+    expect(elevationBlockedCount()).toBe(0)
+  })
+
+  test('ATM-033 live callsite: after a real merge (equal-tiers self-check), consolidation_survivor_elevation_blocked audit rows = 0', async () => {
+    taskDb.setFeatureFlag('memory_sanitization_enabled', true)
+    const consolidator = new MemoryConsolidator(mem, taskDb, false, 50)
+
+    seedPair(
+      'equal-tier duplicate content',
+      { classification: 'operational', quality: 0.9 },
+      { classification: 'operational', quality: 0.1 },
+    )
+
+    const result = await consolidator.run('equal-tier-merge')
+    expect(result.dryRun).toBe(false)
+    expect(result.mutations).toBeGreaterThanOrEqual(1)
+
+    expect(elevationBlockedCount()).toBe(0)
+  })
+
+  test('flag-OFF byte-parity: the same merge (victim tier > survivor tier) executes identically and never invokes the guard', async () => {
+    // Flag left at its default (OFF, seeded by TaskDB).
+    const consolidator = new MemoryConsolidator(mem, taskDb, false, 50)
+
+    const { id1: victimId, id2: survivorId } = seedPair(
+      'flag-off duplicate content',
+      { classification: 'operational', quality: 0.1 },
+      { classification: 'observational', quality: 0.9 },
+    )
+
+    const result = await consolidator.run('flag-off-merge')
+    expect(result.dryRun).toBe(false)
+    expect(result.mutations).toBeGreaterThanOrEqual(1)
+
+    // Merge still happens (flag gates the guard call, not the merge itself).
+    expect(classificationOf(survivorId)).toBe('observational')
+    const victimState = taskDb.run(db =>
+      (db.prepare('SELECT state FROM memories WHERE id = ?').get(victimId) as { state: string }).state
+    )
+    expect(victimState).toBe('superseded')
+
+    // No guard call was ever made -> zero elevation-blocked rows, same as pre-P4.
+    expect(elevationBlockedCount()).toBe(0)
   })
 })
