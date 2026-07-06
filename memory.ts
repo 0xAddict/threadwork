@@ -891,33 +891,40 @@ export class MemoryDB {
         // since these memories ARE being surfaced to the agent on boot.
         const ranked = this.recall(agent, { query: relevantQuery, limit: RELEVANT_LIMIT })
 
+        // P4 gate #5 (flag-OFF byte-parity): the active-only filter on this
+        // TRUSTED boot-briefing section is FLAG-GATED, read the same way P4
+        // reads it in saveMemory/supersedeMemory (this.taskDb.isFeatureEnabled).
+        //  - Flag OFF -> EXACT 921328b baseline: relevance-led admits ANY ranked
+        //    row (recall()'s candidate pool is state != 'superseded'), and the
+        //    pinned backfill uses state != 'superseded'. Byte parity restored.
+        //  - Flag ON  -> active-only, matching role/topMemories/sharedMemories,
+        //    so the P4 Stage-7 KO-3 write_handoff quarantine (state='proposed',
+        //    #10376063) cannot ride a query-overlapping quarantined handoff into
+        //    this trusted section — preserving "a detector miss can't reach
+        //    active/trusted recall".
+        const activeOnly = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
+
         const seen = new Set<number>()
         const merged: Memory[] = []
-        // 1. Relevance-led: BM25 hits first (pinned-or-not). ACTIVE-ONLY: this
-        //    is a TRUSTED boot-briefing section, so it must match the same
-        //    state='active' filter as role/topMemories/sharedMemories. recall()
-        //    is a general-purpose retrieval API whose candidate pool is the
-        //    broader state != 'superseded' (it may surface proposed/disputed/
-        //    archived rows to callers who want them), so we filter to 'active'
-        //    HERE at the trusted surface. Without this, the P4 Stage-7 KO-3
-        //    write_handoff quarantine (state='proposed', #10376063) leaks: a
-        //    quarantined handoff whose body overlaps the agent's active-task
-        //    query would otherwise ride into this trusted section, defeating
-        //    the "a detector miss can't reach active/trusted recall" guarantee.
+        // 1. Relevance-led: BM25 hits first (pinned-or-not). Flag ON additionally
+        //    enforces active-only here (see activeOnly note above); flag OFF is
+        //    the 921328b baseline that admits non-active ranked rows.
         for (const m of ranked) {
           if (merged.length >= RELEVANT_LIMIT) break
-          if (m.state !== 'active') continue
+          if (activeOnly && m.state !== 'active') continue
           if (!seen.has(m.id)) { seen.add(m.id); merged.push(m) }
         }
         // 2. Backfill any leftover slots with top pinned/role rows so a slow day
         //    (few/no relevant hits) still yields a useful section. Ordered by
-        //    quality/importance; capped by the leftover slot count. ACTIVE-ONLY
-        //    for the same trusted-surface reason as (1) — a pinned-but-proposed/
-        //    disputed row must not backfill into trusted recall either.
+        //    quality/importance; capped by the leftover slot count. The state
+        //    clause is flag-gated to match (1): flag ON -> state = 'active' (no
+        //    proposed/disputed backfill into trusted recall); flag OFF ->
+        //    state != 'superseded' (921328b baseline).
         if (merged.length < RELEVANT_LIMIT) {
+          const pinnedStateClause = activeOnly ? "state = 'active'" : "state != 'superseded'"
           const pinned = db.prepare(
             `SELECT * FROM memories
-             WHERE (agent = ? OR agent = 'shared') AND pinned = 1 AND state = 'active'
+             WHERE (agent = ? OR agent = 'shared') AND pinned = 1 AND ${pinnedStateClause}
              ORDER BY quality DESC, importance DESC
              LIMIT ?`
           ).all(agent, RELEVANT_LIMIT) as Memory[]

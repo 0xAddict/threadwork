@@ -221,4 +221,45 @@ describe('KO-3: write_handoff + session-boot.sh rehydrate regression (#10376058)
     const bB = mem.getBootBriefing('steve', db, 'evacuated tasks flaky memory_fts test')
     expect(bB.relevantMemories.find(m => m.id === memory.id)).toBeUndefined()
   })
+
+  test('flag OFF byte-parity guard (gate #5): a proposed row that RANKS into recall MUST appear in getBootBriefing().relevantMemories (921328b baseline), and is excluded ONLY when flag ON', () => {
+    // gate #5 protects flag-OFF byte-parity against the 921328b baseline. In the
+    // baseline, getBootBriefing's relevance-led merge admits ANY ranked row
+    // (recall()'s pool is state != 'superseded', so it includes proposed rows)
+    // and the pinned backfill uses state != 'superseded'. The @3817072 active
+    // filter was UNCONDITIONAL, silently dropping non-active ranked rows even
+    // with the sanitization flag OFF — a byte-parity regression. This test is
+    // RED against that unconditional filter and GREEN once it is flag-gated.
+
+    // Active-task overlap so getBootBriefing auto-derives a relevance query that
+    // recall() ranks the handoff body highly against.
+    const task = db.createTask({
+      from: 'boss',
+      to: 'steve',
+      description: 'reconcile the flaky memory_fts test and finish the evacuated tasks',
+      priority: 'high',
+    })
+    db.claimTask(task.id, 'steve')
+
+    // Seed a state='proposed' row (KO-3 quarantine shape). Written with the flag
+    // ON so handleWriteHandoff quarantines it to state='proposed'; the persisted
+    // state is independent of the flag value at getBootBriefing read time.
+    db.setFeatureFlag('memory_sanitization_enabled', true)
+    const memory = handleWriteHandoff({ body: BODY }, { mem, selfLabel: 'steve' })
+    expect(memory.state).toBe('proposed')
+
+    // (A) FLAG OFF -> 921328b baseline: the proposed row MUST appear in
+    //     relevantMemories. This is the byte-parity assertion — RED against the
+    //     pre-fix unconditional active-filter, GREEN after flag-gating.
+    db.setFeatureFlag('memory_sanitization_enabled', false)
+    const off = mem.getBootBriefing('steve', db)
+    expect(off.relevantQuery).toBeTruthy()
+    expect(off.relevantMemories.find(m => m.id === memory.id)).toBeDefined()
+
+    // (B) FLAG ON -> active-only: the SAME proposed row is excluded (KO-3
+    //     quarantine still holds through the flag-gated filter).
+    db.setFeatureFlag('memory_sanitization_enabled', true)
+    const on = mem.getBootBriefing('steve', db)
+    expect(on.relevantMemories.find(m => m.id === memory.id)).toBeUndefined()
+  })
 })
