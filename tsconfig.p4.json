@@ -27,6 +27,8 @@
     "consolidator.ts",
     "tests/memory-integrity.test.ts",
     "tests/memory-integrity-corpus.test.ts",
+    "memory-integrity-cli.ts",
+    "tests/memory-integrity-cli.test.ts",
     "tests/memory.test.ts",
     "tests/debrief.test.ts",
     "tests/consolidate.test.ts",

@@ -65,6 +65,12 @@ BYPASS_LOG="$STATE_DIR/bypass.log"
 DISABLED_LOG="$STATE_DIR/disabled.log"
 AUDIT_LOG="$HOME/.claude/state/freshness-hook.log"
 DB="${FRESHNESS_DB:-$HOME/.claude/mcp-servers/task-board/tasks.db}"  # env override is for TESTS ONLY
+# P4 Stage 7 KO-1 (#10376057): pipe-through sanitizer CLI for the pinned-memory
+# excerpts emitted by emit_stale_context(). Env-overridable so tests can point
+# at the worktree CLI; defaults to the live path so production behavior is
+# unchanged when unset.
+MEMORY_INTEGRITY_CLI="${MEMORY_INTEGRITY_CLI:-$HOME/.claude/mcp-servers/task-board/memory-integrity-cli.ts}"
+BUN_BIN="$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")"
 CACHE_TTL=10
 FRESHNESS_HOURS_COLD_DEFAULT=24
 
@@ -147,6 +153,43 @@ valid_agent_label() {
     [a-z]*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# P4 Stage 7 KO-1 (#10376057): route the substr(content,1,150) portion of
+# each pinned-memory row through the memory-integrity CLI (same
+# sanitizeMemoryContent primitive as the TS write paths) before it lands in
+# the stderr context block — closes the shell-hook sanitizer bypass.
+# Fail-closed: a row whose CLI invocation errors is DROPPED entirely (never
+# falls back to raw content).
+#
+# $1 = raw sqlite3 output, ASCII 0x1F (Unit Separator)-delimited columns
+#      "id<0x1F>substr(content,1,150)<0x1F>source_type", one row per line.
+#      0x1F (not '|') because the content excerpt routinely contains literal
+#      '|' characters, and with 3 columns a '|'-delimited read would corrupt
+#      the content/source_type split (bash `read` folds all overflow fields
+#      into the LAST variable).
+# Echoes the reassembled "[#id] <sanitized>" lines, one per surviving row.
+format_pinned_mems() {
+  local raw="$1"
+  local out=""
+  local pm_id pm_content pm_source_type sanitized cli_status
+  while IFS=$'\x1f' read -r pm_id pm_content pm_source_type; do
+    [ -z "$pm_id" ] && continue
+    [ -z "$pm_source_type" ] && pm_source_type="agent"
+    sanitized=$(printf '%s' "$pm_content" | TASKBOARD_DB="$DB" "$BUN_BIN" "$MEMORY_INTEGRITY_CLI" --sanitize-stdin --source-type="$pm_source_type" 2>>"$DEBUG_LOG")
+    cli_status=$?
+    if [ "$cli_status" -ne 0 ]; then
+      log_debug "memory-integrity-cli failed (exit=$cli_status) for pinned memory #${pm_id} — dropping (fail-closed)"
+      continue
+    fi
+    if [ -n "$out" ]; then
+      out="${out}
+[#${pm_id}] ${sanitized}"
+    else
+      out="[#${pm_id}] ${sanitized}"
+    fi
+  done <<< "$raw"
+  echo "$out"
 }
 
 # --- Rich inject payload (D1) -----------------------------------------------
@@ -276,26 +319,28 @@ emit_stale_context() {
   local pinned_mems=""
   if [ -n "$kw1" ] && [ -n "$kw2" ]; then
     # overlap-2: SQLite booleans are 0/1 ints, so (LIKE)+(LIKE)>=2 is valid.
-    local overlap_sql
-    overlap_sql="SELECT '[#' || id || '] ' || substr(content,1,150) \
+    local overlap_sql overlap_raw
+    overlap_sql="SELECT id, substr(content,1,150), COALESCE(source_type,'agent') \
       FROM memories WHERE pinned=1 \
         AND COALESCE(category,'') IN (${CATEGORY_ALLOW}) \
         AND ((content LIKE '%${kw1}%') + (content LIKE '%${kw2}%')"
     [ -n "$kw3" ] && overlap_sql="${overlap_sql} + (content LIKE '%${kw3}%')"
     overlap_sql="${overlap_sql}) >= 2 \
       ORDER BY importance DESC LIMIT 3;"
-    pinned_mems=$(sqlite3 -readonly "$DB" "$overlap_sql" 2>>"$DEBUG_LOG")
+    overlap_raw=$(sqlite3 -readonly -separator $'\x1f' "$DB" "$overlap_sql" 2>>"$DEBUG_LOG")
+    pinned_mems=$(format_pinned_mems "$overlap_raw")
   fi
 
   # TG-id is an explicit signal and stands alone (bypasses overlap-2).
   if [ -z "$pinned_mems" ] && [ -n "$tg_id" ]; then
-    local tg_sql
-    tg_sql="SELECT '[#' || id || '] ' || substr(content,1,150) \
+    local tg_sql tg_raw
+    tg_sql="SELECT id, substr(content,1,150), COALESCE(source_type,'agent') \
       FROM memories WHERE pinned=1 \
         AND COALESCE(category,'') IN (${CATEGORY_ALLOW}) \
         AND content LIKE '%${tg_id}%' \
       ORDER BY importance DESC LIMIT 3;"
-    pinned_mems=$(sqlite3 -readonly "$DB" "$tg_sql" 2>>"$DEBUG_LOG")
+    tg_raw=$(sqlite3 -readonly -separator $'\x1f' "$DB" "$tg_sql" 2>>"$DEBUG_LOG")
+    pinned_mems=$(format_pinned_mems "$tg_raw")
   fi
   [ -z "$pinned_mems" ] && pinned_mems="  (none matched)"
 

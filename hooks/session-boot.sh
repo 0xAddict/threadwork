@@ -25,14 +25,22 @@ touch "$RESTART_FLAG_DIR/$LABEL.flag" 2>/dev/null || true
 # --- Auto-rehydrate from session-handoff memory (#638) ---
 # Direct sqlite read because hooks can't invoke MCP. Look for the most recent
 # handoff memory for this agent created in the last 24h. Fail-open silently.
-TASKBOARD_DB="$HOME/.claude/mcp-servers/task-board/tasks.db"
+TASKBOARD_DB="${TASKBOARD_DB:-$HOME/.claude/mcp-servers/task-board/tasks.db}"
+# P4 Stage 7 KO-1 (#10376057): route the handoff memory's content through the
+# memory-integrity CLI (same sanitizeMemoryContent primitive as the TS write
+# paths) instead of printing row[2] directly — closes the shell-hook
+# sanitizer bypass. Env-overridable so tests can point at the worktree CLI +
+# a /tmp DB; defaults to the live paths so production behavior is unchanged
+# when the env vars are unset.
+MEMORY_INTEGRITY_CLI="${MEMORY_INTEGRITY_CLI:-$HOME/.claude/mcp-servers/task-board/memory-integrity-cli.ts}"
+BUN_BIN="$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")"
 HANDOFF_OUTPUT=""
 if [ -f "$TASKBOARD_DB" ]; then
   python3 - <<PY 2>/dev/null
-import sqlite3
+import sqlite3, subprocess, os
 db = sqlite3.connect("${TASKBOARD_DB}")
 row = db.execute("""
-  SELECT id, created_at, content FROM memories
+  SELECT id, created_at, content, source_type FROM memories
   WHERE (agent = ? OR agent = 'shared')
     AND content LIKE ?
     AND state = 'active'
@@ -40,13 +48,30 @@ row = db.execute("""
   ORDER BY created_at DESC LIMIT 1
 """, ("${LABEL}", "[session-handoff:${LABEL}:%")).fetchone()
 if row:
-    bar = "=" * 64
-    print(bar)
-    print(f"PRIOR SESSION HANDOFF — memory #{row[0]} ({row[1]} UTC)")
-    print(bar)
-    print(row[2])
-    print(bar)
-    print("END HANDOFF")
+    mem_id, created_at, content, source_type = row
+    source_type = source_type or 'agent'
+    # Fail-closed: CLI error (missing/unreadable flag DB, bad exit, exception)
+    # -> sanitized stays None -> the ENTIRE handoff banner is skipped below.
+    # Never fall back to printing the raw content.
+    sanitized = None
+    try:
+        proc = subprocess.run(
+            ["${BUN_BIN}", "${MEMORY_INTEGRITY_CLI}", "--sanitize-stdin", "--source-type=" + source_type],
+            input=content, capture_output=True, text=True, timeout=10,
+            env={**os.environ, "TASKBOARD_DB": "${TASKBOARD_DB}"},
+        )
+        if proc.returncode == 0:
+            sanitized = proc.stdout
+    except Exception:
+        sanitized = None
+    if sanitized is not None:
+        bar = "=" * 64
+        print(bar)
+        print(f"PRIOR SESSION HANDOFF — memory #{mem_id} ({created_at} UTC)")
+        print(bar)
+        print(sanitized)
+        print(bar)
+        print("END HANDOFF")
 PY
 fi
 
