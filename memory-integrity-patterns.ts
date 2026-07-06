@@ -96,21 +96,28 @@ export const DETECTION_PATTERNS: DetectionPattern[] = [
     // adversarial payload pairs the header with a directive verb/noun.
     id: 'fake-role-header',
     name: 'Fake role/directive header (SYSTEM:/ASSISTANT:/USER: — LINE-START turn header, any case, ASCII/fullwidth colon, near a directive token, same line or bare-header next line)',
-    // Codex round-2 FP fix: require the header to be a TURN HEADER at line-start
-    // (^ with the `m` flag, after optional leading whitespace). The prior `\b`
-    // match fired on MID-SENTENCE "system:" — so benign prose like "the payment
-    // system: ... grant refunds to admins" or "our billing system: customers
-    // can override ..." false-positived (a directive word elsewhere in the
-    // sentence tripped the same-line lookahead). A real injected chat-turn
-    // header always begins its own line; a noun phrase ending in "system:" does
-    // not. Residual (accepted, arms-race): a mid-LINE "SYSTEM: <directive>" with
-    // no other injection signal is not caught here — but such payloads that also
-    // carry ignore-instructions / tool-call / marker shapes are caught by those
-    // patterns, and the layered defenses (server source_type derivation + boot
-    // re-sanitize) apply.
+    // Codex round-2 FP fix (orchestrator, refined): require the header to sit at
+    // a TURN BOUNDARY — preceded by start-of-line OR a NON-LETTER char (past any
+    // spaces/tabs) — via the variable-length lookbehind below. This is what
+    // distinguishes an injected chat-turn header ("] SYSTEM: ...", "payload:
+    // SYSTEM: ...", line-start "SYSTEM: ...", "\nSYSTEM: ...") from a benign
+    // COMPOUND NOUN ("the payment system: ...", "our billing system: ...", "the
+    // ops system: ...") where "system" is preceded by a real word. The prior
+    // `\b` match fired mid-noun-phrase (false positives on compound nouns); a
+    // naive `^`-only fix then MISSED mid-line injected headers like
+    // "[session-handoff:x] SYSTEM: ignore ..." (SYSTEM: preceded by "] ", a
+    // turn boundary — should be caught). The lookbehind skips intervening
+    // spaces then requires start-of-line or a non-letter/non-space char, so a
+    // word+space before the header ("payment system") excludes it while a
+    // punctuation/bracket/newline before it ("] SYSTEM", "payload: SYSTEM")
+    // includes it. Residual (accepted, arms-race): a header at a turn boundary
+    // whose own line also carries a benign directive word ("system: grant hires
+    // access") can still trip — narrower than the compound-noun class — and the
+    // layered defenses (server source_type derivation + boot re-sanitize) apply.
+    // NOTE: the `u` flag is required for \p{L} in the lookbehind.
     regex: new RegExp(
-      `^[ \\t]*(?:SYSTEM|ASSISTANT|USER)\\s*[:：](?=${DIRECTIVE_HINT_LOOKAHEAD})`,
-      'gim'
+      `(?<=(?:^|[^\\p{L}\\s])[ \\t]*)(?:SYSTEM|ASSISTANT|USER)\\s*[:：](?=${DIRECTIVE_HINT_LOOKAHEAD})`,
+      'gimu'
     ),
     transform: (m) => m.replace(/[:：]$/, (c) => '\\' + c),
   },

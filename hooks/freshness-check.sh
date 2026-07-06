@@ -173,7 +173,12 @@ format_pinned_mems() {
   local raw="$1"
   local out=""
   local pm_id pm_content pm_source_type sanitized cli_status
-  while IFS=$'\x1f' read -r pm_id pm_content pm_source_type; do
+  # codex round-2 finding #2 (HIGH): $raw is now 0x1E (Record Separator)
+  # row-terminated (see the two callers below), so `read -d $'\x1e'` splits
+  # on ROWS instead of newlines — an embedded 0x0A in pm_content no longer
+  # desyncs this loop into treating the continuation text as a new
+  # pm_id/pm_source_type (which previously leaked raw, unsanitized content).
+  while IFS=$'\x1f' read -r -d $'\x1e' pm_id pm_content pm_source_type; do
     [ -z "$pm_id" ] && continue
     [ -z "$pm_source_type" ] && pm_source_type="agent"
     sanitized=$(printf '%s' "$pm_content" | TASKBOARD_DB="$DB" "$BUN_BIN" "$MEMORY_INTEGRITY_CLI" --sanitize-stdin --source-type="$pm_source_type" 2>>"$DEBUG_LOG")
@@ -188,7 +193,7 @@ format_pinned_mems() {
     else
       out="[#${pm_id}] ${sanitized}"
     fi
-  done <<< "$raw"
+  done < <(printf '%s' "$raw")
   echo "$out"
 }
 
@@ -327,7 +332,11 @@ emit_stale_context() {
     [ -n "$kw3" ] && overlap_sql="${overlap_sql} + (content LIKE '%${kw3}%')"
     overlap_sql="${overlap_sql}) >= 2 \
       ORDER BY importance DESC LIMIT 3;"
-    overlap_raw=$(sqlite3 -readonly -separator $'\x1f' "$DB" "$overlap_sql" 2>>"$DEBUG_LOG")
+    # codex round-2 finding #2 (HIGH): two-arg `.separator COL ROW` makes
+    # 0x1E the row terminator (not sqlite3's default newline), so a memory
+    # whose content embeds a newline stays a SINGLE row instead of desyncing
+    # format_pinned_mems's read loop into leaking raw content as an id field.
+    overlap_raw=$(sqlite3 -readonly -cmd '.mode list' -cmd $'.separator \x1f \x1e' "$DB" "$overlap_sql" 2>>"$DEBUG_LOG")
     pinned_mems=$(format_pinned_mems "$overlap_raw")
   fi
 
@@ -339,7 +348,9 @@ emit_stale_context() {
         AND COALESCE(category,'') IN (${CATEGORY_ALLOW}) \
         AND content LIKE '%${tg_id}%' \
       ORDER BY importance DESC LIMIT 3;"
-    tg_raw=$(sqlite3 -readonly -separator $'\x1f' "$DB" "$tg_sql" 2>>"$DEBUG_LOG")
+    # codex round-2 finding #2 (HIGH): same 0x1E row-terminator fix as the
+    # overlap_sql invocation above.
+    tg_raw=$(sqlite3 -readonly -cmd '.mode list' -cmd $'.separator \x1f \x1e' "$DB" "$tg_sql" 2>>"$DEBUG_LOG")
     pinned_mems=$(format_pinned_mems "$tg_raw")
   fi
   [ -z "$pinned_mems" ] && pinned_mems="  (none matched)"

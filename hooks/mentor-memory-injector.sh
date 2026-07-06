@@ -105,7 +105,15 @@ fi
 # would bleed into source_type). 0x1F never appears in normal text.
 QUERY="SELECT id, content, COALESCE(source_type,'agent') FROM memories WHERE state='active' AND pinned=1 AND classification='foundational' AND category='preference' ORDER BY id;"
 
-MEMORIES=$(sqlite3 -readonly -separator $'\x1f' "$DB" "$QUERY" 2>>"$DEBUG_LOG" || true)
+# codex round-2 finding #2 (HIGH): sqlite3's default ROW terminator is a
+# newline, so a memory whose `content` contains an embedded newline would
+# split across multiple output lines and desync the `while read` loop below
+# (the continuation line gets re-parsed as a NEW row, leaking raw content as
+# an id/source_type field — never routed through the sanitizer CLI). Use the
+# two-arg `.separator COL ROW` form to make 0x1E (Record Separator) the row
+# terminator alongside the existing 0x1F (Unit Separator) column separator,
+# so an embedded 0x0A stays inside the content field where it belongs.
+MEMORIES=$(sqlite3 -readonly -cmd '.mode list' -cmd $'.separator \x1f \x1e' "$DB" "$QUERY" 2>>"$DEBUG_LOG" || true)
 
 if [ -z "$MEMORIES" ]; then
   log_debug "tool=$TOOL_NAME — no pinned foundational preference memories found"
@@ -117,7 +125,7 @@ fi
 {
   echo ""
   echo "=== FOUNDATIONAL DIRECTIVES (auto-injected) ==="
-  while IFS=$'\x1f' read -r mem_id mem_content mem_source_type; do
+  while IFS=$'\x1f' read -r -d $'\x1e' mem_id mem_content mem_source_type; do
     [ -z "$mem_id" ] && continue
     [ -z "$mem_source_type" ] && mem_source_type="agent"
 
@@ -140,7 +148,7 @@ fi
     else
       echo "#${mem_id}: ${short_content}"
     fi
-  done <<< "$MEMORIES"
+  done < <(printf '%s' "$MEMORIES")
   echo "=== END FOUNDATIONAL DIRECTIVES ==="
   echo ""
 } >&2
