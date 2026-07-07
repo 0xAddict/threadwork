@@ -396,6 +396,129 @@ describe('ATM-017 — payload JSON validation', () => {
   })
 })
 
+// -----------------------------------------------------------------------------
+// R5 (structural fix, Gwei-authorized option A, TG 7656): reconstruct-then-
+// persist. Closes the codex R4 same-class sibling bypass — a prototype-
+// spoofed Map/Set/Date (Object.setPrototypeOf(exotic, Object.prototype))
+// carries its real state in an INTERNAL SLOT invisible to Reflect.ownKeys, so
+// the R4 courtesy walk sees an empty plain object and cannot detect it (both
+// the courtesy clone AND JSON.stringify(payload) independently agree on the
+// same lossy `{}`, so R4's serialize-then-revalidate divergence check has
+// nothing to compare against). Per the Gwei-authorized REQ-014 boundary
+// amendment, this is now an ACCEPTED, documented trusted-roster footgun:
+// sendDirectedMessage no longer needs to (and cannot, by definition) reject
+// it — instead it GUARANTEES, by construction, that whatever lands in the
+// persisted row is EXACTLY the JSON of the RECONSTRUCTION (never a
+// separately-read copy of the caller's original object), so there is no
+// class of exotic — known or future — whose validated-vs-persisted bytes can
+// ever diverge.
+// -----------------------------------------------------------------------------
+
+describe('R5 — structural reconstruct-then-persist (prototype-spoof internal-slot bypass)', () => {
+  let dbPath: string
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    dbPath = tempDbPath('agentmsg-r5')
+    taskDb = new TaskDB(dbPath)
+  })
+
+  afterEach(() => {
+    cleanupDbFile(dbPath)
+  })
+
+  test('a prototype-spoofed Map (internal-slot data invisible to Reflect.ownKeys) does not throw and persists exactly the validated reconstruction, never the original entries', () => {
+    const m = new Map([['secret', 'leaked-if-buggy']])
+    Object.setPrototypeOf(m, Object.prototype)
+
+    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { m } })
+
+    // The persisted bytes must equal the canonical JSON reconstruction of the
+    // original payload — never diverge from what was validated.
+    const expected = JSON.stringify(JSON.parse(JSON.stringify({ m })))
+    expect(row.payload).toBe(expected)
+
+    // Documents the accepted footgun precisely: the Map's real entry is GONE
+    // from the persisted bytes, not smuggled through on either side.
+    expect(row.payload).not.toContain('leaked-if-buggy')
+    expect(JSON.parse(row.payload)).toEqual({ m: {} })
+  })
+
+  test('a prototype-spoofed Set (internal-slot data invisible to Reflect.ownKeys) does not throw and persists exactly the validated reconstruction', () => {
+    const s = new Set(['leaked-if-buggy'])
+    Object.setPrototypeOf(s, Object.prototype)
+
+    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { s } })
+
+    const expected = JSON.stringify(JSON.parse(JSON.stringify({ s })))
+    expect(row.payload).toBe(expected)
+    expect(row.payload).not.toContain('leaked-if-buggy')
+    expect(JSON.parse(row.payload)).toEqual({ s: {} })
+  })
+
+  test('a prototype-spoofed Date (internal-slot data invisible to Reflect.ownKeys) does not throw and persists exactly the validated reconstruction', () => {
+    const d = new Date('2020-01-01T00:00:00.000Z')
+    Object.setPrototypeOf(d, Object.prototype)
+
+    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { d } })
+
+    const expected = JSON.stringify(JSON.parse(JSON.stringify({ d })))
+    expect(row.payload).toBe(expected)
+    expect(row.payload).not.toContain('2020-01-01')
+    expect(JSON.parse(row.payload)).toEqual({ d: {} })
+  })
+
+  test('persisted-equals-validated property: for an ordinary deep-plain payload, the persisted row.payload is byte-identical to JSON.stringify of the validated reconstruction', () => {
+    const payload = { a: 1, b: 'x', c: true, d: null, e: [1, 2, { f: 3.5 }], g: { h: false } }
+    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload })
+
+    const reconstructed = JSON.parse(JSON.stringify(payload))
+    expect(row.payload).toBe(JSON.stringify(reconstructed))
+    expect(JSON.parse(row.payload)).toEqual(payload)
+  })
+
+  test('a getter that returns a DIFFERENT value on successive reads is STILL rejected after the reconstruct-then-persist refactor (no regression on the R4 divergence guard)', () => {
+    let reads = 0
+    const payload = {
+      get counter() {
+        reads += 1
+        return reads
+      },
+    }
+
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('non-spoofed exotics (real Map/Set/Date/BigInt/function/symbol/circular) are still courtesy-rejected — the R5 amendment narrows acceptance to SPOOFED prototypes only', () => {
+    const cases: Array<[string, unknown]> = [
+      ['Map', { m: new Map([['a', 1]]) }],
+      ['Set', { s: new Set([1]) }],
+      ['Date', { d: new Date() }],
+      ['BigInt', { b: 10n }],
+      ['function', { f: () => 1 }],
+      ['symbol', { s: Symbol('x') }],
+    ]
+    for (const [label, payload] of cases) {
+      expect(() => {
+        sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload })
+      }).toThrow()
+    }
+    const circular: Record<string, unknown> = { a: 1 }
+    circular.self = circular
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: circular })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+})
+
 describe('ATM-018 — sendDirectedMessage identity/recipient discipline + testability seam', () => {
   let dbPath: string
   let taskDb: TaskDB

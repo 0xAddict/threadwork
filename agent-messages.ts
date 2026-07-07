@@ -316,42 +316,74 @@ export function sendDirectedMessage(
     )
   }
 
-  // [CLOSES R2-1, round-2 codex finding; STRENGTHENED for the bounded R4
-  // residual, round-3 codex GENUINE HIGH] A throwing JSON.stringify replacer
-  // only intercepts values JSON.stringify itself would either throw on
-  // (circular refs, BigInt) or silently DROP (nested function/symbol/
-  // undefined). It still ACCEPTS plenty of non-plain values that
-  // JSON.stringify serializes WITHOUT throwing but LOSSILY — a Map/Set/
+  // [CLOSES R2-1, round-2 codex finding; STRENGTHENED for the R4 residual,
+  // round-3 codex GENUINE HIGH; STRUCTURALLY CLOSED for R5, round-4 codex
+  // GENUINE HIGH — Gwei-authorized option A, TG 7656] A throwing
+  // JSON.stringify replacer only intercepts values JSON.stringify itself
+  // would either throw on (circular refs, BigInt) or silently DROP (nested
+  // function/symbol/undefined). It still ACCEPTS plenty of non-plain values
+  // that JSON.stringify serializes WITHOUT throwing but LOSSILY — a Map/Set/
   // RegExp/Error/class-instance collapses to `{}` (or a partial plain
   // object), NaN/Infinity/-Infinity collapse to `null`, and a Date silently
-  // TYPE-CHANGES to an ISO string. REQ-014 requires rejecting any
-  // "non-plain value" whose JSON round-trip is lossy — not merely the
-  // subset JSON.stringify refuses outright.
+  // TYPE-CHANGES to an ISO string.
   //
-  // Layer A (assertJsonPlain — strict recursive structural check): now also
-  // (a) walks Reflect.ownKeys, not Object.keys, so a non-enumerable own
-  // property is inspected rather than silently skipped; (b) rejects a
-  // callable toJSON — own or inherited, enumerable or not — at any node,
-  // since JSON.stringify would substitute its return value for whatever we
-  // validated; (c) rejects an array's own non-index property. It returns a
-  // plain deep-clone built DURING this same walk, each property value read
-  // from the source exactly once.
+  // Layer A (assertJsonPlain — strict recursive structural COURTESY check,
+  // run on the CALLER'S ORIGINAL object): walks Reflect.ownKeys, not
+  // Object.keys, so a non-enumerable own property is inspected rather than
+  // silently skipped; rejects a callable toJSON — own or inherited,
+  // enumerable or not — at any node; rejects an array's own non-index
+  // property; rejects every DETECTABLE non-plain prototype (a real,
+  // non-spoofed Map/Set/RegExp/Error/Date/class-instance). This closes R2/R4
+  // — every case above throws a precise, path-qualified error and no row is
+  // ever inserted.
   //
-  // Layer B (serialize-then-revalidate, R4 fix): a structural check ALONE
-  // cannot catch a STATEFUL getter/proxy that answers a DIFFERENT value on a
-  // second read than the one Layer A already validated and cloned —
-  // structurally, both reads look identically "plain" in isolation. So,
-  // after Layer A passes, we independently JSON.stringify the ORIGINAL
-  // payload (a second, separate read of every property) and compare it
-  // byte-for-byte against JSON.stringify() of the Layer-A clone. ANY
-  // divergence — a toJSON substitution, a non-enumerable property
-  // JSON.stringify silently omits that our clone included, or a
-  // getter/proxy that answered differently the second time — means the
-  // bytes about to be persisted are NOT provably the JSON of what we just
-  // validated, so we refuse to persist them rather than risk a lossy or
-  // substituted payload reaching the database.
+  // R5 residual (codex round-4 GENUINE HIGH, closed here): a value whose
+  // prototype has been SPOOFED to Object.prototype
+  // (Object.setPrototypeOf(new Map(...), Object.prototype), same for
+  // Set/Date) carries its real state in an INTERNAL SLOT invisible to
+  // Reflect.ownKeys — Layer A's structural walk sees a genuinely empty plain
+  // object and cannot detect it. Layer A therefore ACCEPTS it; per the
+  // Gwei-authorized REQ-014 boundary amendment this is now a documented,
+  // ACCEPTED trusted-roster footgun (KO-4/KO-5 roster only), not a rejection
+  // target — hardening the inspector further is an unbounded arms race
+  // against unknown future exotic types.
+  //
+  // R5 fix (reconstruct-then-persist): rather than inspecting the caller's
+  // object and then separately re-reading it to PROVE the persisted bytes
+  // match what was inspected (the old Layer B — a serialize-then-revalidate
+  // EQUALITY CHECK that a hostile stateful getter/proxy could in principle
+  // still race), the object is passed THROUGH the JSON boundary FIRST, and
+  // the reconstruction — never the original — is what gets validated a
+  // second time and persisted. `persisted === validated` therefore holds BY
+  // CONSTRUCTION (there is no second, independent read of the caller's
+  // object between "what we validated" and "what we store"), not merely by
+  // an equality check that happens to imply it. A getter/proxy that answers
+  // differently on its two reads (Layer A's walk vs. this reconstruction
+  // read) is still caught: `payloadStr` (the reconstruction read) is
+  // compared against Layer A's own clone serialization, and any divergence
+  // is refused rather than persisted — this preserves the R4 divergence
+  // guard exactly, so a hostile stateful getter/proxy is rejected exactly as
+  // before, never silently reconstructed from its second, unvalidated read.
   const validatedClone = assertJsonPlain(args.payload)
-  const payloadStr = JSON.stringify(args.payload) as string
+
+  let payloadStr: string
+  try {
+    payloadStr = JSON.stringify(args.payload) as string
+    if (payloadStr === undefined) {
+      // Top-level undefined/function/symbol: JSON.stringify returns the
+      // `undefined` VALUE (not a string) rather than throwing. assertJsonPlain
+      // already rejects these at path '$' before we ever reach this line for
+      // any value reachable from an object/array — this branch only matters
+      // for a genuinely top-level undefined/function/symbol payload, which
+      // assertJsonPlain also already rejects. Kept as defense-in-depth.
+      throw new Error('payload serializes to undefined (top-level undefined/function/symbol)')
+    }
+  } catch (e) {
+    throw new Error(
+      `sendDirectedMessage: payload failed to serialize to JSON — ${(e as Error).message}`
+    )
+  }
+
   const clonedSerialization = JSON.stringify(validatedClone)
   if (clonedSerialization !== payloadStr) {
     throw new Error(
@@ -360,13 +392,25 @@ export function sendDirectedMessage(
     )
   }
 
+  // Reconstruct-then-persist: `reconstructed` is parsed FROM `payloadStr` —
+  // the exact string about to be persisted — so re-validating it and
+  // re-deriving the persisted string from IT (rather than from a fresh read
+  // of `args.payload`) makes `persisted === validated` a structural fact,
+  // not an inference from the equality check above. assertJsonPlain() on a
+  // freshly-JSON.parse'd value can never fail (JSON.parse only ever produces
+  // plain objects/arrays/strings/finite numbers/booleans/null) — this call
+  // is defense-in-depth / documents the invariant, not a live rejection path.
+  const reconstructed = JSON.parse(payloadStr)
+  assertJsonPlain(reconstructed)
+  const finalPayloadStr = JSON.stringify(reconstructed)
+
   const row = withMemoryWriteTxn(taskDb.getHandle(), (db) => {
     const seq = nextWriteSeq(db)
     const inserted = db.prepare(`
       INSERT INTO agent_messages (sender, recipient, msg_type, payload, seq)
       VALUES (?, ?, ?, ?, ?)
       RETURNING *
-    `).get(sender, recipient, msgType, payloadStr, seq) as AgentMessageRow
+    `).get(sender, recipient, msgType, finalPayloadStr, seq) as AgentMessageRow
 
     // REQ-025/C7 (ATM-028 send portion): SAME transaction as the INSERT above
     // — an audit-INSERT failure rolls back the message row, and a message
