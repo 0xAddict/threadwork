@@ -1606,3 +1606,161 @@ describe('ATM-029: no retroactive backfill from historical fault/blocked data (R
     expect(sessionRow?.last_fault_type).toBe('crash')
   })
 })
+
+// ---------------------------------------------------------------------------
+// ATM-031 / REQ-019 [P1] — scope-bleed guardrail (P6 Stage 7 / EPIC-07)
+//
+// P6's stated boundary (specs/P6-spec.md) is: EPIC-01..06 add a NEW,
+// additive failure-classification taxonomy/adapter/persistence/wiring
+// surface, WITHOUT touching the pre-existing memory-integrity/ordering,
+// agent-messages, or decision (critique) subsystems, and WITHOUT altering
+// the pre-existing findings/artifacts table shapes in db.ts. This test
+// proves that boundary held for the real diff, not just "the code looks
+// like it doesn't touch those files" — it shells out to git (read-only) and
+// checks the ACTUAL changed-file set and the ACTUAL db.ts diff hunks against
+// the base commit the P6 work branched from.
+// ---------------------------------------------------------------------------
+describe('ATM-031: scope-bleed guardrail — diff vs base 5014d7f (REQ-019)', () => {
+  const BASE_COMMIT = '5014d7f'
+  // REPO resolves to the worktree root (this file lives in tests/, one level
+  // down) — robust regardless of which directory `bun test` was invoked from.
+  const REPO = join(import.meta.dir, '..')
+
+  function gitDiffNameOnly(): string[] {
+    let proc: ReturnType<typeof Bun.spawnSync>
+    try {
+      proc = Bun.spawnSync(['git', '-C', REPO, 'diff', '--name-only', BASE_COMMIT], {
+        cwd: REPO,
+      })
+    } catch (err) {
+      // Fail loudly — git being unavailable must not be mistaken for "no
+      // diff" (which would silently pass this guardrail for the wrong
+      // reason).
+      throw new Error(`ATM-031: git is unavailable — cannot verify scope-bleed boundary: ${err}`)
+    }
+    if (proc.exitCode !== 0) {
+      const stderr = proc.stderr?.toString() ?? '(no stderr)'
+      throw new Error(
+        `ATM-031: 'git diff --name-only ${BASE_COMMIT}' exited ${proc.exitCode} — cannot verify scope-bleed ` +
+        `boundary. Is ${BASE_COMMIT} a valid commit reachable from this worktree? stderr: ${stderr}`,
+      )
+    }
+    // proc.stdout is typed `Buffer | undefined` by bun-types' generic
+    // ReturnType inference here, but is always a Buffer in practice — this
+    // call never overrides stdio, so it uses spawnSync's "pipe" default.
+    // Guard defensively rather than assert, so an unexpected undefined
+    // still fails loudly (empty diff) instead of throwing a TypeError.
+    const out = (proc.stdout ?? Buffer.alloc(0)).toString().trim()
+    return out.length === 0 ? [] : out.split('\n')
+  }
+
+  function gitDiffFile(relPath: string): string {
+    let proc: ReturnType<typeof Bun.spawnSync>
+    try {
+      proc = Bun.spawnSync(['git', '-C', REPO, 'diff', BASE_COMMIT, '--', relPath], {
+        cwd: REPO,
+      })
+    } catch (err) {
+      throw new Error(`ATM-031: git is unavailable — cannot verify db.ts scope-bleed boundary: ${err}`)
+    }
+    if (proc.exitCode !== 0) {
+      const stderr = proc.stderr?.toString() ?? '(no stderr)'
+      throw new Error(
+        `ATM-031: 'git diff ${BASE_COMMIT} -- ${relPath}' exited ${proc.exitCode} — cannot verify scope-bleed ` +
+        `boundary. stderr: ${stderr}`,
+      )
+    }
+    return (proc.stdout ?? Buffer.alloc(0)).toString()
+  }
+
+  test('ATM-031(1): none of the protected memory/messages/decision files appear in the P6 changed-file set', () => {
+    const PROTECTED_FILES = [
+      'memory-integrity.ts',
+      'memory-integrity-patterns.ts',
+      'memory-ordering.ts',
+      'agent-messages.ts',
+      'agent-message-types.ts',
+      'decision.ts',
+    ]
+
+    const changedFiles = gitDiffNameOnly()
+    // Sanity precondition: the diff must be non-trivial (P6 unquestionably
+    // touched SOMETHING vs the base commit) — otherwise a git misconfig that
+    // makes gitDiffNameOnly() return [] would make this test pass for the
+    // wrong reason (vacuous "0 protected files changed because 0 files
+    // changed at all").
+    expect(changedFiles.length).toBeGreaterThan(0)
+
+    const violations = PROTECTED_FILES.filter(f => changedFiles.includes(f))
+    if (violations.length > 0) {
+      throw new Error(
+        `ATM-031 violation: protected file(s) appear in the P6 diff vs ${BASE_COMMIT}: ${violations.join(', ')}\n` +
+        `P6's BEGIN IMMEDIATE / critique-severity patterns must be re-implemented locally in the failure-` +
+        `classification module, NOT imported from or by modifying decision.ts/memory-integrity.ts/memory-ordering.ts/` +
+        `agent-messages.ts. Full changed-file set: ${changedFiles.join(', ')}`,
+      )
+    }
+    expect(violations).toEqual([])
+  })
+
+  test('ATM-031(2): the findings/artifacts table DEFINITIONS in db.ts are unchanged in the P6 diff (only failure_classifications + flag-seed additions)', () => {
+    const dbDiff = gitDiffFile('db.ts')
+    // Sanity precondition: db.ts DID change (P6 added the failure_classifications
+    // table + flag seed there — ATM-019/ATM-027) — a git misconfig returning
+    // an empty diff must not be mistaken for "no findings/artifacts touch".
+    expect(dbDiff.length).toBeGreaterThan(0)
+
+    const diffLines = dbDiff.split('\n')
+    const addedOrRemoved = diffLines.filter(l => (l.startsWith('+') || l.startsWith('-'))
+      && !l.startsWith('+++') && !l.startsWith('---'))
+
+    // Any added/removed line that touches a `findings` or `artifacts` CREATE
+    // TABLE statement, or references those table names in a column/index
+    // definition context, is a scope-bleed violation. Deliberately broad
+    // (case-insensitive substring match on the table names) so a rename,
+    // an added column, or an added/dropped index on either table is caught
+    // — not just a literal "CREATE TABLE findings" line.
+    const findingsOrArtifactsHits = addedOrRemoved.filter(l =>
+      /\bfindings\b/i.test(l) || /\bartifacts\b/i.test(l),
+    )
+
+    if (findingsOrArtifactsHits.length > 0) {
+      throw new Error(
+        `ATM-031 violation: db.ts diff vs ${BASE_COMMIT} contains added/removed line(s) touching findings/artifacts:\n` +
+        findingsOrArtifactsHits.map(l => `  ${l}`).join('\n') +
+        `\nThe only db.ts additions in P6 should be the failure_classifications table + its indexes ` +
+        `(ATM-019) and the failure_classification_enabled flag seed (ATM-027).`,
+      )
+    }
+    expect(findingsOrArtifactsHits).toEqual([])
+
+    // Confirm the diff DOES contain the expected, in-scope addition (proves
+    // this test is reading real diff content, not an empty/truncated one).
+    expect(dbDiff).toMatch(/failure_classifications/)
+  })
+
+  test('ATM-031(3): verification/failure-classification.ts source contains no reward-shaped computation and no cross-family critique construction', () => {
+    // Distinct from (and in addition to) ATM-025 above: ATM-025 is a
+    // module-scope regex scan proving the module's OWN source is clean.
+    // ATM-031(3) is the scope-bleed-specific restatement of that same
+    // invariant, kept as an independent assertion so this describe block is
+    // a self-contained, diff-anchored proof of REQ-019 that doesn't rely on
+    // ATM-025 continuing to exist/pass elsewhere in this file.
+    const modulePath = join(REPO, 'verification', 'failure-classification.ts')
+    const source = readFileSync(modulePath, 'utf8')
+
+    // (a) No numeric literal -1/0/1 returned or assigned to a `reward`-named
+    // binding, and no `reward` identifier anywhere in the module at all —
+    // the strongest form of "no reward-shaped computation crossed over from
+    // the critique/decision family".
+    expect(source).not.toMatch(/reward/i)
+
+    // (b) No cross-family critique CONSTRUCTION. Strip the one known,
+    // pre-existing type-only `CritiqueSeverity` import (ATM-004's
+    // decision.ts distinctness guardrail — legitimate, unrelated to
+    // building a critique) before scanning, then assert zero remaining
+    // occurrences of the word.
+    const withoutKnownTypeImport = source.replace(/CritiqueSeverity/g, '')
+    expect(withoutKnownTypeImport).not.toMatch(/critique/i)
+  })
+})

@@ -21,7 +21,7 @@
  * onFailureClassified that THROWS must not affect the critical-Telegram
  * emission or the bridge's own resolution.
  */
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect, spyOn } from 'bun:test'
 import { mkdtempSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
@@ -173,5 +173,75 @@ describe('ATM-017(b): fault-injection — throwing onFailureClassified', () => {
 
     bridge.destroy()
     rmSync(tmpDir, { recursive: true, force: true })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// OQ-4 — boss-approved belt-and-suspenders runtime guard (P6 Stage 7).
+//
+// HARD CONSTRAINT: the guard is FLAG-ON-ONLY — it must NEVER fire (no
+// console output, no behavior change) unless a caller explicitly passes
+// `failureClassificationEnabled: true`. This keeps flag-OFF byte-parity
+// (G4) completely untouched: every existing caller (all of
+// tests/escalation-bridge/*.test.ts, the ATM-016/017 tests above, and the
+// one production site system/bin/sprint4-heartbeat-hook.sh) never passes
+// this option, so `opts.failureClassificationEnabled` is `undefined` for
+// all of them and the `=== true` check short-circuits to false.
+//
+// The bridge deliberately has no db handle (DI-only design — see the
+// module doc comment), so it cannot call isFeatureEnabled() itself. The
+// CALLER is expected to read the flag and pass the boolean through; this
+// guard exists to catch the case where the flag is ON but nobody wired the
+// callback, which would silently drop classifications from the
+// all-paths-failed branch (REQ-020 / KO-6).
+// ---------------------------------------------------------------------------
+describe('OQ-4: failure_classification_enabled runtime guard (flag-ON-only, belt-and-suspenders)', () => {
+  it('(a) failureClassificationEnabled=true, NO onFailureClassified -> warns exactly once, message contains "onFailureClassified"', () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const bridge = new EscalationBridge({ failureClassificationEnabled: true })
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      const [msg] = warnSpy.mock.calls[0]!
+      expect(String(msg)).toContain('onFailureClassified')
+      bridge.destroy()
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('(b) failureClassificationEnabled=true WITH onFailureClassified wired -> does NOT warn', () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const bridge = new EscalationBridge({
+        failureClassificationEnabled: true,
+        onFailureClassified: async () => {},
+      })
+      expect(warnSpy).not.toHaveBeenCalled()
+      bridge.destroy()
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('(c) failureClassificationEnabled unset/undefined ({}) -> does NOT warn', () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const bridge = new EscalationBridge({})
+      expect(warnSpy).not.toHaveBeenCalled()
+      bridge.destroy()
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('(d) failureClassificationEnabled=false -> does NOT warn', () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const bridge = new EscalationBridge({ failureClassificationEnabled: false })
+      expect(warnSpy).not.toHaveBeenCalled()
+      bridge.destroy()
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 })

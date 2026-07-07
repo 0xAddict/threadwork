@@ -84,6 +84,16 @@ export interface EscalationBridgeOptions {
   // complete no-op inside the bridge (default; no runtime-guard warning yet
   // — that lands in Stage 7).
   onFailureClassified?: (classification: FailureClassification) => Promise<void>
+  // P6 Stage 7 / OQ-4 — additive, flag-ON-only DI seam. The bridge has no
+  // db handle by design, so it cannot call isFeatureEnabled() itself: the
+  // CALLER reads isFeatureEnabled('failure_classification_enabled') and
+  // passes the result here. When true AND onFailureClassified is unset,
+  // the constructor emits a one-time console.warn (see below) so a
+  // misconfigured deployment (flag ON, no callback wired) is visible
+  // instead of silently dropping classifications. Left undefined (the
+  // default for every existing caller) => the guard never fires and
+  // behavior is byte-identical to pre-Stage-7 (G4 parity untouched).
+  failureClassificationEnabled?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +173,15 @@ export class EscalationBridge {
     this.retryBackoffMs = opts.retryBackoffMs ?? 5000
     // P6 Stage 5 / EPIC-03 — additive DI seam. undefined => no-op (default).
     this.onFailureClassified = opts.onFailureClassified
+
+    // P6 Stage 7 / OQ-4 — belt-and-suspenders runtime guard. FLAG-ON-ONLY:
+    // fires ONLY when the caller explicitly signals the flag is ON
+    // (opts.failureClassificationEnabled === true). Every existing caller
+    // never passes this option (=> undefined), so this branch is dead code
+    // for them and G4 flag-OFF byte-parity is untouched.
+    if (opts.failureClassificationEnabled === true && !opts.onFailureClassified) {
+      console.warn('[escalation-bridge] failure_classification_enabled is ON but no onFailureClassified callback is wired — classifications from the all-paths-failed branch will be dropped (see REQ-020 / KO-6).')
+    }
 
     // Ensure dirs exist
     for (const p of [this.statePath, this.auditLogPath, this.enabledPath]) {
