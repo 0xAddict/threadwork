@@ -9,11 +9,13 @@
 // This stage does NOT test classifyFailure(), adapters, persistence, or the
 // read accessor — those land in later P6 stages (see specs/P6-spec.md).
 
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { unlinkSync } from 'node:fs'
 import type { CritiqueSeverity } from '../decision'
 import type { BlockedOn } from '../db'
+import { TaskDB } from '../db'
 import taxonomySnapshot from './fixtures/failure-classification-taxonomy.snapshot.json'
 import {
   type FailureClass,
@@ -30,6 +32,7 @@ import {
   type RawFailureSignal,
   IDLE_COUNT_STAGNATION_THRESHOLD,
   classifyFailure,
+  persistFailureClassification,
 } from '../verification/failure-classification'
 
 // ---------------------------------------------------------------------------
@@ -653,5 +656,370 @@ describe('ATM-009: never-throw fuzz — 50 malformed inputs incl. circular refs'
     expect(thrownDetails).toEqual([])
     expect(thrown).toBe(0)
     expect(nonUnknown).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// EPIC-04 (Stage 3): durable, append-only persistence
+// ---------------------------------------------------------------------------
+// Covers ATM-019 (table + 3 indexes in migrate()), ATM-027 (feature-flag
+// seed, formally EPIC-06 but seeded/tested here since it lives in migrate()),
+// ATM-020 (persistFailureClassification()), ATM-021 (flag gate), ATM-022
+// (append-only static scan), ATM-023 (build-order independence from P5), and
+// ATM-030 (audit atomicity, two-direction fault injection). See
+// verification/failure-classification.ts and db.ts for the implementation.
+
+/** Builds a FailureClassification literal with sane defaults, override-able per test. */
+function makeFailureClassification(overrides: Partial<FailureClassification> = {}): FailureClassification {
+  return {
+    failure_class: 'verification_failure',
+    severity: 'medium',
+    transience: 'transient',
+    domain: 'agent',
+    taxonomy_version: TAXONOMY_VERSION,
+    signal_source: 'verify_check',
+    source_ref: 'chk-1',
+    task_id: null,
+    agent: 'boss',
+    summary: 'a test classification',
+    raw_signal: { source: 'verify_check', checkResultId: 'chk-1' },
+    ...overrides,
+  }
+}
+
+/** Removes a sqlite db file plus its -shm/-wal sidecars, tolerating "doesn't exist". */
+function wipeDbFile(path: string): void {
+  for (const suffix of ['', '-shm', '-wal']) {
+    try { unlinkSync(path + suffix) } catch { /* doesn't exist yet */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ATM-019 / REQ-009 [P1] — failure_classifications table + 3 indexes
+// ---------------------------------------------------------------------------
+describe('ATM-019: failure_classifications table + indexes (REQ-009)', () => {
+  const TEST_DB = '/tmp/p6-persist-atm019.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-019: failure_classifications has exactly the documented columns, and NO classified_at column', () => {
+    const columns = taskDb.run(db => db.prepare("PRAGMA table_info('failure_classifications')").all()) as { name: string }[]
+    const columnNames = columns.map(c => c.name).sort()
+    expect(columnNames).toEqual(
+      [
+        'id',
+        'taxonomy_version',
+        'failure_class',
+        'severity',
+        'transience',
+        'domain',
+        'signal_source',
+        'source_ref',
+        'task_id',
+        'agent',
+        'summary',
+        'raw_signal_json',
+        'created_at',
+      ].sort()
+    )
+    expect(columnNames).not.toContain('classified_at')
+  })
+
+  test('ATM-019: 3 indexes exist covering task_id, failure_class, and created_at', () => {
+    const indexes = taskDb.run(db => db.prepare("PRAGMA index_list('failure_classifications')").all()) as { name: string }[]
+    expect(indexes.length).toBeGreaterThanOrEqual(3)
+
+    const coveredColumns = new Set<string>()
+    for (const idx of indexes) {
+      const infoRows = taskDb.run(db => db.prepare(`PRAGMA index_info('${idx.name}')`).all()) as { name: string }[]
+      for (const row of infoRows) coveredColumns.add(row.name)
+    }
+    expect(coveredColumns.has('task_id')).toBe(true)
+    expect(coveredColumns.has('failure_class')).toBe(true)
+    expect(coveredColumns.has('created_at')).toBe(true)
+  })
+
+  test('ATM-019: re-running migrate() (fresh TaskDB against the same file) is idempotent — no error, same schema', () => {
+    expect(() => new TaskDB(TEST_DB)).not.toThrow()
+    const columns = taskDb.run(db => db.prepare("PRAGMA table_info('failure_classifications')").all()) as { name: string }[]
+    expect(columns.length).toBe(13)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-027 / REQ-015 [P1] — failure_classification_enabled flag seed
+// ---------------------------------------------------------------------------
+describe('ATM-027: failure_classification_enabled flag seed (REQ-015)', () => {
+  const TEST_DB = '/tmp/p6-persist-atm027.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-027: fresh migrate() seeds failure_classification_enabled=0, read via isFeatureEnabled()', () => {
+    expect(taskDb.isFeatureEnabled('failure_classification_enabled')).toBe(false)
+    const row = taskDb.run(db => db.prepare(
+      "SELECT enabled FROM feature_flags WHERE flag_name = 'failure_classification_enabled'"
+    ).get()) as { enabled: number } | null
+    expect(row).not.toBeNull()
+    expect(row!.enabled).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-020 / REQ-009 [P1] — persistFailureClassification()
+// ---------------------------------------------------------------------------
+describe('ATM-020: persistFailureClassification() (REQ-009)', () => {
+  const TEST_DB = '/tmp/p6-persist-atm020.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-020: 3 sequential persists (flag ON) -> 3 rows, strictly increasing ids, created_at populated, every field round-trips incl. raw_signal_json', () => {
+    taskDb.setFeatureFlag('failure_classification_enabled', true)
+
+    const inputs: FailureClassification[] = [
+      makeFailureClassification({ summary: 'first', raw_signal: { source: 'verify_check', checkResultId: 'a' } }),
+      makeFailureClassification({
+        summary: 'second',
+        task_id: 42,
+        agent: 'steve',
+        failure_class: 'test_failure',
+        signal_source: 'test_run',
+        raw_signal: { source: 'test_run', nested: { x: 1, y: [1, 2, 3] } },
+      }),
+      makeFailureClassification({ summary: 'third', source_ref: null, task_id: null, agent: null, raw_signal: null }),
+    ]
+
+    const ids: number[] = []
+    for (const input of inputs) {
+      const id = taskDb.run(db => persistFailureClassification(db, input))
+      expect(id).not.toBeNull()
+      ids.push(id as number)
+    }
+
+    expect(ids[1]).toBeGreaterThan(ids[0])
+    expect(ids[2]).toBeGreaterThan(ids[1])
+
+    const rows = taskDb.run(db => db.prepare('SELECT * FROM failure_classifications ORDER BY id ASC').all()) as any[]
+    expect(rows.length).toBe(3)
+
+    rows.forEach((row, i) => {
+      const input = inputs[i]
+      expect(row.id).toBe(ids[i])
+      expect(typeof row.created_at).toBe('string')
+      expect(row.created_at.length).toBeGreaterThan(0)
+      expect(row.taxonomy_version).toBe(input.taxonomy_version)
+      expect(row.failure_class).toBe(input.failure_class)
+      expect(row.severity).toBe(input.severity)
+      expect(row.transience).toBe(input.transience)
+      expect(row.domain).toBe(input.domain)
+      expect(row.signal_source).toBe(input.signal_source)
+      expect(row.source_ref).toBe(input.source_ref)
+      expect(row.task_id).toBe(input.task_id)
+      expect(row.agent).toBe(input.agent)
+      expect(row.summary).toBe(input.summary)
+      expect(JSON.parse(row.raw_signal_json)).toEqual(input.raw_signal)
+    })
+  })
+
+  test('ATM-020: source-level — persistFailureClassification uses a LOCAL BEGIN IMMEDIATE, and the module imports no memory-ordering.ts symbol', () => {
+    const modulePath = join(import.meta.dir, '..', 'verification', 'failure-classification.ts')
+    const source = readFileSync(modulePath, 'utf8')
+
+    const marker = 'export function persistFailureClassification'
+    const start = source.indexOf(marker)
+    expect(start).toBeGreaterThanOrEqual(0)
+
+    const braceStart = source.indexOf('{', start)
+    expect(braceStart).toBeGreaterThan(start)
+
+    let depth = 0
+    let end = -1
+    for (let i = braceStart; i < source.length; i++) {
+      const ch = source[i]
+      if (ch === '{') depth++
+      else if (ch === '}') {
+        depth--
+        if (depth === 0) {
+          end = i
+          break
+        }
+      }
+    }
+    expect(end).toBeGreaterThan(braceStart)
+
+    const body = source.slice(braceStart, end + 1)
+    expect(body).toMatch(/BEGIN IMMEDIATE/)
+    expect(body).toMatch(/COMMIT/)
+    expect(body).toMatch(/ROLLBACK/)
+
+    expect(source).not.toMatch(/from\s+['"]\.{1,2}\/memory-ordering['"]/)
+    expect(source).not.toMatch(/\bwithMemoryWriteTxn\b/)
+    expect(source).not.toMatch(/\bnextWriteSeq\b/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-021 / REQ-010 [P1] — flag gate
+// ---------------------------------------------------------------------------
+describe('ATM-021: flag gate (REQ-010)', () => {
+  const TEST_DB = '/tmp/p6-persist-atm021.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-021: flag OFF (default) -> persist returns null, row count stays 0', () => {
+    const id = taskDb.run(db => persistFailureClassification(db, makeFailureClassification()))
+    expect(id).toBeNull()
+    const count = taskDb.run(db => (db.prepare('SELECT count(*) AS n FROM failure_classifications').get() as { n: number }).n)
+    expect(count).toBe(0)
+  })
+
+  test('ATM-021: flag ON -> row inserted, non-null numeric id returned', () => {
+    taskDb.setFeatureFlag('failure_classification_enabled', true)
+    const id = taskDb.run(db => persistFailureClassification(db, makeFailureClassification()))
+    expect(id).not.toBeNull()
+    expect(typeof id).toBe('number')
+    const count = taskDb.run(db => (db.prepare('SELECT count(*) AS n FROM failure_classifications').get() as { n: number }).n)
+    expect(count).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-022 / REQ-011 [P2] — append-only, no UPDATE/DELETE
+// ---------------------------------------------------------------------------
+describe('ATM-022: append-only — no UPDATE/DELETE against failure_classifications (REQ-011)', () => {
+  test('ATM-022: neither UPDATE nor DELETE targeting failure_classifications appears in failure-classification.ts or db.ts', () => {
+    const fcPath = join(import.meta.dir, '..', 'verification', 'failure-classification.ts')
+    const dbPath = join(import.meta.dir, '..', 'db.ts')
+    const fcSource = readFileSync(fcPath, 'utf8')
+    const dbSource = readFileSync(dbPath, 'utf8')
+
+    const updateRe = /UPDATE\s+failure_classifications/i
+    const deleteRe = /DELETE\s+FROM\s+failure_classifications/i
+
+    expect(updateRe.test(fcSource)).toBe(false)
+    expect(deleteRe.test(fcSource)).toBe(false)
+    expect(updateRe.test(dbSource)).toBe(false)
+    expect(deleteRe.test(dbSource)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-023 / REQ-012 [P2] — build-order independence (zero P5 coupling)
+// ---------------------------------------------------------------------------
+describe('ATM-023: build-order independence — zero P5 coupling (REQ-012)', () => {
+  const TEST_DB = '/tmp/p6-persist-atm023.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-023(a): failure-classification.ts source has zero references to memory-ordering.ts, withMemoryWriteTxn, or nextWriteSeq', () => {
+    const fcPath = join(import.meta.dir, '..', 'verification', 'failure-classification.ts')
+    const source = readFileSync(fcPath, 'utf8')
+    expect(source).not.toMatch(/memory-ordering/)
+    expect(source).not.toMatch(/\bwithMemoryWriteTxn\b/)
+    expect(source).not.toMatch(/\bnextWriteSeq\b/)
+  })
+
+  test('ATM-023(b): persistFailureClassification succeeds against a fresh migrated temp DB with zero dependence on memory-ordering.ts (atomicity comes from the LOCAL BEGIN IMMEDIATE proven in ATM-020, not any P5 symbol — see ATM-023(a))', () => {
+    taskDb.setFeatureFlag('failure_classification_enabled', true)
+    const id = taskDb.run(db => persistFailureClassification(db, makeFailureClassification()))
+    expect(id).not.toBeNull()
+    expect(typeof id).toBe('number')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-030 / REQ-018 [P2] — audit atomicity, two-direction fault injection
+// ---------------------------------------------------------------------------
+describe('ATM-030: audit atomicity, two-direction fault injection (REQ-018)', () => {
+  const TEST_DB = '/tmp/p6-persist-atm030.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    taskDb.setFeatureFlag('failure_classification_enabled', true)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-030(a) happy path: persisting a classification produces exactly ONE audit_log row with action=failure_classified, detail containing failure_class/task_id/agent', () => {
+    const input = makeFailureClassification({ task_id: 77, agent: 'sadie', failure_class: 'test_failure' })
+    const id = taskDb.run(db => persistFailureClassification(db, input))
+    expect(id).not.toBeNull()
+
+    const auditRows = taskDb.run(db => db.prepare(
+      "SELECT * FROM audit_log WHERE action = 'failure_classified'"
+    ).all()) as any[]
+    expect(auditRows.length).toBe(1)
+    expect(auditRows[0].task_id).toBe(77)
+
+    const detail = JSON.parse(auditRows[0].detail)
+    expect(detail.failure_class).toBe('test_failure')
+    expect(detail.task_id).toBe(77)
+    expect(detail.agent).toBe('sadie')
+  })
+
+  test('ATM-030(b) fault-injection (audit direction): forcing the AUDIT insert to throw (audit_log renamed away) rolls back the classification row too — 0 rows, persist rethrows', () => {
+    taskDb.run(db => db.exec('ALTER TABLE audit_log RENAME TO audit_log_atm030_bak'))
+    try {
+      let threw = false
+      let thrownErr: unknown = null
+      try {
+        taskDb.run(db => persistFailureClassification(db, makeFailureClassification()))
+      } catch (err) {
+        threw = true
+        thrownErr = err
+      }
+      expect(threw).toBe(true)
+      expect(thrownErr).not.toBeNull()
+
+      const count = taskDb.run(db => (db.prepare('SELECT count(*) AS n FROM failure_classifications').get() as { n: number }).n)
+      expect(count).toBe(0)
+    } finally {
+      taskDb.run(db => db.exec('ALTER TABLE audit_log_atm030_bak RENAME TO audit_log'))
+    }
+  })
+
+  test('ATM-030(c) fault-injection (classification direction): forcing the CLASSIFICATION insert to throw (failure_classifications renamed away) leaves NO audit_log row with action=failure_classified', () => {
+    taskDb.run(db => db.exec('ALTER TABLE failure_classifications RENAME TO failure_classifications_atm030_bak'))
+    try {
+      let threw = false
+      try {
+        taskDb.run(db => persistFailureClassification(db, makeFailureClassification()))
+      } catch {
+        threw = true
+      }
+      expect(threw).toBe(true)
+    } finally {
+      taskDb.run(db => db.exec('ALTER TABLE failure_classifications_atm030_bak RENAME TO failure_classifications'))
+    }
+
+    const auditRows = taskDb.run(db => db.prepare(
+      "SELECT * FROM audit_log WHERE action = 'failure_classified'"
+    ).all()) as any[]
+    expect(auditRows.length).toBe(0)
   })
 })

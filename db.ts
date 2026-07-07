@@ -608,6 +608,11 @@ export class TaskDB {
     // off, send_directed_message's behavior is byte-identical to Stage 6
     // (no onSent callback is constructed or passed).
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('directed_messaging_nudge_on_send', 0)")
+    // P6 EPIC-04/EPIC-06 (REQ-015/ATM-027): durable failure-classification
+    // persistence. DEFAULT OFF — Stage 3 scaffold only; persistFailureClassification()
+    // (verification/failure-classification.ts) is not yet wired into any
+    // production call site in this stage (adapter/live-wiring lands later).
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('failure_classification_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
@@ -1074,6 +1079,36 @@ export class TaskDB {
       console.warn('[task-board] memory_vectors (migration 0015) setup skipped:', (err as Error)?.message)
     }
 
+    // P6 EPIC-04 (REQ-009/ATM-019): durable, append-only failure-classification
+    // persistence. Mirrors the audit_log idiom above (CREATE TABLE IF NOT
+    // EXISTS + supporting indexes). created_at is the single canonical
+    // timestamp, stamped at persist time by the DEFAULT — classifyFailure()
+    // (verification/failure-classification.ts) is pure and carries no
+    // timestamp of its own, so there is deliberately no separate
+    // classified_at column. Rows are NEVER updated or deleted (REQ-011/
+    // ATM-022) — this is a write-once, append-only log written by
+    // persistFailureClassification() in verification/failure-classification.ts.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS failure_classifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        taxonomy_version INTEGER NOT NULL,
+        failure_class TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        transience TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        signal_source TEXT NOT NULL,
+        source_ref TEXT,
+        task_id INTEGER REFERENCES tasks(id),
+        agent TEXT,
+        summary TEXT NOT NULL,
+        raw_signal_json TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_failure_classifications_task ON failure_classifications(task_id);
+      CREATE INDEX IF NOT EXISTS idx_failure_classifications_class ON failure_classifications(failure_class);
+      CREATE INDEX IF NOT EXISTS idx_failure_classifications_created ON failure_classifications(created_at);
+    `)
   }
 
   createTask(input: CreateTaskInput): Task {

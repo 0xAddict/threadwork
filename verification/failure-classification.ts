@@ -21,6 +21,7 @@
 // blocked_on field precisely.
 
 import type { BlockedOn } from '../db'
+import type { Database } from 'bun:sqlite'
 
 // ---------------------------------------------------------------------------
 // ATM-001 / REQ-001 [P1] — Canonical versioned FailureClass
@@ -438,4 +439,95 @@ export function classifyFailure(signal: RawFailureSignal): FailureClassification
   }
 
   return { ...base, ...quad }
+}
+
+// ---------------------------------------------------------------------------
+// ATM-020 / REQ-009 [P1] — persistFailureClassification() (Stage 3, EPIC-04)
+// ---------------------------------------------------------------------------
+
+/**
+ * Persists a FailureClassification as a durable, append-only row in
+ * failure_classifications (migrate()'d in db.ts), plus a matching audit_log
+ * row — both inside ONE LOCAL 'BEGIN IMMEDIATE' transaction, so a failure on
+ * either write rolls back both (REQ-018/ATM-030 two-direction fault
+ * injection). Gated on the failure_classification_enabled feature flag
+ * (REQ-010/ATM-021): when the flag row is missing or `enabled` is not
+ * exactly 1, this returns null WITHOUT opening any transaction or inserting
+ * any row.
+ *
+ * Deliberately takes a raw `db: Database` handle (not a TaskDB) so this
+ * module stays free of any TaskDB coupling beyond the type-only BlockedOn
+ * import already present above. Atomicity here comes from the LOCAL
+ * 'BEGIN IMMEDIATE'/'COMMIT'/'ROLLBACK' below — the same inline pattern used
+ * by decision.ts's finalizeDecision()/expireDecision() — NOT from any P5
+ * write-ordering helper (the write-transaction wrapper or sequence minter
+ * that ships in a sibling module). This module imports neither of those P5
+ * symbols (REQ-012/ATM-023): build-order independence from P5 is structural,
+ * not just a runtime coincidence.
+ */
+export function persistFailureClassification(
+  db: Database,
+  classification: FailureClassification,
+): number | null {
+  // REQ-010/ATM-021: flag gate, checked BEFORE any transaction is opened.
+  const flagRow = db
+    .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'failure_classification_enabled'")
+    .get() as { enabled: number } | null
+  if (!flagRow || flagRow.enabled !== 1) {
+    return null
+  }
+
+  // Tolerate circular / non-serializable raw_signal without throwing.
+  let rawJson: string | null
+  try {
+    rawJson = JSON.stringify(classification.raw_signal) ?? null
+  } catch {
+    rawJson = null
+  }
+
+  db.prepare('BEGIN IMMEDIATE').run()
+  try {
+    const inserted = db
+      .prepare(`
+        INSERT INTO failure_classifications (
+          taxonomy_version, failure_class, severity, transience, domain,
+          signal_source, source_ref, task_id, agent, summary, raw_signal_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING id
+      `)
+      .get(
+        classification.taxonomy_version,
+        classification.failure_class,
+        classification.severity,
+        classification.transience,
+        classification.domain,
+        classification.signal_source,
+        classification.source_ref,
+        classification.task_id,
+        classification.agent,
+        classification.summary,
+        rawJson,
+      ) as { id: number }
+
+    // REQ-018/ATM-030: audit row, same local transaction. detail always
+    // carries failure_class; task_id/agent are included only when present.
+    const detail: Record<string, unknown> = { failure_class: classification.failure_class }
+    if (classification.task_id !== null && classification.task_id !== undefined) {
+      detail.task_id = classification.task_id
+    }
+    if (classification.agent !== null && classification.agent !== undefined) {
+      detail.agent = classification.agent
+    }
+
+    db.prepare(`
+      INSERT INTO audit_log (agent, action, detail, task_id)
+      VALUES (?, ?, ?, ?)
+    `).run(classification.agent ?? 'system', 'failure_classified', JSON.stringify(detail), classification.task_id)
+
+    db.prepare('COMMIT').run()
+    return inserted.id
+  } catch (err) {
+    try { db.prepare('ROLLBACK').run() } catch {}
+    throw err
+  }
 }
