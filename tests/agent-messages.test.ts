@@ -311,6 +311,89 @@ describe('ATM-017 — payload JSON validation', () => {
     const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
     expect(count).toBe(1)
   })
+
+  // -------------------------------------------------------------------------
+  // R4 (bounded residual, codex round-3 GENUINE HIGH, Gwei-authorized fold):
+  // assertJsonPlain() still under-validated the actual JSON.stringify()
+  // serialization surface. (1) plain objects were checked via
+  // Object.keys() (enumerable-only), so a NON-ENUMERABLE own toJSON was
+  // invisible to validation but JSON.stringify() STILL calls it, persisting
+  // a different tree than what was validated. (2) arrays were checked only
+  // at numeric indices, so own string/symbol props on arrays were never
+  // checked. These cases close that gap via Layer A (structural,
+  // strengthened assertJsonPlain) + Layer B (serialize-then-revalidate
+  // integrity check in sendDirectedMessage) belt-and-suspenders validation.
+  // -------------------------------------------------------------------------
+
+  test('R4: codex EXACT repro — a NON-enumerable toJSON is rejected, no row inserted, and no row containing its substituted content is ever persisted', () => {
+    const p: any = { ok: true }
+    Object.defineProperty(p, 'toJSON', { value: () => ({ evil: 1 }), enumerable: false })
+
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: p })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+
+    const evilRow = taskDb.getHandle().prepare("SELECT * FROM agent_messages WHERE payload LIKE '%evil%'").get()
+    expect(evilRow).toBeNull()
+  })
+
+  test('R4: an ENUMERABLE toJSON is rejected and no row inserted', () => {
+    const payload = { ok: true, toJSON() { return { evil: 1 } } }
+
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+
+    const evilRow = taskDb.getHandle().prepare("SELECT * FROM agent_messages WHERE payload LIKE '%evil%'").get()
+    expect(evilRow).toBeNull()
+  })
+
+  test('R4: an array carrying a non-index own property is rejected and no row inserted', () => {
+    const a: any = [1, 2]
+    a.foo = 'x'
+
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: a })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('R4: a non-enumerable own string property is rejected (it would otherwise be silently dropped by JSON.stringify)', () => {
+    const o: any = { ok: true }
+    Object.defineProperty(o, 'hidden', { value: 1, enumerable: false })
+
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: o })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('R4: a getter that returns a DIFFERENT value on successive reads is rejected (Layer B serialize-then-revalidate divergence)', () => {
+    let reads = 0
+    const payload = {
+      get counter() {
+        reads += 1
+        return reads
+      },
+    }
+
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
 })
 
 describe('ATM-018 — sendDirectedMessage identity/recipient discipline + testability seam', () => {

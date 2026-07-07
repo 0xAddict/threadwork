@@ -58,11 +58,22 @@ export interface SendDirectedMessageOptions {
 }
 
 /**
- * R2-1 (REQ-014/ATM-017, codex round 2 GENUINE HIGH finding): strict
- * recursive structural deep-check. A `JSON.stringify` round-trip is
- * LOSSLESS only for a closed set of value shapes — this function ACCEPTS
- * exactly that set and REJECTS everything else, including several values a
- * bare `JSON.stringify()` accepts without throwing but mangles silently:
+ * The closed set of value shapes assertJsonPlain() accepts — the exact
+ * subset of `unknown` for which `JSON.stringify` is lossless. Recursive: an
+ * array of JsonPlainValue, or a plain object whose own string-keyed values
+ * are all JsonPlainValue.
+ */
+type JsonPlainValue = null | string | boolean | number | JsonPlainValue[] | { [key: string]: JsonPlainValue }
+
+/**
+ * R4 (REQ-014/ATM-017, bounded R4 residual — codex round-3 GENUINE HIGH
+ * finding, "R2-1 residual"): strict recursive structural deep-check PLUS a
+ * serialize-then-revalidate integrity check (Layer B — see the comment at
+ * this function's call site in sendDirectedMessage(), immediately below). A
+ * `JSON.stringify` round-trip is LOSSLESS only for a closed set of value
+ * shapes — this function ACCEPTS exactly that set and REJECTS everything
+ * else, including several values a bare `JSON.stringify()` accepts without
+ * throwing but mangles silently:
  *
  *   - `Map` / `Set` / a class instance -> serializes to `{}` or a partial
  *     plain object (own enumerable data properties only; methods and
@@ -71,38 +82,70 @@ export interface SendDirectedMessageOptions {
  *   - `Error` -> serializes to `{}` (message/stack are non-enumerable).
  *   - `NaN` / `Infinity` / `-Infinity` -> silently coerced to `null`.
  *   - `Date` -> silently TYPE-CHANGES to an ISO string.
+ *   - a callable `toJSON` (own — enumerable OR non-enumerable — OR
+ *     inherited) -> `JSON.stringify` silently SUBSTITUTES `toJSON()`'s
+ *     return value for the object being validated, so structurally
+ *     validating the object itself proves nothing about what actually gets
+ *     persisted.
+ *   - an own non-enumerable data property, or an array's own non-index
+ *     property -> `JSON.stringify` silently OMITS it from its output, so a
+ *     naive `Object.keys()`/index-only walk never even sees it, yet the
+ *     walked/validated structure and the persisted bytes diverge.
  *
  * Accepted (recursively): `null`, `string`, `boolean`, a FINITE `number`, a
- * plain `Array` (every element recursively accepted), and a plain `Object`
- * — prototype is `Object.prototype` or `null` (an `Object.create(null)`
- * object), no symbol-keyed own properties, every value recursively
+ * plain `Array` (every index element recursively accepted, AND the array has
+ * NO own property beyond its numeric indices + `length`), and a plain
+ * `Object` — prototype is `Object.prototype` or `null` (an
+ * `Object.create(null)` object), no symbol-keyed own properties, no callable
+ * `toJSON`, every own string-keyed property value — enumerable OR
+ * non-enumerable, walked via `Reflect.ownKeys`, NOT `Object.keys` — recursively
  * accepted.
  *
  * Rejected: `function`, `symbol`, `undefined`, a non-finite `number`
  * (`NaN`/`±Infinity`), `BigInt`, any value whose prototype is not
  * `Object.prototype`/`null` (this catches `Map`/`Set`/`RegExp`/`Date`/
- * `Error`/any custom class instance uniformly), a symbol-keyed property,
- * and a circular reference (an ancestor object/array re-appearing as its
- * own descendant — tracked via a per-call `WeakSet` of currently-open
- * ancestors, so this ALSO subsumes the classic circular-ref case without a
- * separate check).
+ * `Error`/any custom class instance uniformly), a symbol-keyed own property
+ * (object OR array), a callable `toJSON` at any node, an array's own
+ * non-index property, and a circular reference (an ancestor object/array
+ * re-appearing as its own descendant — tracked via a per-call `WeakSet` of
+ * currently-open ancestors, so this ALSO subsumes the classic circular-ref
+ * case without a separate check).
  *
  * `Date` is INTENTIONALLY rejected — this is a deliberate strict
  * plain-only reading of REQ-014's "reject any non-plain value whose JSON
  * round-trip is lossy" (a `Date` -> string type-change IS a lossy,
  * unrequested transformation of the caller's data). Callers that want to
  * persist a timestamp MUST pass an ISO string themselves
- * (`someDate.toISOString()`) rather than a live `Date` instance.
+ * (`someDate.toISOString()`) rather than a live `Date` instance. (In
+ * practice `Date.prototype.toJSON` means a `Date` is now rejected by the
+ * callable-`toJSON` check below before it ever reaches the prototype check —
+ * same outcome, reject, just via an earlier, more specific check.)
+ *
+ * Returns a NEW plain deep-clone of `value`, built during this SAME
+ * recursive walk — each own-property value is read from the source EXACTLY
+ * ONCE (never via `toJSON`, since a callable `toJSON` is rejected outright
+ * before any clone-building happens at that node). sendDirectedMessage()
+ * compares `JSON.stringify()` of this returned clone against a SEPARATE,
+ * independent `JSON.stringify()` of the ORIGINAL payload — that
+ * serialize-then-revalidate comparison is Layer B, and it is what catches a
+ * stateful getter/proxy that returns a DIFFERENT value on its second read
+ * than the value this walk already validated and cloned; a purely
+ * structural check cannot see that divergence, since both reads look
+ * identically "plain" in isolation.
  *
  * Every rejection throws an `Error` naming the offending JSON-path (e.g.
  * `$.a.b[2]`) and the value's runtime type/tag, so callers can locate the
  * bad value without a debugger.
  */
-export function assertJsonPlain(value: unknown, path = '$', seen: WeakSet<object> = new WeakSet()): void {
-  if (value === null) return
+export function assertJsonPlain(
+  value: unknown,
+  path = '$',
+  seen: WeakSet<object> = new WeakSet(),
+): JsonPlainValue {
+  if (value === null) return null
 
   const t = typeof value
-  if (t === 'string' || t === 'boolean') return
+  if (t === 'string' || t === 'boolean') return value as string | boolean
 
   if (t === 'number') {
     if (!Number.isFinite(value as number)) {
@@ -111,7 +154,7 @@ export function assertJsonPlain(value: unknown, path = '$', seen: WeakSet<object
         `JSON has no representation for NaN/Infinity/-Infinity (JSON.stringify would silently emit "null")`
       )
     }
-    return
+    return value as number
   }
 
   if (t === 'undefined') {
@@ -137,14 +180,52 @@ export function assertJsonPlain(value: unknown, path = '$', seen: WeakSet<object
     throw new Error(`sendDirectedMessage: payload contains a circular reference at path ${path}`)
   }
 
+  // [R4, Layer A] A callable `toJSON` — own, enumerable OR non-enumerable
+  // (ordinary property lookup finds both), OR inherited via the prototype
+  // chain — is exactly what `JSON.stringify` consults to SUBSTITUTE a
+  // different value for this node. Reject unconditionally, before any
+  // structural check or clone-building below: there is no sound way to
+  // "validate" a node whose actual serialization is determined by a method
+  // this walk never inspects.
+  if (typeof (obj as { toJSON?: unknown }).toJSON === 'function') {
+    throw new Error(
+      `sendDirectedMessage: payload contains a callable toJSON at path ${path} — ` +
+      `JSON.stringify would substitute its return value for the structure being validated here`
+    )
+  }
+
   if (Array.isArray(obj)) {
     seen.add(obj)
     const arr = obj as unknown[]
+
+    // [R4, Layer A] An array's numeric-index elements are all that
+    // `JSON.stringify` actually emits for an array — any OTHER own property
+    // (string or symbol) is silently dropped from the output. A prior
+    // version of this validator only ever walked the index range, so an
+    // extra own property was entirely invisible to it. Reject it explicitly
+    // — a caller relying on that extra property deserves a clear error, not
+    // silent loss.
+    const ownArrayKeys = Reflect.ownKeys(arr)
+    const expectedArrayKeys = new Set<string>(['length'])
+    for (let i = 0; i < arr.length; i++) expectedArrayKeys.add(String(i))
+    for (const key of ownArrayKeys) {
+      if (typeof key === 'symbol') {
+        throw new Error(`sendDirectedMessage: payload array contains a symbol-keyed own property at path ${path}`)
+      }
+      if (!expectedArrayKeys.has(key)) {
+        throw new Error(
+          `sendDirectedMessage: payload array contains a non-index own property "${key}" at path ${path} — ` +
+          `arrays only serialize their numeric-index elements through JSON.stringify; extra own properties are silently dropped`
+        )
+      }
+    }
+
+    const clone: JsonPlainValue[] = new Array(arr.length)
     for (let i = 0; i < arr.length; i++) {
-      assertJsonPlain(arr[i], `${path}[${i}]`, seen)
+      clone[i] = assertJsonPlain(arr[i], `${path}[${i}]`, seen)
     }
     seen.delete(obj)
-    return
+    return clone
   }
 
   const proto = Object.getPrototypeOf(obj)
@@ -160,16 +241,36 @@ export function assertJsonPlain(value: unknown, path = '$', seen: WeakSet<object
     )
   }
 
-  const symbolKeys = Object.getOwnPropertySymbols(obj)
-  if (symbolKeys.length > 0) {
-    throw new Error(`sendDirectedMessage: payload contains a symbol-keyed property at path ${path}`)
+  // [R4, Layer A] `Reflect.ownKeys`, NOT `Object.keys` — walk EVERY own
+  // string-keyed property, enumerable or not. A non-enumerable own data
+  // property is invisible to `Object.keys()` yet `JSON.stringify` silently
+  // OMITS it from its output too — walking (and cloning) it here is what
+  // lets the Layer-B serialized-output comparison in sendDirectedMessage
+  // catch the resulting divergence: the clone built below WILL contain that
+  // property, while the real `JSON.stringify(payload)` never will.
+  const ownKeys = Reflect.ownKeys(obj)
+  const stringKeys: string[] = []
+  for (const key of ownKeys) {
+    if (typeof key === 'symbol') {
+      throw new Error(`sendDirectedMessage: payload contains a symbol-keyed property at path ${path}`)
+    }
+    stringKeys.push(key)
   }
 
   seen.add(obj)
-  for (const key of Object.keys(obj)) {
-    assertJsonPlain((obj as Record<string, unknown>)[key], `${path}.${key}`, seen)
+  const clone: { [key: string]: JsonPlainValue } = {}
+  for (const key of stringKeys) {
+    // Single read: this is the ONLY time this property value is read during
+    // this Layer-A walk. It is used to BOTH validate the value AND populate
+    // the clone — never read twice here, so a stateful getter cannot
+    // diverge from itself within this function. It CAN still diverge from
+    // the SEPARATE read `JSON.stringify(args.payload)` performs in
+    // sendDirectedMessage — that is exactly what Layer B is for.
+    const propValue = (obj as Record<string, unknown>)[key]
+    clone[key] = assertJsonPlain(propValue, `${path}.${key}`, seen)
   }
   seen.delete(obj)
+  return clone
 }
 
 /**
@@ -215,7 +316,8 @@ export function sendDirectedMessage(
     )
   }
 
-  // [CLOSES R2-1, round-2 codex finding] A throwing JSON.stringify replacer
+  // [CLOSES R2-1, round-2 codex finding; STRENGTHENED for the bounded R4
+  // residual, round-3 codex GENUINE HIGH] A throwing JSON.stringify replacer
   // only intercepts values JSON.stringify itself would either throw on
   // (circular refs, BigInt) or silently DROP (nested function/symbol/
   // undefined). It still ACCEPTS plenty of non-plain values that
@@ -224,11 +326,39 @@ export function sendDirectedMessage(
   // object), NaN/Infinity/-Infinity collapse to `null`, and a Date silently
   // TYPE-CHANGES to an ISO string. REQ-014 requires rejecting any
   // "non-plain value" whose JSON round-trip is lossy — not merely the
-  // subset JSON.stringify refuses outright. assertJsonPlain() performs a
-  // strict recursive structural check BEFORE we ever call JSON.stringify,
-  // so by the time we do call it below, losslessness is already guaranteed.
-  assertJsonPlain(args.payload)
+  // subset JSON.stringify refuses outright.
+  //
+  // Layer A (assertJsonPlain — strict recursive structural check): now also
+  // (a) walks Reflect.ownKeys, not Object.keys, so a non-enumerable own
+  // property is inspected rather than silently skipped; (b) rejects a
+  // callable toJSON — own or inherited, enumerable or not — at any node,
+  // since JSON.stringify would substitute its return value for whatever we
+  // validated; (c) rejects an array's own non-index property. It returns a
+  // plain deep-clone built DURING this same walk, each property value read
+  // from the source exactly once.
+  //
+  // Layer B (serialize-then-revalidate, R4 fix): a structural check ALONE
+  // cannot catch a STATEFUL getter/proxy that answers a DIFFERENT value on a
+  // second read than the one Layer A already validated and cloned —
+  // structurally, both reads look identically "plain" in isolation. So,
+  // after Layer A passes, we independently JSON.stringify the ORIGINAL
+  // payload (a second, separate read of every property) and compare it
+  // byte-for-byte against JSON.stringify() of the Layer-A clone. ANY
+  // divergence — a toJSON substitution, a non-enumerable property
+  // JSON.stringify silently omits that our clone included, or a
+  // getter/proxy that answered differently the second time — means the
+  // bytes about to be persisted are NOT provably the JSON of what we just
+  // validated, so we refuse to persist them rather than risk a lossy or
+  // substituted payload reaching the database.
+  const validatedClone = assertJsonPlain(args.payload)
   const payloadStr = JSON.stringify(args.payload) as string
+  const clonedSerialization = JSON.stringify(validatedClone)
+  if (clonedSerialization !== payloadStr) {
+    throw new Error(
+      `sendDirectedMessage: payload's JSON serialization diverges from its validated structure at $ — ` +
+      `a toJSON/getter/proxy likely substituted or returned different content than what was validated; refusing to persist`
+    )
+  }
 
   const row = withMemoryWriteTxn(taskDb.getHandle(), (db) => {
     const seq = nextWriteSeq(db)
