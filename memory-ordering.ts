@@ -12,15 +12,19 @@
 //   - a monotonic, cross-process-unique sequence primitive (nextWriteSeq)
 //     backed by an append-only `write_sequence` table (REQ-009).
 //
-// Concurrency-model note: `db.ts`'s openDb() sets `PRAGMA busy_timeout=5000`
-// on every TaskDB handle. Left alone, that SQLite-internal busy-handler would
-// swallow BEGIN IMMEDIATE contention for up to 5s *before* SQLITE_BUSY is
-// ever surfaced to JS — silently defeating the explicit 50/150/450ms
-// JS-managed backoff this module is specified to implement (REQ-001/ATM-030).
-// We therefore pin busy_timeout=0 on the handle for the duration of the
-// acquisition loop only (restored to its prior value immediately after,
-// success or failure) so OUR retry schedule — not SQLite's internal wait —
-// governs how long a caller blocks under contention.
+// Concurrency-model note (REQ-001b/c): `db.ts`'s openDb() sets
+// `PRAGMA busy_timeout=5000` on every TaskDB handle, and this module SHALL
+// rely on that EXISTING busy_timeout as the FIRST layer of cross-process
+// lock-wait behavior — it never reads, lowers, or restores busy_timeout
+// itself. A single `BEGIN IMMEDIATE` attempt therefore already absorbs up to
+// ~5s of contention via SQLite's own internal busy-handler before ever
+// surfacing SQLITE_BUSY to JS. The ONLY additional retry this module adds is
+// a bounded, JS-managed 50/150/450ms backoff around the lock-ACQUISITION
+// step itself (REQ-001c) — for the rare case where BEGIN IMMEDIATE still
+// throws SQLITE_BUSY/SQLITE_BUSY_SNAPSHOT after that budget expires under
+// SUSTAINED contention. That ladder governs additional acquisition retries
+// only; it is layered on top of — never a substitute for — the handle's own
+// busy_timeout, which applies fresh on every one of those retry attempts too.
 
 import type { Database } from 'bun:sqlite'
 
@@ -64,52 +68,31 @@ export function isWriteTxnActive(db: Database): boolean {
 }
 
 /**
- * Acquire BEGIN IMMEDIATE with a bounded, JS-managed retry/backoff. Bypasses
- * the handle's own PRAGMA busy_timeout for the duration of the attempt loop
- * only (see module-level note above) so the 50/150/450ms schedule — not
- * SQLite's internal busy-handler — governs the wait, then restores whatever
- * busy_timeout was configured before we touched it.
+ * Acquire BEGIN IMMEDIATE with a bounded, JS-managed acquisition retry/backoff
+ * (REQ-001c) layered ON TOP OF the handle's own existing busy_timeout
+ * (REQ-001b) — this function never reads, lowers, or restores busy_timeout;
+ * each BEGIN IMMEDIATE attempt below (including retries) is subject to
+ * whatever busy_timeout is already configured on `db`.
  */
 function acquireWriteLock(db: Database): void {
-  let priorTimeout = 0
-  try {
-    const row = db.prepare('PRAGMA busy_timeout').get() as { timeout: number } | null
-    priorTimeout = row?.timeout ?? 0
-  } catch {
-    // Non-fatal — fall back to restoring 0 if we can't read the prior value.
-  }
-  try {
-    db.prepare('PRAGMA busy_timeout=0').run()
-  } catch {
-    // Non-fatal; proceed with whatever timeout is already configured.
-  }
-
-  try {
-    let attempt = 0
-    for (;;) {
-      try {
-        db.prepare('BEGIN IMMEDIATE').run()
-        return
-      } catch (err) {
-        if (isNestedTxnError(err)) {
-          throw new NestedWriteTxnError()
-        }
-        if (isBusyError(err) && attempt < BUSY_RETRY_DELAYS_MS.length) {
-          Bun.sleepSync(BUSY_RETRY_DELAYS_MS[attempt])
-          attempt++
-          continue
-        }
-        if (isBusyError(err)) {
-          throw new WriteLockTimeoutError()
-        }
-        throw err
-      }
-    }
-  } finally {
+  let attempt = 0
+  for (;;) {
     try {
-      db.prepare(`PRAGMA busy_timeout=${priorTimeout}`).run()
-    } catch {
-      // Non-fatal.
+      db.prepare('BEGIN IMMEDIATE').run()
+      return
+    } catch (err) {
+      if (isNestedTxnError(err)) {
+        throw new NestedWriteTxnError()
+      }
+      if (isBusyError(err) && attempt < BUSY_RETRY_DELAYS_MS.length) {
+        Bun.sleepSync(BUSY_RETRY_DELAYS_MS[attempt])
+        attempt++
+        continue
+      }
+      if (isBusyError(err)) {
+        throw new WriteLockTimeoutError()
+      }
+      throw err
     }
   }
 }

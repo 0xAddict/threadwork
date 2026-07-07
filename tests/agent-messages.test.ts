@@ -162,6 +162,40 @@ describe('ATM-017 — payload JSON validation', () => {
     expect(count).toBe(0)
   })
 
+  // [CLOSES finding H3] JSON.stringify does NOT throw for a nested
+  // function/symbol/undefined object-property value — it silently DROPS the
+  // key, producing a lossy, partial payload that would otherwise persist.
+  // These three assert rejection (no row inserted) for exactly that class of
+  // nested non-serializable value, distinct from the top-level-undefined and
+  // circular-reference cases above (which already throw natively).
+
+  test('a nested function value is rejected and no row is inserted (would otherwise be silently dropped)', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { ok: true, cb: () => 'lost' } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('a nested symbol value is rejected and no row is inserted (would otherwise be silently dropped)', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { ok: true, s: Symbol('x') } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('a nested undefined object-property value is rejected and no row is inserted (would otherwise be silently dropped = partial data)', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { ok: true, u: undefined } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
   test('a plain-object payload succeeds and round-trips through JSON.parse', () => {
     const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { a: 1, b: 'x' } })
     expect(JSON.parse(row.payload)).toEqual({ a: 1, b: 'x' })

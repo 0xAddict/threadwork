@@ -101,7 +101,29 @@ export function sendDirectedMessage(
 
   let payloadStr: string
   try {
-    payloadStr = JSON.stringify(args.payload) as string
+    // [CLOSES finding H3] A plain `JSON.stringify(args.payload)` only catches
+    // thrown failures (circular refs, BigInt) and the TOP-LEVEL undefined
+    // case (handled below). A NESTED function/symbol/undefined object-
+    // property value does not throw — JSON.stringify silently DROPS that
+    // key, producing a lossy, partial payload that would otherwise persist
+    // unnoticed. This throwing replacer is invoked for every nested value
+    // (not just the top-level one), so any such value anywhere in the
+    // payload throws instead of being dropped.
+    payloadStr = JSON.stringify(args.payload, (key, value) => {
+      if (typeof value === 'function' || typeof value === 'symbol') {
+        throw new Error(`sendDirectedMessage: payload contains a non-serializable ${typeof value} value at key "${key}"`)
+      }
+      if (key !== '' && value === undefined) {
+        // Nested `undefined` object-property values are silently DROPPED by
+        // JSON.stringify (not merely coerced), which is exactly the
+        // "partial data persisted" hazard REQ-014 requires closed. `key !==
+        // ''` excludes the TOP-LEVEL call (key `''`), which is already
+        // handled below via the classic "serialized to undefined" check —
+        // this branch is only for values nested inside an object/array.
+        throw new Error(`sendDirectedMessage: payload contains a nested undefined value at key "${key}" (would be silently dropped)`)
+      }
+      return value
+    }) as string
   } catch (err) {
     throw new Error(
       `sendDirectedMessage: payload is not JSON-serializable (${(err as Error)?.message ?? 'unknown error'})`

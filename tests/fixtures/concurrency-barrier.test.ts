@@ -11,11 +11,13 @@
 // (c): source-level regression check — waitForBarrier( must never appear
 // inside a withMemoryWriteTxn( callback body in memory.ts/agent-messages.ts.
 
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { Worker } from 'worker_threads'
 import { readFileSync, unlinkSync } from 'fs'
 import { waitForStartGate, waitForBarrier } from './concurrency-barrier'
+import { TaskDB } from '../../db'
+import { MemoryDB } from '../../memory'
 
 const FIXTURE_PATH = new URL('./concurrency-barrier.ts', import.meta.url).pathname
 
@@ -215,7 +217,44 @@ describe('ATM-033 (c) — source-level regression check', () => {
     return count
   }
 
+  /**
+   * Walk backward from `callIdx` (the index of a call site) to find the
+   * nearest lexically-enclosing `{ ... }` block, and — if that block is
+   * opened by an `if (<condition>)` header — return the trimmed condition
+   * text. Returns null when the nearest enclosing block is NOT an
+   * if-statement (a bare function body, a loop, top-level scope, etc.), or
+   * when no enclosing block exists at all.
+   */
+  function nearestEnclosingIfCondition(source: string, callIdx: number): string | null {
+    let depth = 0
+    for (let i = callIdx - 1; i >= 0; i--) {
+      const ch = source[i]
+      if (ch === '}') {
+        depth++
+      } else if (ch === '{') {
+        if (depth === 0) {
+          const header = source.slice(Math.max(0, i - 200), i)
+          const m = header.match(/if\s*\(([^()]*)\)\s*$/)
+          return m ? m[1].trim() : null
+        }
+        depth--
+      }
+    }
+    return null
+  }
+
   test('waitForBarrier( never appears inside a withMemoryWriteTxn( callback body', () => {
+    // Defense in depth (kept from the original check): a purely TEXTUAL
+    // check that no occurrence of waitForBarrier( sits inside the literal
+    // argument-list region of a withMemoryWriteTxn(...) call expression.
+    // [CLOSES finding H1] This is deliberately NOT the only check below — it
+    // is vacuous against an unguarded waitForBarrier() living in a SEPARATE
+    // function (e.g. a `*Critical` helper invoked from inside
+    // withMemoryWriteTxn's callback, which is exactly how memory.ts's real
+    // ON path is structured), since such a call is textually outside any
+    // withMemoryWriteTxn(...) call expression while still being reachable on
+    // the ON path at runtime. See the two tests below for the checks that
+    // actually close that gap.
     const files = [
       new URL('../../memory.ts', import.meta.url).pathname,
       new URL('../../agent-messages.ts', import.meta.url).pathname,
@@ -230,9 +269,94 @@ describe('ATM-033 (c) — source-level regression check', () => {
       }
     }
 
-    // Stage 1: neither file calls withMemoryWriteTxn OR waitForBarrier yet, so
-    // this passes vacuously. It stays a live regression check once later
-    // stages wire withMemoryWriteTxn() into these files' write paths.
     expect(violations).toBe(0)
   })
+
+  test('[CLOSES finding H1] every waitForBarrier( call in memory.ts is lexically inside an `if (!orderingOn) {` guard block', () => {
+    // Deepened per finding H1: walks backward from EVERY waitForBarrier(
+    // call site (wherever it lexically lives — including inside a separate
+    // `*Critical` helper method called from the withMemoryWriteTxn(...)
+    // callback) to its nearest enclosing `{ ... }` block, and asserts that
+    // block's header is exactly `if (!orderingOn)` — the flag-OFF branch.
+    // Any occurrence NOT so guarded (e.g. unconditional, or guarded by the
+    // wrong condition) fails this check, which the shallower
+    // withMemoryWriteTxn-region check above cannot detect.
+    const file = new URL('../../memory.ts', import.meta.url).pathname
+    const source = readFileSync(file, 'utf8')
+    const callIdxs: number[] = []
+    {
+      let idx = 0
+      const marker = 'waitForBarrier('
+      for (;;) {
+        idx = source.indexOf(marker, idx)
+        if (idx === -1) break
+        callIdxs.push(idx)
+        idx += marker.length
+      }
+    }
+
+    // Sanity: the seam must actually be wired somewhere, or this check would
+    // pass vacuously (zero occurrences = zero violations, proving nothing).
+    expect(callIdxs.length).toBeGreaterThan(0)
+
+    const violations: string[] = []
+    for (const idx of callIdxs) {
+      const condition = nearestEnclosingIfCondition(source, idx)
+      const guarded = condition !== null && condition.replace(/\s+/g, '') === '!orderingOn'
+      if (!guarded) {
+        const lineNo = source.slice(0, idx).split('\n').length
+        violations.push(`memory.ts:${lineNo} enclosing condition=${JSON.stringify(condition)}`)
+      }
+    }
+    expect(violations).toEqual([])
+  })
+
+  test('[CLOSES finding H1] agent-messages.ts contains ZERO waitForBarrier( occurrences (sendDirectedMessage has no unwrapped flag-OFF variant)', () => {
+    const file = new URL('../../agent-messages.ts', import.meta.url).pathname
+    const source = readFileSync(file, 'utf8')
+    expect(countOccurrences(source, 'waitForBarrier(')).toBe(0)
+  })
+})
+
+describe('ATM-033 (c) — RUNTIME PROOF: waitForBarrier is unreachable on the memory_write_ordering_enabled=1 (ON) path', () => {
+  // [CLOSES finding H1] The source-level checks above are a static proxy for
+  // "waitForBarrier can never run on the ON path." This is the real runtime
+  // guarantee: with ordering ON, arm P5_TEST_BARRIER with an expectedCount NO
+  // in-process caller could ever satisfy on its own (no other worker is
+  // inserting 'ready' markers for this barrier name), then call
+  // saveMemory/challengeMemory/supersedeMemory once each. If waitForBarrier()
+  // were reachable from the ON path, each call would block polling toward
+  // concurrency-barrier.ts's own internal 30s deadline — bounding this test's
+  // bun:test timeout well below that turns a latent ON-path barrier leak into
+  // an immediate, loud test failure instead of a 30s hang.
+  let dbPath: string
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    dbPath = tempDbPath('atm033-runtime-proof')
+    taskDb = new TaskDB(dbPath)
+    taskDb.setFeatureFlag('memory_write_ordering_enabled', true)
+  })
+
+  afterEach(() => {
+    delete process.env.P5_TEST_BARRIER
+    delete process.env.P5_BARRIER_COUNT
+    cleanupDbFile(dbPath)
+  })
+
+  test('saveMemory / challengeMemory / supersedeMemory each return promptly with an unsatisfiable barrier armed', () => {
+    process.env.P5_TEST_BARRIER = 'atm033-runtime-proof'
+    process.env.P5_BARRIER_COUNT = '5'
+
+    const mem = new MemoryDB(taskDb)
+
+    const saved = mem.saveMemory({ agent: 'boss', content: 'atm033-runtime-proof save', category: 'fact' })
+    expect(saved).toBeTruthy()
+
+    const challenged = mem.challengeMemory(saved.id, 'atm033 runtime proof')
+    expect(challenged).toBeTruthy()
+
+    const superseded = mem.supersedeMemory(saved.id, 'atm033-runtime-proof superseded content', 'refinement')
+    expect(superseded).toBeTruthy()
+  }, 5_000)
 })

@@ -131,14 +131,50 @@ describe('withMemoryWriteTxn — ATM-030 (BEGIN IMMEDIATE contention, real cross
     cleanupDbFile(dbPath)
   })
 
-  test('(a) TIMEOUT — competing lock held past the retry budget throws WriteLockTimeoutError', async () => {
-    // Nominal retry budget is 50+150+450 = 650ms across 4 total BEGIN IMMEDIATE
-    // attempts, but the acquisition loop is ATTEMPT-count-bounded (exactly 4
-    // tries), not deadline-bounded — so what matters is that the competing lock
-    // outlives all 4 attempts, however long Bun.sleepSync's backoff actually
-    // takes under real (possibly loaded) system scheduling. Hold generously
-    // past the nominal budget so this is robust to sleep-timer jitter.
-    const { worker, locked } = holdCompetingLock(dbPath, 6_000)
+  test('(1) CORRECT-CONTRACT — competing lock held ~900ms under the handle\'s DEFAULT busy_timeout (5000) SUCCEEDS via SQLite\'s own busy-wait, never touching the JS ladder', async () => {
+    // REQ-001(b): withMemoryWriteTxn MUST rely on the handle's EXISTING
+    // busy_timeout (db.ts sets 5000) as the FIRST layer — it must NOT
+    // override/lower it. Do NOT touch busy_timeout here: db.ts's default of
+    // 5000ms must absorb this sub-5s contention entirely on its own.
+    const defaultTimeout = (db.prepare('PRAGMA busy_timeout').get() as { timeout: number }).timeout
+    expect(defaultTimeout).toBe(5000)
+
+    const { worker, locked } = holdCompetingLock(dbPath, 900)
+    await locked
+    try {
+      // The competing lock (900ms) is well within the 5000ms busy_timeout,
+      // so BEGIN IMMEDIATE must simply wait it out and SUCCEED — it must
+      // NOT throw WriteLockTimeoutError. (Against the pre-fix code, which
+      // pins busy_timeout=0 for the acquisition loop and relies solely on
+      // the 50/150/450ms JS ladder — a ~650ms total budget — this 900ms hold
+      // exhausts that budget and wrongly throws.)
+      expect(() => {
+        withMemoryWriteTxn(db, (d) => {
+          d.prepare('INSERT INTO memories (agent, content, category) VALUES (?, ?, ?)').run('boss', 'atm030-correct-contract', 'fact')
+        })
+      }).not.toThrow()
+
+      const row = db.prepare("SELECT * FROM memories WHERE content = 'atm030-correct-contract'").get() as any
+      expect(row).toBeTruthy()
+    } finally {
+      worker.terminate()
+    }
+  }, 10_000)
+
+  test('(2) TIMEOUT (kept fast) — small busy_timeout on THIS handle + a competing lock outliving the total retry budget throws WriteLockTimeoutError', async () => {
+    // Lower ONLY this test's own handle's busy_timeout so the timeout path
+    // stays fast in CI: withMemoryWriteTxn relies on whatever busy_timeout
+    // the handle carries (REQ-001b) — it neither reads nor needs a "prior"
+    // value to restore, it just issues BEGIN IMMEDIATE against the handle
+    // as-is. NOTE: SQLite's default busy-handler backoff schedule can
+    // overshoot the configured busy_timeout considerably on a single attempt
+    // (empirically ~3-4x at small values, e.g. busy_timeout=10 -> ~35ms/
+    // attempt, not 10ms) — measured empirically, the full 4-attempt ladder
+    // (4 attempts + the 50/150/450ms JS backoff between them) exhausts in
+    // ~900-1000ms at busy_timeout=10. Hold the competing lock generously past
+    // that (2000ms) so this is robust to scheduling jitter.
+    taskDb.getHandle().exec('PRAGMA busy_timeout=10')
+    const { worker, locked } = holdCompetingLock(dbPath, 2_000)
     await locked
     try {
       expect(() => {
@@ -149,11 +185,11 @@ describe('withMemoryWriteTxn — ATM-030 (BEGIN IMMEDIATE contention, real cross
     } finally {
       worker.terminate()
     }
-  }, 20_000)
+  }, 10_000)
 
-  test('(b) RECOVERY — competing lock released before budget expiry lets the call eventually commit', async () => {
-    // Release at 300ms: after attempt-2 (t=200) but well before attempt-3 (t=650),
-    // so the final retry finds the lock free and commits with no error.
+  test('(3) RECOVERY — small busy_timeout, competing lock released before budget expiry lets the call eventually commit', async () => {
+    taskDb.getHandle().exec('PRAGMA busy_timeout=10')
+    // Release at 300ms: well before the ~900-1000ms total budget expires.
     const { worker, locked } = holdCompetingLock(dbPath, 300)
     await locked
     try {
@@ -169,6 +205,17 @@ describe('withMemoryWriteTxn — ATM-030 (BEGIN IMMEDIATE contention, real cross
       worker.terminate()
     }
   }, 10_000)
+
+  test('(4) RELIANCE (REQ-001b) — withMemoryWriteTxn does not override/reset the handle\'s busy_timeout', () => {
+    const before = (db.prepare('PRAGMA busy_timeout').get() as { timeout: number }).timeout
+
+    withMemoryWriteTxn(db, (d) => {
+      d.prepare('INSERT INTO memories (agent, content, category) VALUES (?, ?, ?)').run('boss', 'atm030-reliance', 'fact')
+    })
+
+    const after = (db.prepare('PRAGMA busy_timeout').get() as { timeout: number }).timeout
+    expect(after).toBe(before)
+  })
 })
 
 describe('withMemoryWriteTxn — ATM-031 (no replay on mid-transaction fault)', () => {
