@@ -1,7 +1,10 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { MemoryDB } from '../memory'
 import { TaskDB } from '../db'
-import { unlinkSync, readFileSync } from 'fs'
+import { unlinkSync, readFileSync, existsSync } from 'fs'
+// P5 STAGE 8 (ATM-026/REQ-022): direct-call no-op proof for the flag-OFF
+// barrier seam (see the final describe block in this file).
+import { waitForBarrier } from './fixtures/concurrency-barrier'
 
 const TEST_DB = '/tmp/memory-test.db'
 
@@ -1343,5 +1346,329 @@ describe('P5 STAGE 5 — EPIC-05 write-sequence verification (ATM-013)', () => {
         try { unlinkSync(dbPathOff + suffix) } catch {}
       }
     }
+  })
+})
+
+// --- P5 STAGE 8 (EPIC-08 / REQ-022 / ATM-026): flag-OFF additive-schema -----
+// parity + traceability. Every temp DB below is fresh (`TaskDB.migrate()`
+// defaults) and NEVER has `memory_write_ordering_enabled` flipped on; per the
+// stage brief we also leave `memory_sanitization_enabled` at its pristine
+// fresh-migrate default (0) so this suite isolates the ORDERING flag being
+// OFF, not P4's sanitizer. Values below were derived by executing the exact
+// same call sequence against BOTH this worktree (flag OFF) and the pristine
+// pre-P5 baseline clone (HEAD 85a11c5, the merge commit immediately
+// preceding P5 Stage 0) and confirming byte-identical results on every
+// pre-existing column.
+describe('P5 EPIC-08 — ATM-026 flag-OFF additive-schema parity (REQ-022)', () => {
+  let dbPath: string
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    dbPath = tempP5DbPath('atm026-off')
+    taskDb = new TaskDB(dbPath)
+    mem = new MemoryDB(taskDb)
+  })
+
+  afterEach(() => {
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(dbPath + suffix) } catch {}
+    }
+  })
+
+  test('fresh-migrate defaults: memory_write_ordering_enabled and memory_sanitization_enabled are both 0 (pristine)', () => {
+    expect(taskDb.isFeatureEnabled('memory_write_ordering_enabled')).toBe(false)
+    expect(taskDb.isFeatureEnabled('memory_sanitization_enabled')).toBe(false)
+  })
+
+  test('(1) pre-existing column value parity across saveMemory -> challengeMemory -> supersedeMemory, exact expected pre-P5 values', () => {
+    const saved = mem.saveMemory({
+      agent: 'boss',
+      content: 'atm026 parity content',
+      category: 'fact',
+      importance: 4,
+      pinned: true,
+      evidence: 'atm026 evidence',
+    })
+
+    // Fresh saveMemory: exact expected values for every pre-existing column.
+    expect(saved.id).toBeGreaterThan(0)
+    expect(saved.agent).toBe('boss')
+    expect(saved.content).toBe('atm026 parity content')
+    expect(saved.category).toBe('fact')
+    expect(saved.importance).toBe(4)
+    expect(saved.pinned).toBe(1)
+    expect(saved.source_task_id).toBeNull()
+    expect(typeof saved.created_at).toBe('string')
+    expect(typeof saved.last_accessed).toBe('string')
+    expect(saved.access_count).toBe(0)
+    expect(saved.classification).toBe('operational')
+    expect(saved.quality).toBe(0.5)
+    expect(saved.state).toBe('active')
+    expect(saved.source_type).toBe('agent')
+    expect(saved.evidence).toBe('atm026 evidence')
+    expect(saved.support_count).toBe(0)
+    expect(saved.challenge_count).toBe(0)
+    expect(saved.supersedes_memory_id).toBeNull()
+    expect(typeof saved.last_validated).toBe('string')
+    // The one permitted schema delta (REQ-022): NULL while the flag is OFF.
+    expect(saved.write_seq).toBeNull()
+
+    const challenged = mem.challengeMemory(saved.id, 'atm026 challenge reason')
+    expect(challenged).not.toBeNull()
+    // challengeMemory: newChallengeCount(1) > support_count(0) -> disputed,
+    // quality clamped down by 0.2 (pre-P5 formula, unchanged).
+    expect(challenged!.id).toBe(saved.id)
+    expect(challenged!.agent).toBe('boss')
+    expect(challenged!.content).toBe('atm026 parity content')
+    expect(challenged!.category).toBe('fact')
+    expect(challenged!.importance).toBe(4)
+    expect(challenged!.pinned).toBe(1)
+    expect(challenged!.source_task_id).toBeNull()
+    expect(challenged!.access_count).toBe(0)
+    expect(challenged!.classification).toBe('operational')
+    expect(challenged!.quality).toBeCloseTo(0.3, 5)
+    expect(challenged!.state).toBe('disputed')
+    expect(challenged!.source_type).toBe('agent')
+    expect(challenged!.evidence).toBe('atm026 evidence')
+    expect(challenged!.support_count).toBe(0)
+    expect(challenged!.challenge_count).toBe(1)
+    expect(challenged!.supersedes_memory_id).toBeNull()
+    expect(typeof challenged!.last_validated).toBe('string')
+    expect(challenged!.write_seq).toBeNull()
+
+    const superseded = mem.supersedeMemory(saved.id, 'atm026 replacement content', 'atm026 supersede reason')
+    expect(superseded).not.toBeNull()
+
+    // Old row: unconditional UPDATE (no state guard when OFF) only touches
+    // state + last_validated — every other pre-existing column (including
+    // the challenge_count/quality/state set by the PRIOR challengeMemory
+    // call) is carried through unchanged.
+    const old = superseded!.old
+    expect(old.id).toBe(saved.id)
+    expect(old.agent).toBe('boss')
+    expect(old.content).toBe('atm026 parity content')
+    expect(old.category).toBe('fact')
+    expect(old.importance).toBe(4)
+    expect(old.pinned).toBe(1)
+    expect(old.source_task_id).toBeNull()
+    expect(old.access_count).toBe(0)
+    expect(old.classification).toBe('operational')
+    expect(old.quality).toBeCloseTo(0.3, 5)
+    expect(old.state).toBe('superseded')
+    expect(old.source_type).toBe('agent')
+    expect(old.evidence).toBe('atm026 evidence')
+    expect(old.support_count).toBe(0)
+    expect(old.challenge_count).toBe(1)
+    expect(old.supersedes_memory_id).toBeNull()
+    expect(old.write_seq).toBeNull()
+
+    // New (replacement) row: pre-P5 supersede INSERT column list is a NARROW
+    // subset (agent, content, category, classification, quality, state,
+    // source_type, support_count, supersedes_memory_id) — importance/pinned/
+    // evidence/challenge_count are NOT inherited from the old row, they take
+    // the `memories` table's own column defaults.
+    const replacement = superseded!.new
+    expect(replacement.id).toBeGreaterThan(old.id)
+    expect(replacement.agent).toBe('boss')
+    expect(replacement.content).toBe('atm026 replacement content')
+    expect(replacement.category).toBe('fact')
+    expect(replacement.importance).toBe(3)
+    expect(replacement.pinned).toBe(0)
+    expect(replacement.source_task_id).toBeNull()
+    expect(replacement.access_count).toBe(0)
+    expect(replacement.classification).toBe('operational')
+    expect(replacement.quality).toBe(0.5)
+    expect(replacement.state).toBe('active')
+    expect(replacement.source_type).toBe('agent')
+    expect(replacement.evidence).toBeNull()
+    expect(replacement.support_count).toBe(0)
+    expect(replacement.challenge_count).toBe(0)
+    expect(replacement.supersedes_memory_id).toBe(old.id)
+    expect(typeof replacement.last_validated).toBe('string')
+    expect(replacement.write_seq).toBeNull()
+  })
+
+  test('(2) write_seq stays NULL on the affected row after each of the three ops, and write_sequence never grows (nextWriteSeq never called OFF)', () => {
+    const saved = mem.saveMemory({ agent: 'boss', content: 'atm026 write_seq null content', category: 'fact' })
+    expect(saved.write_seq).toBeNull()
+
+    const dup = mem.saveMemory({ agent: 'boss', content: 'ATM026   Write_seq   Null   Content', category: 'fact' })
+    expect(dup.id).toBe(saved.id)
+    expect(dup.write_seq).toBeNull()
+
+    const challenged = mem.challengeMemory(saved.id, 'atm026 write_seq null reason')
+    expect(challenged!.write_seq).toBeNull()
+
+    const seed = mem.saveMemory({ agent: 'boss', content: 'atm026 write_seq null supersede seed', category: 'fact' })
+    const superseded = mem.supersedeMemory(seed.id, 'atm026 write_seq null replacement', 'atm026 write_seq null reason')
+    expect(superseded!.old.write_seq).toBeNull()
+    expect(superseded!.new.write_seq).toBeNull()
+
+    // nextWriteSeq() is never invoked anywhere on the flag-OFF path — the
+    // append-only log itself never grows past zero rows.
+    const wsCount = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM write_sequence').get() as { c: number }).c
+    expect(wsCount).toBe(0)
+  })
+
+  test('(3) supersede unguarded when OFF: two sequential supersedeMemory calls on the SAME id BOTH succeed, producing TWO rows with supersedes_memory_id = id', () => {
+    const old = mem.saveMemory({ agent: 'boss', content: 'atm026 double-supersede seed', category: 'fact' })
+
+    const first = mem.supersedeMemory(old.id, 'A', 'r1')
+    expect(first).not.toBeNull()
+    expect(first!.old.state).toBe('superseded')
+
+    // Pre-P5 unguarded behavior preserved when OFF: the old-row UPDATE has no
+    // `AND state != 'superseded'` guard, so a SECOND supersede of the
+    // already-superseded id still succeeds (unlike the flag-ON guarded path,
+    // which returns null on the second call — see EPIC-04's ATM-009 test).
+    const second = mem.supersedeMemory(old.id, 'B', 'r2')
+    expect(second).not.toBeNull()
+    expect(second!.old.state).toBe('superseded')
+
+    const row = taskDb.getHandle().prepare(
+      'SELECT COUNT(*) as c FROM memories WHERE supersedes_memory_id = ?'
+    ).get(old.id) as { c: number }
+    expect(row.c).toBe(2)
+
+    // Confirms the guard is STRICTLY an ON-path behavior: no
+    // memory_supersede_blocked_duplicate audit row is ever written when OFF
+    // (that audit action, REQ-024/ATM-027, only fires from the ON-path
+    // zero-rows-affected branch, which this flag-OFF path never reaches).
+    const blockedAudit = taskDb.getHandle().prepare(
+      "SELECT COUNT(*) as c FROM audit_log WHERE action = 'memory_supersede_blocked_duplicate'"
+    ).get() as { c: number }
+    expect(blockedAudit.c).toBe(0)
+  })
+
+  test('(4) no barrier latency when env unset: waitForBarrier() is a complete no-op and flag-OFF saveMemory behaves identically with/without the seam wired in', () => {
+    expect(process.env.P5_TEST_BARRIER).toBeUndefined()
+    expect(process.env.P5_TEST_START_GATE).toBeUndefined()
+
+    // Direct-call proof: absent P5_TEST_BARRIER, waitForBarrier() returns via
+    // its guard clause before touching the DB at all — no test_barrier table
+    // is ever created.
+    const db = taskDb.getHandle()
+    waitForBarrier(db, 'atm026-direct-noop', 5)
+    const tableExists = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='test_barrier'"
+    ).get()
+    expect(tableExists).toBeNull()
+
+    // End-to-end proof: a flag-OFF saveMemory (which wires waitForBarrier()
+    // into its own read->write boundary) still completes promptly and with
+    // the exact same result shape as every other OFF-path test above — the
+    // seam adds zero behavior when unset.
+    const before = Date.now()
+    const m = mem.saveMemory({ agent: 'boss', content: 'atm026 barrier noop content', category: 'fact' })
+    const elapsedMs = Date.now() - before
+    expect(m.id).toBeGreaterThan(0)
+    expect(m.state).toBe('active')
+    expect(m.write_seq).toBeNull()
+    // Generous bound: the rendezvous poll loop sleeps in 2ms increments and
+    // only engages at all once P5_TEST_BARRIER is set, so an unset run must
+    // stay far below even a single poll interval's worth of overhead.
+    expect(elapsedMs).toBeLessThan(1000)
+  })
+})
+
+// --- P5 STAGE 8 (ATM-026, part B): OPTIONAL cross-baseline parity ----------
+//
+// Per the stage brief, IF a pristine pre-P5 clone exists at
+// scratchpad/tb-baseline AND its HEAD is the expected 85a11c5 (the P4 merge
+// commit immediately preceding P5 Stage 0), run the SAME operation sequence
+// against BOTH that baseline's TaskDB/MemoryDB (imported by absolute path —
+// never copied into this repo) and this worktree's TaskDB/MemoryDB (flag
+// OFF), and assert every pre-existing column is identical. If the clone is
+// absent or not at the expected commit, this whole block is skipped — the
+// in-suite assertions above are the required (non-optional) coverage.
+const BASELINE_DIR = '/private/tmp/claude-501/-/bc99d08c-711b-4a73-80a0-3d124080ede4/scratchpad/tb-baseline'
+const BASELINE_EXPECTED_HEAD = '85a11c5'
+
+function resolveBaselineHead(): string | null {
+  if (!existsSync(BASELINE_DIR) || !existsSync(`${BASELINE_DIR}/.git`)) return null
+  try {
+    const proc = Bun.spawnSync(['git', 'rev-parse', '--short', 'HEAD'], { cwd: BASELINE_DIR })
+    if (proc.exitCode !== 0) return null
+    return proc.stdout.toString().trim()
+  } catch {
+    return null
+  }
+}
+
+const baselineHead = resolveBaselineHead()
+const baselineAvailable = baselineHead !== null && baselineHead.startsWith(BASELINE_EXPECTED_HEAD.slice(0, baselineHead.length))
+
+describe('P5 EPIC-08 — ATM-026 cross-baseline parity (optional, gated on tb-baseline @ 85a11c5)', () => {
+  test.skipIf(!baselineAvailable)('same op sequence against baseline (85a11c5) TaskDB/MemoryDB and this worktree (flag OFF) TaskDB/MemoryDB yields identical pre-existing columns', async () => {
+    const { TaskDB: BaselineTaskDB } = await import(`${BASELINE_DIR}/db.ts`)
+    const { MemoryDB: BaselineMemoryDB } = await import(`${BASELINE_DIR}/memory.ts`)
+
+    const baselineDbPath = tempP5DbPath('atm026-baseline')
+    const worktreeDbPath = tempP5DbPath('atm026-worktree')
+
+    const baselineTaskDb = new BaselineTaskDB(baselineDbPath)
+    const baselineMem = new BaselineMemoryDB(baselineTaskDb)
+    const worktreeTaskDb = new TaskDB(worktreeDbPath)
+    const worktreeMem = new MemoryDB(worktreeTaskDb)
+
+    // Pre-existing columns only — write_seq does not exist in the baseline
+    // schema at all, so it is excluded from the comparison by construction
+    // (this list is exactly REQ-022's enumerated pre-existing column set).
+    const PRE_EXISTING_COLUMNS = [
+      'id', 'agent', 'content', 'category', 'importance', 'pinned',
+      'source_task_id', 'created_at', 'last_accessed', 'access_count',
+      'classification', 'quality', 'state', 'source_type', 'evidence',
+      'support_count', 'challenge_count', 'supersedes_memory_id', 'last_validated',
+    ] as const
+
+    function assertParity(worktreeRow: any, baselineRow: any, label: string) {
+      for (const col of PRE_EXISTING_COLUMNS) {
+        expect(worktreeRow[col], `${label}.${col}`).toEqual(baselineRow[col])
+      }
+    }
+
+    try {
+      const bSaved = baselineMem.saveMemory({
+        agent: 'boss', content: 'atm026 cross-baseline content', category: 'fact',
+        importance: 4, pinned: true, evidence: 'atm026 cross-baseline evidence',
+      })
+      const wSaved = worktreeMem.saveMemory({
+        agent: 'boss', content: 'atm026 cross-baseline content', category: 'fact',
+        importance: 4, pinned: true, evidence: 'atm026 cross-baseline evidence',
+      })
+      assertParity(wSaved, bSaved, 'saveMemory')
+      expect(wSaved.write_seq).toBeNull()
+
+      const bChallenged = baselineMem.challengeMemory(bSaved.id, 'atm026 cross-baseline reason')
+      const wChallenged = worktreeMem.challengeMemory(wSaved.id, 'atm026 cross-baseline reason')
+      assertParity(wChallenged, bChallenged, 'challengeMemory')
+      expect(wChallenged.write_seq).toBeNull()
+
+      const bSuperseded = baselineMem.supersedeMemory(bSaved.id, 'atm026 cross-baseline replacement', 'atm026 cross-baseline supersede reason')
+      const wSuperseded = worktreeMem.supersedeMemory(wSaved.id, 'atm026 cross-baseline replacement', 'atm026 cross-baseline supersede reason')
+      assertParity(wSuperseded.old, bSuperseded.old, 'supersedeMemory.old')
+      assertParity(wSuperseded.new, bSuperseded.new, 'supersedeMemory.new')
+      expect(wSuperseded.old.write_seq).toBeNull()
+      expect(wSuperseded.new.write_seq).toBeNull()
+
+      // Double-supersede parity: both baselines are unguarded when the P5
+      // flag doesn't exist (baseline) / is OFF (worktree) — both succeed.
+      const bSecond = baselineMem.supersedeMemory(bSaved.id, 'C', 'r2')
+      const wSecond = worktreeMem.supersedeMemory(wSaved.id, 'C', 'r2')
+      expect(bSecond).not.toBeNull()
+      expect(wSecond).not.toBeNull()
+      assertParity(wSecond.new, bSecond.new, 'supersedeMemory(second).new')
+    } finally {
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { unlinkSync(baselineDbPath + suffix) } catch {}
+        try { unlinkSync(worktreeDbPath + suffix) } catch {}
+      }
+    }
+  })
+
+  test('baseline availability is reported (informational — never fails the suite)', () => {
+    // Documents whether part B ran or was skipped, without gating the gate.
+    expect(typeof baselineAvailable).toBe('boolean')
   })
 })
