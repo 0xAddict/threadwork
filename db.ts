@@ -259,6 +259,26 @@ export class TaskDB {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+
+      -- P5 (REQ-012 / ATM-015): durable, typed directed agent->agent message
+      -- store. Written through the SAME withMemoryWriteTxn() envelope as
+      -- memories (agent-messages.ts), stamped with a nextWriteSeq() value in
+      -- the seq column (distinct from write_sequence's own append-only ids
+      -- referenced by memories.write_seq). Rows are never deleted; poll
+      -- transitions pending -> delivered, ack transitions -> acked (Stage 7).
+      CREATE TABLE IF NOT EXISTS agent_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        msg_type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','delivered','acked')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        delivered_at TEXT,
+        acked_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_messages_recipient_status ON agent_messages(recipient, status, seq);
     `)
 
     // Add nudge_count column if missing (safe migration for existing DBs)

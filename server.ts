@@ -38,6 +38,8 @@ import {
 } from './delegation-brief'
 import { AuditLog } from './audit'
 import { MemoryConsolidator } from './consolidator'
+import { sendDirectedMessage } from './agent-messages'
+import { MSG_TYPES } from './agent-message-types'
 
 const db = new TaskDB(DB_PATH)
 const mem = new MemoryDB(db)
@@ -204,6 +206,26 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           message: { type: 'string', description: 'The message to send' },
         },
         required: ['agent', 'message'],
+      },
+    },
+    {
+      // P5 (REQ-012/013/014/015, ATM-015/016/017/018): durable, typed,
+      // directed agent->agent message store. Additive/complementary to
+      // nudge_agent (EPIC-07/REQ-019-020) — that tool stays untouched. Unlike
+      // nudge_agent (ephemeral tmux wake, no ack, untyped string), this
+      // persists a typed row for later poll/ack retrieval (poll/ack tools
+      // land in Stage 7). Sender is ALWAYS the caller's own SELF_LABEL —
+      // there is deliberately NO `sender` property in this inputSchema.
+      name: 'send_directed_message',
+      description: 'Send a durable, typed directed message to another agent (persisted for poll/ack, unlike the ephemeral nudge_agent wake signal). Sender is always your own identity — never caller-suppliable.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          recipient: { type: 'string', description: 'Target agent: boss, steve, sadie, kiera, or snoopy.' },
+          msg_type: { type: 'string', enum: [...MSG_TYPES], description: 'Message kind.' },
+          payload: { type: 'object', description: 'Structured JSON payload.' },
+        },
+        required: ['recipient', 'msg_type', 'payload'],
       },
     },
     {
@@ -1036,6 +1058,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // successful sendTmux path only — this is the single canonical write site
         // (sprint #256 gate 3). Do NOT re-add a direct write here.
         return { content: [{ type: 'text', text: `Nudged ${agent}: ${message}` }] }
+      }
+
+      case 'send_directed_message': {
+        // ATM-029 (Stage 7) gates this same flag for poll/ack too; Stage 6
+        // wires the flag-gate for send only. Mirrors the existing tool-error
+        // shape used elsewhere in server.ts (e.g. nudge_agent's failure
+        // branch above) rather than throwing or silently no-opping.
+        if (!db.isFeatureEnabled('directed_messaging_enabled')) {
+          return { content: [{ type: 'text', text: 'directed messaging is disabled', isError: true }] }
+        }
+
+        const row = sendDirectedMessage(db, SELF_LABEL, {
+          recipient: args.recipient as string,
+          msg_type: args.msg_type as string,
+          payload: args.payload,
+        })
+
+        return { content: [{ type: 'text', text: `Message #${row.id} sent to ${row.recipient} (type: ${row.msg_type}, seq: ${row.seq}).` }] }
       }
 
       case 'save_memory': {
