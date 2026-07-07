@@ -618,3 +618,181 @@ export function getFailureClassifications(
     }
   })
 }
+
+// ---------------------------------------------------------------------------
+// ATM-010/013/016/018 / REQ-005/006/007/008 [P1] — Stage 5, EPIC-03: pure
+// signal adapters
+// ---------------------------------------------------------------------------
+//
+// Pure, I/O-free functions that translate raw signals observed by verify.ts
+// (CheckResult / Summary), watchdog.ts (fault / blocked / dead-session
+// events), and the escalation bridge (all-paths-failed) into a
+// RawFailureSignal ready for classifyFailure(). fromAdversarialFinding is
+// standalone — no production call site is wired in this stage. None of these
+// adapters touch the database or do any I/O; persistence + the actual
+// call-site wiring live in the additive, flag-gated, try/catch-swallowed
+// call sites added to verify.ts / watchdog.ts / src/escalation-bridge/
+// index.ts (see those files for the wiring).
+
+/** Minimal duck-typed shape of verify.ts's (unexported) CheckResult. */
+interface _VerifyCheckLike {
+  id: string
+  verified: boolean
+  description?: string
+  evidence?: string
+  task_id?: number
+  agent?: string
+  summary?: string
+}
+
+/** Minimal duck-typed shape of verify.ts's (unexported) Summary — test-run slice. */
+interface _TestRunLike {
+  tests_pass: boolean
+  test_output?: string
+  task_id?: number
+  agent?: string
+  summary?: string
+}
+
+/** Minimal duck-typed shape of verify.ts's (unexported) Summary — idle-count slice. */
+interface _IdleCountLike {
+  idle_count: number
+  task_id?: number
+  agent?: string
+  summary?: string
+}
+
+/**
+ * Shared optional context for the watchdog-sourced adapters below.
+ * `agent` is `string | null` (not just `string | undefined`) because every
+ * watchdog.ts call site passes a `task.to_agent`/`session.agent` value that
+ * is itself typed `string | null` — see db.ts's `Task.to_agent`.
+ */
+interface _WatchdogCtx {
+  task_id?: number
+  agent?: string | null
+  summary?: string
+}
+
+/** Resolves the signal's agent field from ctx.agent, falling back to a positional agent arg; null/undefined collapse to undefined (never persisted as the literal string "null"). */
+function _resolveAgent(ctx: _WatchdogCtx | undefined, fallback?: string | null): string | undefined {
+  if (typeof ctx?.agent === 'string') return ctx.agent
+  if (typeof fallback === 'string') return fallback
+  return undefined
+}
+
+/**
+ * ATM-010 — maps a failing, non-SG-13 verify.ts CheckResult to a verify_check
+ * signal. Returns null for SG-13 (its failure is captured separately via
+ * fromTestRun — Codex #5 dedup: SG-13 must never be double-classified) and
+ * for any check that isn't failing (`verified !== false`).
+ */
+export function fromVerifyCheckResult(check: _VerifyCheckLike): RawFailureSignal | null {
+  if (check.id === 'SG-13') return null
+  if (check.verified !== false) return null
+  const summary = check.summary ?? check.evidence ?? check.description
+  return {
+    source: 'verify_check',
+    checkResultId: check.id,
+    ...(check.task_id !== undefined ? { task_id: check.task_id } : {}),
+    ...(check.agent !== undefined ? { agent: check.agent } : {}),
+    ...(summary !== undefined ? { summary } : {}),
+  }
+}
+
+/** ATM-010 — maps a failing verify.ts test run (tests_pass === false) to a test_run signal; null otherwise. */
+export function fromTestRun(summary: _TestRunLike): RawFailureSignal | null {
+  if (summary.tests_pass !== false) return null
+  const text = summary.summary ?? summary.test_output
+  return {
+    source: 'test_run',
+    ...(summary.task_id !== undefined ? { task_id: summary.task_id } : {}),
+    ...(summary.agent !== undefined ? { agent: summary.agent } : {}),
+    ...(text !== undefined ? { summary: text } : {}),
+  }
+}
+
+/** ATM-010 — maps a stagnant verify.ts idle_count (>= IDLE_COUNT_STAGNATION_THRESHOLD) to a verify_idle_count signal; null otherwise. */
+export function fromIdleCount(summary: _IdleCountLike): RawFailureSignal | null {
+  if (typeof summary.idle_count !== 'number' || !Number.isFinite(summary.idle_count)) return null
+  if (summary.idle_count < IDLE_COUNT_STAGNATION_THRESHOLD) return null
+  return {
+    source: 'verify_idle_count',
+    idle_count: summary.idle_count,
+    ...(summary.task_id !== undefined ? { task_id: summary.task_id } : {}),
+    ...(summary.agent !== undefined ? { agent: summary.agent } : {}),
+    ...(summary.summary !== undefined ? { summary: summary.summary } : {}),
+  }
+}
+
+/** ATM-013 — maps a watchdog.ts recordFault() event (crash/timeout/other) to a watchdog_fault signal. */
+export function fromWatchdogFault(
+  agent: string | null,
+  faultType: string,
+  ctx?: _WatchdogCtx,
+): RawFailureSignal {
+  const resolvedAgent = _resolveAgent(ctx, agent)
+  return {
+    source: 'watchdog_fault',
+    faultType,
+    ...(resolvedAgent !== undefined ? { agent: resolvedAgent } : {}),
+    ...(ctx?.task_id !== undefined ? { task_id: ctx.task_id } : {}),
+    ...(ctx?.summary !== undefined ? { summary: ctx.summary } : {}),
+  }
+}
+
+/** ATM-013 — maps a watchdog.ts blocked-task observation (any of the 5 blocked_on cases, incl. 'agent' and null/legacy) to a watchdog_blocked signal. */
+export function fromWatchdogBlocked(
+  blockedOn: BlockedOn | null,
+  ctx?: _WatchdogCtx,
+): RawFailureSignal {
+  const resolvedAgent = _resolveAgent(ctx)
+  return {
+    source: 'watchdog_blocked',
+    blocked_on: blockedOn,
+    ...(ctx?.task_id !== undefined ? { task_id: ctx.task_id } : {}),
+    ...(resolvedAgent !== undefined ? { agent: resolvedAgent } : {}),
+    ...(ctx?.summary !== undefined ? { summary: ctx.summary } : {}),
+  }
+}
+
+/** ATM-013 — maps a watchdog.ts dead-session escalation to a watchdog_dead_session signal. */
+export function fromWatchdogDeadSession(ctx?: _WatchdogCtx): RawFailureSignal {
+  const resolvedAgent = _resolveAgent(ctx)
+  return {
+    source: 'watchdog_dead_session',
+    ...(ctx?.task_id !== undefined ? { task_id: ctx.task_id } : {}),
+    ...(resolvedAgent !== undefined ? { agent: resolvedAgent } : {}),
+    ...(ctx?.summary !== undefined ? { summary: ctx.summary } : {}),
+  }
+}
+
+/** ATM-016 — maps the escalation bridge's all-paths-failed branch (MCP + SQLite both failed) to an escalation_bridge_all_paths_failed signal. */
+export function fromEscalationBridgeAllPathsFailed(agent: string, step: number, err: string): RawFailureSignal {
+  return {
+    source: 'escalation_bridge_all_paths_failed',
+    agent,
+    summary: `escalation bridge failed: agent=${agent} step=${step} err=${err}`,
+    source_ref: `step-${step}`,
+  }
+}
+
+/**
+ * ATM-018 — maps an adversarial-verifier finding to an adversarial_finding
+ * signal. STANDALONE: no production call site is wired to this adapter in
+ * this stage.
+ */
+export function fromAdversarialFinding(
+  verifierName: string,
+  category: string,
+  severityHint: string,
+  summary: string,
+): RawFailureSignal {
+  return {
+    source: 'adversarial_finding',
+    category,
+    severityHint,
+    verifierName,
+    summary,
+  }
+}

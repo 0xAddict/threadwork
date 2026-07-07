@@ -26,6 +26,12 @@ import {
 } from 'fs'
 import { join, dirname } from 'path'
 import { homedir } from 'os'
+// P6 Stage 5 / EPIC-03 — additive DI seam. Pure functions only (no db.ts /
+// persistFailureClassification import here — persistence is the CALLER's
+// responsibility via the onFailureClassified callback, exactly like the
+// existing onCriticalTelegram seam).
+import { fromEscalationBridgeAllPathsFailed, classifyFailure } from '../../verification/failure-classification'
+import type { FailureClassification } from '../../verification/failure-classification'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -72,6 +78,12 @@ export interface EscalationBridgeOptions {
   onCriticalTelegram?: (message: string) => Promise<void>
   onSqliteFallback?: (agent: string, step: number, context: Record<string, unknown>) => Promise<void>
   retryBackoffMs?: number   // default 5000ms; override for tests
+  // P6 Stage 5 / EPIC-03 — additive DI seam, mirroring onCriticalTelegram.
+  // Invoked (best-effort) after the all-paths-failed critical-Telegram
+  // emission with a FailureClassification for this failure. Undefined =>
+  // complete no-op inside the bridge (default; no runtime-guard warning yet
+  // — that lands in Stage 7).
+  onFailureClassified?: (classification: FailureClassification) => Promise<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +127,8 @@ export class EscalationBridge {
   private onCriticalTelegram: (message: string) => Promise<void>
   private onSqliteFallbackOverride?: (agent: string, step: number, context: Record<string, unknown>) => Promise<void>
   private retryBackoffMs: number
+  // P6 Stage 5 / EPIC-03 — additive DI seam field, mirroring the other callbacks.
+  private onFailureClassified?: (classification: FailureClassification) => Promise<void>
 
   // Track lock across ticks for multi-instance guard
   private _lockFd: number | null = null
@@ -147,6 +161,8 @@ export class EscalationBridge {
     this.onCriticalTelegram = opts.onCriticalTelegram ?? (async () => {})
     this.onSqliteFallbackOverride = opts.onSqliteFallback
     this.retryBackoffMs = opts.retryBackoffMs ?? 5000
+    // P6 Stage 5 / EPIC-03 — additive DI seam. undefined => no-op (default).
+    this.onFailureClassified = opts.onFailureClassified
 
     // Ensure dirs exist
     for (const p of [this.statePath, this.auditLogPath, this.enabledPath]) {
@@ -241,6 +257,15 @@ export class EscalationBridge {
     try {
       await this.onCriticalTelegram(errMsg)
     } catch { /* ignore */ }
+    // P6 Stage 5 / EPIC-03 — additive, best-effort failure classification.
+    // Placed LAST so it can never affect the Telegram emission or this
+    // method's return value.
+    if (this.onFailureClassified) {
+      try {
+        const c = classifyFailure(fromEscalationBridgeAllPathsFailed(agent, step, String(lastErr)))
+        await this.onFailureClassified(c)
+      } catch { /* best-effort */ }
+    }
   }
 
   // ── SQLite fallback ───────────────────────────────────────────────────────

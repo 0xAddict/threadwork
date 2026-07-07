@@ -36,6 +36,14 @@ import {
   persistFailureClassification,
   type PersistedFailureClassification,
   getFailureClassifications,
+  fromVerifyCheckResult,
+  fromTestRun,
+  fromIdleCount,
+  fromWatchdogFault,
+  fromWatchdogBlocked,
+  fromWatchdogDeadSession,
+  fromEscalationBridgeAllPathsFailed,
+  fromAdversarialFinding,
 } from '../verification/failure-classification'
 
 // ---------------------------------------------------------------------------
@@ -1247,5 +1255,153 @@ describe('ATM-026: forward-compat read pass-through — unknown failure_class + 
     expect(row.id).toBe(id)
     expect(row.failure_class).toBe('future_class_v2')
     expect(row.taxonomy_version).toBe(999)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// EPIC-03 (Stage 5): pure signal adapters (ATM-010/013/018)
+// ---------------------------------------------------------------------------
+// Covers ATM-010 (verify.ts adapters: fromVerifyCheckResult / fromTestRun /
+// fromIdleCount, incl. the SG-13 dedup exclusion — Codex #5), ATM-013
+// (watchdog.ts adapters: fromWatchdogFault / fromWatchdogBlocked /
+// fromWatchdogDeadSession, all 5 blocked_on cases), and ATM-018
+// (fromAdversarialFinding — standalone, no production call site wired in
+// this stage). Live-file wiring + integration coverage for these adapters
+// lives in the sibling *-verify-integration.test.ts,
+// *-watchdog-integration.test.ts, and *-escalation-integration.test.ts files.
+
+describe('ATM-010: verify.ts adapters — fromVerifyCheckResult / fromTestRun / fromIdleCount', () => {
+  test('ATM-010: a failing non-SG-13 CheckResult maps to a verify_check signal -> classifyFailure -> verification_failure', () => {
+    const check = { id: 'SG-1', description: 'x', verified: false, evidence: 'missing', checked_at: 'now' }
+    const sig = fromVerifyCheckResult(check)
+    expect(sig).not.toBeNull()
+    expect(sig!.source).toBe('verify_check')
+    expect((sig as any).checkResultId).toBe('SG-1')
+    const result = classifyFailure(sig!)
+    expect(result.failure_class).toBe('verification_failure')
+  })
+
+  test('ATM-010: a tests_pass:false Summary maps to a test_run signal -> classifyFailure -> test_failure', () => {
+    const summary = { tests_pass: false, test_output: 'boom', idle_count: 0 }
+    const sig = fromTestRun(summary)
+    expect(sig).not.toBeNull()
+    expect(sig!.source).toBe('test_run')
+    const result = classifyFailure(sig!)
+    expect(result.failure_class).toBe('test_failure')
+  })
+
+  test('ATM-010: an idle_count:5 Summary maps to a verify_idle_count signal -> classifyFailure -> resource_budget_exhaustion', () => {
+    const summary = { idle_count: 5 }
+    const sig = fromIdleCount(summary)
+    expect(sig).not.toBeNull()
+    expect(sig!.source).toBe('verify_idle_count')
+    const result = classifyFailure(sig!)
+    expect(result.failure_class).toBe('resource_budget_exhaustion')
+  })
+
+  test('ATM-010: a FAILING SG-13 CheckResult -> fromVerifyCheckResult returns null (never double-classified)', () => {
+    const check = { id: 'SG-13', description: 'All tests pass', verified: false, evidence: 'Tests failing', checked_at: 'now' }
+    expect(fromVerifyCheckResult(check)).toBeNull()
+  })
+
+  test('ATM-010: a PASSING check (verified: true) -> fromVerifyCheckResult returns null', () => {
+    const check = { id: 'SG-2', description: 'x', verified: true, evidence: 'ok', checked_at: 'now' }
+    expect(fromVerifyCheckResult(check)).toBeNull()
+  })
+
+  test('ATM-010: a tests_pass:true Summary -> fromTestRun returns null', () => {
+    expect(fromTestRun({ tests_pass: true })).toBeNull()
+  })
+
+  test('ATM-010: an idle_count below threshold -> fromIdleCount returns null', () => {
+    expect(fromIdleCount({ idle_count: IDLE_COUNT_STAGNATION_THRESHOLD - 1 })).toBeNull()
+  })
+})
+
+describe('ATM-013: watchdog.ts adapters — fromWatchdogFault / fromWatchdogBlocked / fromWatchdogDeadSession', () => {
+  test('ATM-013: fromWatchdogFault crash -> classifyFailure -> liveness_timeout/critical', () => {
+    const sig = fromWatchdogFault('kiera', 'crash', { task_id: 1, agent: 'kiera' })
+    const result = classifyFailure(sig)
+    expect(result.failure_class).toBe('liveness_timeout')
+    expect(result.severity).toBe('critical')
+  })
+
+  test('ATM-013: fromWatchdogFault timeout -> classifyFailure -> liveness_timeout/high', () => {
+    const sig = fromWatchdogFault('sadie', 'timeout', { task_id: 2 })
+    const result = classifyFailure(sig)
+    expect(result.failure_class).toBe('liveness_timeout')
+    expect(result.severity).toBe('high')
+  })
+
+  const blockedCases: { blockedOn: BlockedOn | null; expectedDomain: FailureDomain }[] = [
+    { blockedOn: 'human', expectedDomain: 'human' },
+    { blockedOn: 'external_api', expectedDomain: 'external_api' },
+    { blockedOn: 'upstream_task', expectedDomain: 'upstream_task' },
+    { blockedOn: 'agent', expectedDomain: 'agent' },
+    { blockedOn: null, expectedDomain: 'unknown' },
+  ]
+  for (const { blockedOn, expectedDomain } of blockedCases) {
+    test(`ATM-013: fromWatchdogBlocked(${blockedOn}) -> classifyFailure -> blocked_dependency/domain=${expectedDomain}`, () => {
+      const sig = fromWatchdogBlocked(blockedOn, { task_id: 3, agent: 'boss' })
+      const result = classifyFailure(sig)
+      expect(result.failure_class).toBe('blocked_dependency')
+      expect(result.domain).toBe(expectedDomain)
+    })
+  }
+
+  test('ATM-013: fromWatchdogDeadSession -> classifyFailure -> liveness_timeout/critical/permanent', () => {
+    const sig = fromWatchdogDeadSession({ task_id: 4, agent: 'steve' })
+    const result = classifyFailure(sig)
+    expect(result.failure_class).toBe('liveness_timeout')
+    expect(result.severity).toBe('critical')
+    expect(result.transience).toBe('permanent')
+  })
+})
+
+describe('ATM-016-unit: fromEscalationBridgeAllPathsFailed (pure adapter half — integration lives in the escalation-integration file)', () => {
+  test('ATM-016-unit: fromEscalationBridgeAllPathsFailed -> classifyFailure -> infrastructure_transient/critical', () => {
+    const sig = fromEscalationBridgeAllPathsFailed('kiera', 1, 'MCP unavailable')
+    const result = classifyFailure(sig)
+    expect(result.failure_class).toBe('infrastructure_transient')
+    expect(result.severity).toBe('critical')
+    expect(result.agent).toBe('kiera')
+  })
+})
+
+describe('ATM-018: fromAdversarialFinding (standalone, no production call site)', () => {
+  test("ATM-018: fromAdversarialFinding('codex','correctness','HIGH',...) -> correctness_adversarial_finding/high", () => {
+    const sig = fromAdversarialFinding('codex', 'correctness', 'HIGH', 'bug found')
+    const result = classifyFailure(sig)
+    expect(result.failure_class).toBe('correctness_adversarial_finding')
+    expect(result.severity).toBe('high')
+  })
+
+  const contractScopeCategories = [
+    'scope_conformance',
+    'verifiability',
+    'ears_conformance',
+    'traceability',
+    'classifier_rigor',
+    'consumption_contract',
+  ]
+  for (const category of contractScopeCategories) {
+    test(`ATM-018: fromAdversarialFinding(..., '${category}', ...) -> contract_scope_conformance`, () => {
+      const sig = fromAdversarialFinding('codex', category, 'MEDIUM', 'x')
+      const result = classifyFailure(sig)
+      expect(result.failure_class).toBe('contract_scope_conformance')
+    })
+  }
+
+  test("ATM-018: fromAdversarialFinding(..., 'zzz_unknown', ...) -> unknown", () => {
+    const sig = fromAdversarialFinding('codex', 'zzz_unknown', 'HIGH', 'weird')
+    const result = classifyFailure(sig)
+    expect(result.failure_class).toBe('unknown')
+  })
+
+  test('ATM-018: fromAdversarialFinding never throws across a battery of malformed categories/hints', () => {
+    const inputs = ['', 'CORRECTNESS', 'correctness ', 'made_up', 'SCOPE_CONFORMANCE']
+    for (const category of inputs) {
+      expect(() => classifyFailure(fromAdversarialFinding('codex', category, 'weird-hint', 'x'))).not.toThrow()
+    }
   })
 })

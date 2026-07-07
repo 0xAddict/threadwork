@@ -213,3 +213,39 @@ console.log(`[${now}] Spec Gate: ${verified}/${checks.length} verified | Tests: 
 for (const c of checks) {
   console.log(`  ${c.verified ? '✅' : '⬜'} ${c.id}: ${c.description}`)
 }
+
+// ---------------------------------------------------------------------------
+// P6 Stage 5 / EPIC-03 — additive, flag-gated, fully-swallowed persistence of
+// failure classifications derived from this run's checks/summary. Placed
+// strictly AFTER the summary.json write and the console output above, and
+// wrapped end-to-end in try/catch, so it can NEVER alter verify.ts's exit
+// code, console output, or summary.json (REQ-005(a)). Never creates the live
+// db (existsSync gate below); never throws past this block.
+// ---------------------------------------------------------------------------
+try {
+  const { Database } = await import('bun:sqlite')
+  const {
+    fromVerifyCheckResult,
+    fromTestRun,
+    fromIdleCount,
+    classifyFailure,
+    persistFailureClassification,
+  } = await import('./failure-classification')
+
+  const dbPath = join(PROJECT, 'tasks.db')
+  if (existsSync(dbPath)) {
+    const db = new Database(dbPath)
+    try {
+      for (const check of checks) {
+        const sig = fromVerifyCheckResult(check)
+        if (sig) persistFailureClassification(db, classifyFailure(sig))
+      }
+      const testSig = fromTestRun(summary)
+      if (testSig) persistFailureClassification(db, classifyFailure(testSig))
+      const idleSig = fromIdleCount(summary)
+      if (idleSig) persistFailureClassification(db, classifyFailure(idleSig))
+    } finally {
+      db.close()
+    }
+  }
+} catch { /* swallow — REQ-005(a): never affect verify.ts's exit/console/summary.json */ }

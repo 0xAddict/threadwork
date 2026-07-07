@@ -18,7 +18,21 @@ import { validateLabels, schemaCheck, isReadyForDispatch } from './inhibit-engin
 // Re-export for cross-module access
 export { validateLabels, schemaCheck, isReadyForDispatch }
 import { TaskDB, type Task } from './db'
+import type { BlockedOn } from './db'
 import { MemoryDB } from './memory'
+// P6 Stage 5 / EPIC-03 — additive failure-classification wiring. Every call
+// site below is wrapped in its OWN try/catch so a thrown persistence error
+// can NEVER alter watchdog's existing control flow, DB mutations, or log
+// output (REQ-006a). persistFailureClassification self-gates on the
+// failure_classification_enabled flag, so no separate flag check is needed
+// at these call sites.
+import {
+  fromWatchdogFault,
+  fromWatchdogBlocked,
+  fromWatchdogDeadSession,
+  classifyFailure,
+  persistFailureClassification,
+} from './verification/failure-classification'
 import { DecisionDB, expireStaleDecisions, type Decision, type DecisionWithDetail } from './decision'
 import { AuditLog } from './audit'
 import { dispatchAgentNudge, configureNudgeDebounce } from './nudge'
@@ -366,6 +380,19 @@ export class TaskReconciler {
 
     if (task.blocked_at) {
       const blockedOn = (task as any).blocked_on as string | null
+      // P6 Stage 5 / EPIC-03 — additive, flag-gated, swallowed failure
+      // classification. Fires ONCE per blocked-task processing pass, for ANY
+      // blocked_on value (incl. 'agent' and null/legacy), before any of the
+      // long-block/short-block branching below.
+      try {
+        this.taskDb.run(db =>
+          persistFailureClassification(
+            db,
+            classifyFailure(fromWatchdogBlocked(blockedOn as BlockedOn | null, { task_id: task.id, agent: task.to_agent })),
+          )
+        )
+      } catch { /* swallow — REQ-006a: never alter watchdog control flow */ }
+
       const isLongBlock = blockedOn === 'human' || blockedOn === 'external_api' || blockedOn === 'upstream_task'
 
       if (isLongBlock) {
@@ -555,6 +582,15 @@ export class TaskReconciler {
       }, task.id)
     } else {
       this.taskDb.recordFault(task.to_agent, 'crash')
+      // P6 Stage 5 / EPIC-03 \u2014 additive, flag-gated, swallowed failure classification.
+      try {
+        this.taskDb.run(db =>
+          persistFailureClassification(
+            db,
+            classifyFailure(fromWatchdogFault(task.to_agent, 'crash', { task_id: task.id, agent: task.to_agent })),
+          )
+        )
+      } catch { /* swallow \u2014 REQ-006a: never alter watchdog control flow */ }
     }
 
     // Check if an escalation task already exists for this
@@ -566,6 +602,15 @@ export class TaskReconciler {
 
     // Create escalation task for boss
     const escalationDesc = `ESCALATION L${level + 1}: Task #${task.id} (${task.to_agent}) \u2014 worker session dead, task abandoned. Original: ${task.description}`
+    // P6 Stage 5 / EPIC-03 \u2014 additive, flag-gated, swallowed failure classification.
+    try {
+      this.taskDb.run(db =>
+        persistFailureClassification(
+          db,
+          classifyFailure(fromWatchdogDeadSession({ task_id: task.id, agent: task.to_agent })),
+        )
+      )
+    } catch { /* swallow \u2014 REQ-006a: never alter watchdog control flow */ }
 
     this.taskDb.run(db => {
       // Create the escalation task (self-assigned to boss so trigger does not fire)
@@ -660,6 +705,15 @@ export class TaskReconciler {
       }, task.id)
     } else {
       const faultResult = this.taskDb.recordFault(task.to_agent, 'timeout')
+      // P6 Stage 5 / EPIC-03 — additive, flag-gated, swallowed failure classification.
+      try {
+        this.taskDb.run(db =>
+          persistFailureClassification(
+            db,
+            classifyFailure(fromWatchdogFault(task.to_agent, 'timeout', { task_id: task.id, agent: task.to_agent })),
+          )
+        )
+      } catch { /* swallow — REQ-006a: never alter watchdog control flow */ }
       if (faultResult.circuit_state === 'open') {
         // #615 Phase 1: dedup circuit_open alerts per agent. Hash on agent only
         // (not fault_count) so once OPEN, alerts only re-fire after the cooldown
@@ -957,6 +1011,15 @@ export class TaskReconciler {
           `).run(session.agent)
         })
         this.taskDb.recordFault(session.agent, 'crash')
+        // P6 Stage 5 / EPIC-03 — additive, flag-gated, swallowed failure classification.
+        try {
+          this.taskDb.run(db =>
+            persistFailureClassification(
+              db,
+              classifyFailure(fromWatchdogFault(session.agent, 'crash', { agent: session.agent })),
+            )
+          )
+        } catch { /* swallow — REQ-006a: never alter watchdog control flow */ }
 
         // Clear stale heartbeat timing so watchdog picks up tasks immediately
         this.taskDb.run(db => {

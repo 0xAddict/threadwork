@@ -24,6 +24,7 @@
     "tests/failure-classification.test.ts",
     "tests/failure-classification-verify-integration.test.ts",
     "tests/failure-classification-watchdog-integration.test.ts",
+    "tests/failure-classification-escalation-integration.test.ts",
     "tests/guardrails/escalation-bridge-onfailureclassified-wired.test.ts"
   ]
 }
