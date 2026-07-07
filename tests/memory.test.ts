@@ -1027,6 +1027,26 @@ describe('P5 EPIC-03 — challengeMemory write-ordering (ATM-005/ATM-007)', () =
     expect(memOn.challengeMemory(999999, 'reason')).toBeNull()
   })
 
+  test('STAGE 5 (ATM-013/REQ-022): flag OFF — challengeMemory keeps write_seq NULL (parity with saveMemory/supersedeMemory OFF-path tests)', () => {
+    const dbPathOff = tempP5DbPath('challenge-atm013-off')
+    const taskDbOff = new TaskDB(dbPathOff)
+    const memOff = new MemoryDB(taskDbOff)
+
+    try {
+      const m = memOff.saveMemory({ agent: 'boss', content: 'atm013 off challenge fact', category: 'fact' })
+      expect(m.write_seq).toBeNull()
+
+      const challenged = memOff.challengeMemory(m.id, 'atm013 off outdated info')
+      expect(challenged).not.toBeNull()
+      expect(challenged!.challenge_count).toBe(1)
+      expect(challenged!.write_seq).toBeNull()
+    } finally {
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { unlinkSync(dbPathOff + suffix) } catch {}
+      }
+    }
+  })
+
   test('ATM-007: fault-injection — UPDATE throws mid-critical-section leaves no orphaned audit_log row (all-or-nothing)', () => {
     const m = memOn.saveMemory({ agent: 'boss', content: 'atm007 fact', category: 'fact' })
     const db = taskDbOn.getHandle()
@@ -1159,6 +1179,165 @@ describe('P5 EPIC-04 — supersedeMemory write-ordering (ATM-008/ATM-009/ATM-027
         'SELECT COUNT(*) as c FROM memories WHERE supersedes_memory_id = ?'
       ).get(old.id) as { c: number }
       expect(row.c).toBe(2)
+    } finally {
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { unlinkSync(dbPathOff + suffix) } catch {}
+      }
+    }
+  })
+})
+
+// --- P5 STAGE 5 (EPIC-05 / ATM-013): write-sequence verification -----------
+//
+// Single-process, single-temp-DB coverage of REQ-010/REQ-011's full contract
+// across ALL THREE P5-covered write paths (saveMemory, challengeMemory,
+// supersedeMemory) in ONE combined flow, closing the gaps the per-EPIC
+// describe blocks above don't individually exercise:
+//   1. write_seq non-NULL + PRESENT in write_sequence (not just "truthy") on
+//      every affected row, for every one of the three ops, flag ON; NULL on
+//      all three ops, flag OFF.
+//   2. APPEND-ONLY LOG CHECK: write_sequence grows by EXACTLY 5 across
+//      save-INSERT(1) + save-dedup-UPDATE(1) + challenge-UPDATE(1) +
+//      supersede-old-UPDATE(1)+new-INSERT(1) = 5 stamps for 4 operation
+//      calls — proving one row per nextWriteSeq() call, not per operation.
+//   3. OVERWRITE PROOF: the SAME row's memories.write_seq is replaced by a
+//      DIFFERENT, LARGER value on its dedup UPDATE than its INSERT-time
+//      stamp — memories.write_seq is a latest-write marker, not a history log.
+describe('P5 STAGE 5 — EPIC-05 write-sequence verification (ATM-013)', () => {
+  let dbPathOn: string
+  let taskDbOn: TaskDB
+  let memOn: MemoryDB
+
+  beforeEach(() => {
+    dbPathOn = tempP5DbPath('stage5-atm013-on')
+    taskDbOn = new TaskDB(dbPathOn)
+    taskDbOn.setFeatureFlag('memory_write_ordering_enabled', true)
+    memOn = new MemoryDB(taskDbOn)
+  })
+
+  afterEach(() => {
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(dbPathOn + suffix) } catch {}
+    }
+  })
+
+  /** Confirms `seq` is a real id minted by nextWriteSeq() — not merely non-NULL. */
+  function existsInWriteSequence(seq: number): boolean {
+    const row = taskDbOn.getHandle().prepare(
+      'SELECT id FROM write_sequence WHERE id = ?'
+    ).get(seq) as { id: number } | null
+    return row !== null && row.id === seq
+  }
+
+  function writeSequenceCount(): number {
+    return (taskDbOn.getHandle().prepare('SELECT COUNT(*) as c FROM write_sequence').get() as { c: number }).c
+  }
+
+  test('flag ON: write_seq on every affected row is non-NULL and present in write_sequence; APPEND-ONLY LOG grows by EXACTLY 5 across save-INSERT + save-dedup-UPDATE + challenge-UPDATE + supersede(old-UPDATE+new-INSERT); OVERWRITE PROOF on the dedup row', () => {
+    // Pre-seed the rows the challenge/supersede calls below need. Seeding
+    // itself consumes write_sequence stamps (2 INSERTs) — captured BEFORE the
+    // measured baseline so it is excluded from the "+5" delta assertion.
+    const challengeSeed = memOn.saveMemory({ agent: 'boss', content: `stage5 challenge seed ${crypto.randomUUID()}`, category: 'fact' })
+    const supersedeSeed = memOn.saveMemory({ agent: 'boss', content: `stage5 supersede seed ${crypto.randomUUID()}`, category: 'fact' })
+    expect(challengeSeed.write_seq).not.toBeNull()
+    expect(supersedeSeed.write_seq).not.toBeNull()
+
+    const countBefore = writeSequenceCount()
+
+    // (a) saveMemory — new distinct content -> INSERT -> 1 stamp.
+    const a = memOn.saveMemory({ agent: 'boss', content: 'stage5 append-only content', category: 'fact' })
+    expect(a.write_seq).not.toBeNull()
+    expect(existsInWriteSequence(a.write_seq!)).toBe(true)
+
+    // (b) saveMemory — identical normalized content -> dedup UPDATE on the
+    // SAME row as (a) -> 1 stamp. This is the OVERWRITE PROOF pair: (a)'s
+    // INSERT-time stamp must be superseded by a DIFFERENT, LARGER stamp.
+    const b = memOn.saveMemory({ agent: 'boss', content: 'Stage5   Append-Only   Content', category: 'fact' })
+    expect(b.id).toBe(a.id)
+    expect(b.write_seq).not.toBeNull()
+    expect(existsInWriteSequence(b.write_seq!)).toBe(true)
+    expect(b.write_seq!).toBeGreaterThan(a.write_seq!)
+    // Re-read the row directly: its write_seq is NOW the dedup-UPDATE value,
+    // not the original INSERT-time stamp — memories.write_seq is a
+    // latest-write marker (REQ-010), not a history log (REQ-011).
+    const reread = taskDbOn.getHandle().prepare('SELECT write_seq FROM memories WHERE id = ?').get(a.id) as { write_seq: number }
+    expect(reread.write_seq).toBe(b.write_seq)
+    expect(reread.write_seq).not.toBe(a.write_seq)
+
+    // (c) challengeMemory — UPDATE on the pre-seeded row -> 1 stamp.
+    const c = memOn.challengeMemory(challengeSeed.id, 'stage5 outdated info')
+    expect(c).not.toBeNull()
+    expect(c!.write_seq).not.toBeNull()
+    expect(existsInWriteSequence(c!.write_seq!)).toBe(true)
+
+    // (d) supersedeMemory — old-row UPDATE + new-row INSERT on the pre-seeded
+    // row -> 2 stamps (its own nextWriteSeq() call each).
+    const d = memOn.supersedeMemory(supersedeSeed.id, 'stage5 new fact', 'stage5 updated info')
+    expect(d).not.toBeNull()
+    expect(d!.old.write_seq).not.toBeNull()
+    expect(d!.new.write_seq).not.toBeNull()
+    expect(existsInWriteSequence(d!.old.write_seq!)).toBe(true)
+    expect(existsInWriteSequence(d!.new.write_seq!)).toBe(true)
+
+    // --- APPEND-ONLY LOG CHECK (REQ-011/C2) ---
+    // Exactly 5 new write_sequence rows for the 4 operation calls above:
+    // save-INSERT(1) + save-dedup-UPDATE(1) + challenge-UPDATE(1) +
+    // supersede-old-UPDATE(1) + supersede-new-INSERT(1) = 5, NOT merely 4
+    // (one row per nextWriteSeq() call, not per operation).
+    const countAfter = writeSequenceCount()
+    expect(countAfter - countBefore).toBe(5)
+
+    // Strictly increasing, no gaps, WITHIN this assertion's own captured set
+    // (single-process — these are the only nextWriteSeq() calls in this window).
+    const capturedSeqs = [a.write_seq!, b.write_seq!, c!.write_seq!, d!.old.write_seq!, d!.new.write_seq!]
+    expect(new Set(capturedSeqs).size).toBe(5) // no duplicates
+    const sorted = [...capturedSeqs].sort((x, y) => x - y)
+    for (let i = 1; i < sorted.length; i++) {
+      expect(sorted[i]).toBe(sorted[i - 1] + 1) // gapless
+    }
+
+    // Cross-check against write_sequence itself: the ids in ascending order
+    // for THIS window (id > countBefore's high-water mark, i.e. the last 5
+    // rows) match the captured set exactly.
+    const rows = taskDbOn.getHandle().prepare(
+      'SELECT id FROM write_sequence ORDER BY id ASC'
+    ).all() as Array<{ id: number }>
+    expect(rows).toHaveLength(countAfter)
+    const newRows = rows.slice(countBefore).map(r => r.id)
+    expect(newRows).toEqual(sorted)
+  })
+
+  test('flag OFF: write_seq stays NULL across all three P5-covered ops (save-INSERT, save-dedup-UPDATE, challenge-UPDATE, supersede-UPDATE+INSERT) — REQ-022 parity', () => {
+    const dbPathOff = tempP5DbPath('stage5-atm013-off')
+    const taskDbOff = new TaskDB(dbPathOff)
+    const memOff = new MemoryDB(taskDbOff)
+
+    try {
+      const challengeSeed = memOff.saveMemory({ agent: 'boss', content: `stage5 off challenge seed ${crypto.randomUUID()}`, category: 'fact' })
+      const supersedeSeed = memOff.saveMemory({ agent: 'boss', content: `stage5 off supersede seed ${crypto.randomUUID()}`, category: 'fact' })
+      expect(challengeSeed.write_seq).toBeNull()
+      expect(supersedeSeed.write_seq).toBeNull()
+
+      const a = memOff.saveMemory({ agent: 'boss', content: 'stage5 off append-only content', category: 'fact' })
+      expect(a.write_seq).toBeNull()
+
+      const b = memOff.saveMemory({ agent: 'boss', content: 'Stage5   Off   Append-Only   Content', category: 'fact' })
+      expect(b.id).toBe(a.id)
+      expect(b.write_seq).toBeNull()
+
+      const c = memOff.challengeMemory(challengeSeed.id, 'stage5 off outdated info')
+      expect(c).not.toBeNull()
+      expect(c!.write_seq).toBeNull()
+
+      const d = memOff.supersedeMemory(supersedeSeed.id, 'stage5 off new fact', 'stage5 off updated info')
+      expect(d).not.toBeNull()
+      expect(d!.old.write_seq).toBeNull()
+      expect(d!.new.write_seq).toBeNull()
+
+      // write_sequence is never touched at all on the flag-OFF path — no
+      // nextWriteSeq() call happens anywhere in these 4 operations.
+      const count = (taskDbOff.getHandle().prepare('SELECT COUNT(*) as c FROM write_sequence').get() as { c: number }).c
+      expect(count).toBe(0)
     } finally {
       for (const suffix of ['', '-shm', '-wal']) {
         try { unlinkSync(dbPathOff + suffix) } catch {}

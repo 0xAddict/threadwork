@@ -431,3 +431,159 @@ describe('ATM-010 — supersedeMemory cross-process double-supersede race', () =
     SPAWN_TIMEOUT_MS
   )
 })
+
+// tests/memory-ordering-concurrency.test.ts — P5 EPIC-05 ATM-014.
+//
+// CROSS-PROCESS strict-ordering/uniqueness proof over a MIXED operation set
+// (saveMemory + challengeMemory + supersedeMemory), flag ON only — write_seq/
+// write_sequence stamping only occurs on the ordering-enabled path, so there
+// is no flag-OFF variant of this test (per REQ-011/ATM-014's own scope).
+//
+// Reuses the EXISTING per-op worker scripts (concurrent-save-memory-worker.ts,
+// concurrent-challenge-worker.ts, concurrent-supersede-worker.ts) rather than a
+// new combined dispatcher — all three already honor the SAME REQ-027
+// P5_TEST_START_GATE/P5_GATE_COUNT env-var contract (waitForStartGate, called
+// immediately before invoking the wrapped memory function), so spawning all
+// three worker types against ONE shared gateName/expectedCount rendezvouses
+// them at approximately the same instant regardless of op type — genuine
+// multi-process BEGIN IMMEDIATE contention across a MIXED op mix.
+//
+// Op mix chosen so the exact mutating-statement count is deterministic
+// (documented inline, matching the spec's guidance):
+//   - SAVE_N workers, each saveMemory()-ing DISTINCT content -> guaranteed
+//     INSERT, never a dedup UPDATE -> 1 stamp each.
+//   - CHALLENGE_N workers, each challengeMemory()-ing its OWN pre-seeded
+//     DISTINCT row -> 1 stamp each (challengeMemory's UPDATE has no guard, so
+//     even a shared row would be deterministic, but distinct rows keep the
+//     per-row assertion in (a) simple to reason about too).
+//   - SUPERSEDE_N workers, each supersedeMemory()-ing its OWN pre-seeded
+//     DISTINCT row -> 2 stamps each (old-row UPDATE + new-row INSERT). Using
+//     DISTINCT rows (never two workers on the SAME id) avoids the REQ-007
+//     state guard turning a "loser" into a 0-stamp blocked no-op, which would
+//     make the expected count non-deterministic.
+// EXPECTED_STAMPS = SAVE_N*1 + CHALLENGE_N*1 + SUPERSEDE_N*2.
+
+describe('ATM-014 — mixed-operation cross-process strict-ordering/uniqueness proof', () => {
+  test(
+    'flag ON — N concurrent mixed save/challenge/supersede workers produce a gapless, duplicate-free append-only log',
+    async () => {
+      const dbPath = tempDbPath('atm014-mixed')
+      const seedDb = new TaskDB(dbPath)
+      seedDb.setFeatureFlag('memory_write_ordering_enabled', true)
+      const seedMem = new MemoryDB(seedDb)
+
+      const runId = crypto.randomUUID()
+      const SAVE_N = 3
+      const CHALLENGE_N = 3
+      const SUPERSEDE_N = 3
+      const TOTAL_N = SAVE_N + CHALLENGE_N + SUPERSEDE_N // 9 concurrent workers
+
+      // Pre-seed DISTINCT rows for the challenge/supersede workers to target.
+      // Seeding itself consumes write_sequence stamps — captured in
+      // countBefore below so it's excluded from the measured delta.
+      const challengeSeeds = Array.from({ length: CHALLENGE_N }, (_, i) =>
+        seedMem.saveMemory({ agent: 'boss', content: `atm014-challenge-seed-${i}-${runId}`, category: 'fact' })
+      )
+      const supersedeSeeds = Array.from({ length: SUPERSEDE_N }, (_, i) =>
+        seedMem.saveMemory({ agent: 'boss', content: `atm014-supersede-seed-${i}-${runId}`, category: 'fact' })
+      )
+
+      const countBefore = (
+        seedDb.getHandle().prepare('SELECT COUNT(*) as c FROM write_sequence').get() as { c: number }
+      ).c
+      seedDb.close()
+
+      const gateName = `atm014-mixed-${runId}`
+
+      const saveExits = Array.from({ length: SAVE_N }, (_, i) =>
+        spawnWorker({
+          DB_PATH: dbPath,
+          AGENT_LABEL: `save-${i}`,
+          // DISTINCT per worker -> guaranteed INSERT (1 stamp), never a dedup UPDATE.
+          MEMORY_CONTENT: `atm014-save-distinct-${i}-${runId}`,
+          P5_TEST_START_GATE: gateName,
+          P5_GATE_COUNT: String(TOTAL_N),
+        })
+      )
+      const challengeExits = challengeSeeds.map((seed, i) =>
+        spawnChallengeWorker({
+          DB_PATH: dbPath,
+          AGENT_LABEL: `challenge-${i}`,
+          CHALLENGE_ID: String(seed.id),
+          P5_TEST_START_GATE: gateName,
+          P5_GATE_COUNT: String(TOTAL_N),
+        })
+      )
+      const supersedeExits = supersedeSeeds.map((seed, i) =>
+        spawnSupersedeWorker({
+          DB_PATH: dbPath,
+          AGENT_LABEL: `supersede-${i}`,
+          OLD_ID: String(seed.id),
+          WORKER_CONTENT: `atm014-supersede-replacement-${i}-${runId}`,
+          P5_TEST_START_GATE: gateName,
+          P5_GATE_COUNT: String(TOTAL_N),
+        })
+      )
+
+      const exitCodes = await Promise.all([...saveExits, ...challengeExits, ...supersedeExits])
+      for (const code of exitCodes) expect(code).toBe(0)
+
+      // Computed, deterministic expected mutating-statement count (see file
+      // header comment for the reasoning behind the op-mix choice):
+      //   SAVE_N distinct-content saves       -> 1 stamp each = 3
+      //   CHALLENGE_N challenges (own row)    -> 1 stamp each = 3
+      //   SUPERSEDE_N supersedes (own row)    -> 2 stamps each = 6
+      // EXPECTED_STAMPS = 3 + 3 + 6 = 12
+      const EXPECTED_STAMPS = SAVE_N * 1 + CHALLENGE_N * 1 + SUPERSEDE_N * 2
+
+      const readDb = new Database(dbPath, { readonly: true })
+      try {
+        // Sanity check on the op-mix assumption: every supersede must have
+        // actually succeeded (own distinct row -> no REQ-007 guard block) —
+        // otherwise EXPECTED_STAMPS's "2 stamps each" would be wrong.
+        const blockedCount = readDb
+          .prepare("SELECT COUNT(*) as c FROM audit_log WHERE action = 'memory_supersede_blocked_duplicate'")
+          .get() as { c: number }
+        expect(blockedCount.c).toBe(0)
+
+        // (a) Per-row write_seq: strictly increasing, NO duplicate values,
+        // across the FULL mixed set (proves no two concurrent workers were
+        // ever assigned the same sequence id).
+        const memRows = readDb
+          .prepare('SELECT write_seq FROM memories WHERE write_seq IS NOT NULL ORDER BY write_seq')
+          .all() as Array<{ write_seq: number }>
+        const memSeqs = memRows.map(r => r.write_seq)
+        expect(new Set(memSeqs).size).toBe(memSeqs.length)
+        for (let i = 1; i < memSeqs.length; i++) {
+          expect(memSeqs[i]).toBeGreaterThan(memSeqs[i - 1])
+        }
+
+        // (b) Append-only log: COUNT(*) equal to the EXACT number of
+        // mutating statements executed across all N workers — stronger than
+        // (a), proving the log is complete/gapless/duplicate-free, not just
+        // that the per-row markers happen to look ordered.
+        const seqRows = readDb.prepare('SELECT id FROM write_sequence ORDER BY id ASC').all() as Array<{ id: number }>
+        const countAfter = seqRows.length
+        expect(countAfter - countBefore).toBe(EXPECTED_STAMPS)
+
+        // The whole write_sequence table (fresh temp DB, sole writer is
+        // nextWriteSeq()) is gapless from id=1 through countAfter — no
+        // dropped/rolled-back stamps anywhere in the seed OR concurrent phase.
+        for (let i = 0; i < seqRows.length; i++) {
+          expect(seqRows[i].id).toBe(i + 1)
+        }
+
+        // The ids consumed by JUST the N concurrent workers (i.e. everything
+        // after the seed-phase high-water mark) are exactly the trailing
+        // EXPECTED_STAMPS entries of that gapless sequence.
+        const workerSeqs = seqRows.slice(countBefore).map(r => r.id)
+        expect(workerSeqs).toHaveLength(EXPECTED_STAMPS)
+        expect(new Set(workerSeqs).size).toBe(EXPECTED_STAMPS)
+      } finally {
+        readDb.close()
+        cleanupDbFile(dbPath)
+      }
+    },
+    SPAWN_TIMEOUT_MS
+  )
+})
