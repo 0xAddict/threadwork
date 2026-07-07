@@ -3,14 +3,24 @@
 // EPIC-01 (Taxonomy): the canonical, versioned FailureClass taxonomy plus
 // three orthogonal classification axes (severity / transience / domain).
 //
-// This stage does NOT implement classifyFailure(), adapters, persistence, or
-// the read accessor — those are implemented in later build Stages (2-7). See
-// ~/.claude/state/p4-p8-fanout/build-p6/PLAN.md and specs/P6-spec.md.
+// EPIC-02 (this stage's addition, below): the FailureClassification record
+// type, the RawFailureSignal discriminated union, and the pure
+// classifyFailure() table-driven classifier.
 //
-// Isolation: this module has ZERO runtime dependency on decision.ts or db.ts.
-// Guardrail tests (tests/failure-classification.test.ts, ATM-004) import
-// CritiqueSeverity / BlockedOn as TYPES ONLY, read-only, for compile-time
-// drift detection — never imported here.
+// This stage does NOT implement adapters (fromVerifyCheckResult etc.),
+// persistence, migrate(), or the read accessor — those are implemented in
+// later build Stages (3-7). See ~/.claude/state/p4-p8-fanout/build-p6/PLAN.md
+// and specs/P6-spec.md.
+//
+// Isolation: this module has ZERO RUNTIME dependency on decision.ts or
+// db.ts. Guardrail tests (tests/failure-classification.test.ts, ATM-004)
+// import CritiqueSeverity / BlockedOn as TYPES ONLY, read-only, for
+// compile-time drift detection. EPIC-02 below imports BlockedOn as a TYPE
+// ONLY from db.ts (via `import type`, erased at compile time — zero runtime
+// dependency) so RawFailureSignal's watchdog_blocked variant can express its
+// blocked_on field precisely.
+
+import type { BlockedOn } from '../db'
 
 // ---------------------------------------------------------------------------
 // ATM-001 / REQ-001 [P1] — Canonical versioned FailureClass
@@ -144,3 +154,288 @@ const _failureDomainExhaustive: _FailureDomainExhaustive = true
 void _failureDomainExhaustive
 
 export const ALL_FAILURE_DOMAINS: readonly FailureDomain[] = Object.freeze(_failureDomainsTuple)
+
+// ---------------------------------------------------------------------------
+// ATM-005 / REQ-003 [P1] — FailureClassification record + RawFailureSignal
+// ---------------------------------------------------------------------------
+
+/**
+ * The result of classifying a raw failure signal.
+ *
+ * Deliberately has NO timestamp / classified_at field: classifyFailure() is
+ * GENUINELY PURE (no Date/Date.now/performance.now/datetime(), no
+ * randomness, no I/O, no side effects). The persisted `created_at` is
+ * stamped later, at persist time, by Stage 3 — not here.
+ */
+export interface FailureClassification {
+  failure_class: FailureClass
+  severity: FailureSeverity
+  transience: FailureTransience
+  domain: FailureDomain
+  taxonomy_version: number
+  signal_source: string
+  source_ref: string | null
+  task_id: number | null
+  agent: string | null
+  summary: string
+  raw_signal: unknown
+}
+
+/**
+ * Fields common to the RawFailureSignal variants that carry task/agent/
+ * summary context (verify_check, test_run, verify_idle_count,
+ * watchdog_fault, watchdog_blocked, watchdog_dead_session, manual).
+ */
+interface _SignalContext {
+  task_id?: number
+  agent?: string
+  summary?: string
+}
+
+/**
+ * The 9 recognized raw-failure-signal shapes, discriminated on `source`.
+ * classifyFailure() maps each variant (plus sub-conditions where noted) to a
+ * FailureClassification via the authoritative 16-row mapping table (see
+ * classifyFailure()'s doc comment below).
+ */
+export type RawFailureSignal =
+  | ({
+      source: 'verify_check'
+      /** The CheckResult id — carried through to source_ref so the SG-13
+       * exclusion is expressible upstream. The exclusion itself is the
+       * Stage-5 adapter's job; classifyFailure just maps unconditionally. */
+      checkResultId: string
+    } & _SignalContext)
+  | ({
+      source: 'test_run'
+    } & _SignalContext)
+  | ({
+      source: 'verify_idle_count'
+      /** Checked against IDLE_COUNT_STAGNATION_THRESHOLD. */
+      idle_count: number
+    } & _SignalContext)
+  | ({
+      source: 'watchdog_fault'
+      /** Branches on 'crash' | 'timeout'; anything else falls to unknown. */
+      faultType: string
+    } & _SignalContext)
+  | ({
+      source: 'watchdog_blocked'
+      /** Type-only import from ../db — zero runtime dependency on db.ts. */
+      blocked_on: BlockedOn | null
+    } & _SignalContext)
+  | ({
+      source: 'watchdog_dead_session'
+    } & _SignalContext)
+  | {
+      source: 'escalation_bridge_all_paths_failed'
+      agent?: string
+      summary?: string
+      /** May hold the step/agent identifier. */
+      source_ref?: string
+    }
+  | {
+      source: 'adversarial_finding'
+      category: string
+      severityHint: string
+      verifierName?: string
+      summary?: string
+    }
+  | ({
+      source: 'manual'
+    } & _SignalContext)
+
+/**
+ * Idle-count stagnation threshold (mapping-table row 3): a verify_idle_count
+ * signal with idle_count >= this value classifies as
+ * resource_budget_exhaustion. Also consumed by the Stage-5 adapter.
+ */
+export const IDLE_COUNT_STAGNATION_THRESHOLD = 3
+
+// ---------------------------------------------------------------------------
+// ATM-006/007/008/009 / REQ-004 [P1/P2] — classifyFailure()
+// ---------------------------------------------------------------------------
+
+/** adversarial_finding categories that map to contract_scope_conformance (mapping-table row 14). */
+const _CONTRACT_SCOPE_CATEGORIES: ReadonlySet<string> = new Set([
+  'scope_conformance',
+  'verifiability',
+  'ears_conformance',
+  'traceability',
+  'classifier_rigor',
+  'consumption_contract',
+])
+
+function _toNullableNumber(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null
+}
+
+function _toNullableString(v: unknown): string | null {
+  return typeof v === 'string' ? v : null
+}
+
+function _toSummary(v: unknown): string {
+  return typeof v === 'string' ? v : ''
+}
+
+/** severityHint sub-rule (mapping-table rows 13-15): case-sensitive, defaults to 'medium'. */
+function _mapSeverityHint(hint: unknown): FailureSeverity {
+  if (hint === 'HIGH') return 'high'
+  if (hint === 'MEDIUM' || hint === 'MED') return 'medium'
+  return 'medium'
+}
+
+type _ClassificationQuad = Pick<FailureClassification, 'failure_class' | 'severity' | 'transience' | 'domain'>
+
+/** Row 16: manual / unrecognized source / malformed required fields. */
+const _UNKNOWN_QUAD: _ClassificationQuad = {
+  failure_class: 'unknown',
+  severity: 'medium',
+  transience: 'unknown',
+  domain: 'unknown',
+}
+
+/**
+ * classifyFailure() — pure, deterministic, table-driven mapping from a
+ * RawFailureSignal to a FailureClassification, keyed on signal.source (and
+ * sub-condition). Encodes the authoritative 16-row mapping table:
+ *
+ *  1  verify_check                          (unconditional)          -> verification_failure / medium   / transient / agent
+ *  2  test_run                              (unconditional)          -> test_failure          / high     / transient / agent
+ *  3  verify_idle_count   idle_count >= 3                            -> resource_budget_exhaustion / medium / permanent / agent
+ *  4  watchdog_fault      faultType==='crash'                        -> liveness_timeout      / critical / transient / agent
+ *  5  watchdog_fault      faultType==='timeout'                      -> liveness_timeout      / high     / transient / agent
+ *  6  watchdog_blocked    blocked_on==='human'                       -> blocked_dependency     / low      / transient / human
+ *  7  watchdog_blocked    blocked_on==='external_api'                -> blocked_dependency     / medium   / transient / external_api
+ *  8  watchdog_blocked    blocked_on==='upstream_task'                -> blocked_dependency     / low      / transient / upstream_task
+ *  9  watchdog_blocked    blocked_on==='agent'                       -> blocked_dependency     / low      / transient / agent
+ *  10 watchdog_blocked    blocked_on===null / legacy                 -> blocked_dependency     / low      / transient / unknown
+ *  11 watchdog_dead_session               (unconditional)            -> liveness_timeout       / critical / permanent / agent
+ *  12 escalation_bridge_all_paths_failed  (unconditional)            -> infrastructure_transient / critical / transient / infrastructure
+ *  13 adversarial_finding category==='correctness'                  -> correctness_adversarial_finding / hint-mapped / permanent / system
+ *  14 adversarial_finding category in contract-scope set            -> contract_scope_conformance      / hint-mapped / permanent / system
+ *  15 adversarial_finding other/unrecognized category                -> unknown                / hint-mapped / permanent / system
+ *  16 manual / unrecognized source / malformed required fields      -> unknown                / medium      / unknown   / unknown
+ *
+ * PURITY CONTRACT: no Date, no Date.now, no performance.now, no datetime(),
+ * no randomness, no I/O, no side effects — see ATM-008's source-level
+ * guardrail test. Never throws — see ATM-007/ATM-009: any unrecognized
+ * source or malformed/missing/wrong-type required field falls to the row-16
+ * unknown fallback. Tolerates circular references in the input signal (this
+ * function never JSON-serializes the signal — raw_signal below stores a
+ * plain object reference).
+ */
+export function classifyFailure(signal: RawFailureSignal): FailureClassification {
+  // Deliberately untyped local view: at runtime the input may not actually
+  // satisfy RawFailureSignal (ATM-007/ATM-009 feed malformed/cast values).
+  // Every read below is defensive (optional chaining + typeof narrowing) so
+  // no property access can throw, even for null/undefined/primitive/
+  // circular-referenced signals.
+  const s: any = signal
+  const source: unknown = s !== null && s !== undefined ? s.source : undefined
+
+  const base = {
+    taxonomy_version: TAXONOMY_VERSION,
+    signal_source: typeof source === 'string' ? source : 'unknown',
+    source_ref: _toNullableString(s?.source_ref ?? s?.checkResultId),
+    task_id: _toNullableNumber(s?.task_id),
+    agent: _toNullableString(s?.agent),
+    summary: _toSummary(s?.summary),
+    raw_signal: signal,
+  }
+
+  let quad: _ClassificationQuad
+
+  switch (source) {
+    case 'verify_check': {
+      // Row 1 — unconditional. The SG-13 exclusion is the Stage-5 adapter's
+      // job (it simply never emits a verify_check signal for an excluded
+      // check); classifyFailure maps every verify_check it receives.
+      quad = { failure_class: 'verification_failure', severity: 'medium', transience: 'transient', domain: 'agent' }
+      break
+    }
+    case 'test_run': {
+      // Row 2 — unconditional (the adapter only emits on tests_pass===false).
+      quad = { failure_class: 'test_failure', severity: 'high', transience: 'transient', domain: 'agent' }
+      break
+    }
+    case 'verify_idle_count': {
+      // Row 3, else row 16.
+      const idleCount = s?.idle_count
+      if (typeof idleCount === 'number' && Number.isFinite(idleCount) && idleCount >= IDLE_COUNT_STAGNATION_THRESHOLD) {
+        quad = { failure_class: 'resource_budget_exhaustion', severity: 'medium', transience: 'permanent', domain: 'agent' }
+      } else {
+        quad = { ..._UNKNOWN_QUAD }
+      }
+      break
+    }
+    case 'watchdog_fault': {
+      // Rows 4-5, else row 16.
+      const faultType = s?.faultType
+      if (faultType === 'crash') {
+        quad = { failure_class: 'liveness_timeout', severity: 'critical', transience: 'transient', domain: 'agent' }
+      } else if (faultType === 'timeout') {
+        quad = { failure_class: 'liveness_timeout', severity: 'high', transience: 'transient', domain: 'agent' }
+      } else {
+        quad = { ..._UNKNOWN_QUAD }
+      }
+      break
+    }
+    case 'watchdog_blocked': {
+      // Rows 6-10 — every blocked_on value (including null/legacy/
+      // unrecognized) resolves to blocked_dependency; only the domain and
+      // severity vary.
+      const blockedOn = s?.blocked_on
+      switch (blockedOn) {
+        case 'human':
+          quad = { failure_class: 'blocked_dependency', severity: 'low', transience: 'transient', domain: 'human' }
+          break
+        case 'external_api':
+          quad = { failure_class: 'blocked_dependency', severity: 'medium', transience: 'transient', domain: 'external_api' }
+          break
+        case 'upstream_task':
+          quad = { failure_class: 'blocked_dependency', severity: 'low', transience: 'transient', domain: 'upstream_task' }
+          break
+        case 'agent':
+          quad = { failure_class: 'blocked_dependency', severity: 'low', transience: 'transient', domain: 'agent' }
+          break
+        default:
+          // Row 10 — null / legacy / any unrecognized blocked_on value.
+          quad = { failure_class: 'blocked_dependency', severity: 'low', transience: 'transient', domain: 'unknown' }
+          break
+      }
+      break
+    }
+    case 'watchdog_dead_session': {
+      // Row 11 — unconditional.
+      quad = { failure_class: 'liveness_timeout', severity: 'critical', transience: 'permanent', domain: 'agent' }
+      break
+    }
+    case 'escalation_bridge_all_paths_failed': {
+      // Row 12 — unconditional.
+      quad = { failure_class: 'infrastructure_transient', severity: 'critical', transience: 'transient', domain: 'infrastructure' }
+      break
+    }
+    case 'adversarial_finding': {
+      // Rows 13-15.
+      const category = s?.category
+      const severity = _mapSeverityHint(s?.severityHint)
+      if (category === 'correctness') {
+        quad = { failure_class: 'correctness_adversarial_finding', severity, transience: 'permanent', domain: 'system' }
+      } else if (typeof category === 'string' && _CONTRACT_SCOPE_CATEGORIES.has(category)) {
+        quad = { failure_class: 'contract_scope_conformance', severity, transience: 'permanent', domain: 'system' }
+      } else {
+        quad = { failure_class: 'unknown', severity, transience: 'permanent', domain: 'system' }
+      }
+      break
+    }
+    case 'manual':
+    default: {
+      // Row 16 — manual, or any source not recognized above.
+      quad = { ..._UNKNOWN_QUAD }
+      break
+    }
+  }
+
+  return { ...base, ...quad }
+}
