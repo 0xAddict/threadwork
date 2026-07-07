@@ -328,3 +328,67 @@ describe('saveMemory composition boundary — ATM-004 (REQ-003)', () => {
     expect(recordedActive).toBe(true)
   })
 })
+
+describe('supersedeMemory composition boundary — ATM-011 (REQ-008)', () => {
+  // Mirrors ATM-004's mechanism exactly, at the supersedeMemory call site.
+  // [CLOSES finding #4] Never asserts on sanitizeMemoryContent()'s own
+  // signature/arguments — only observes isWriteTxnActive(db) from inside the
+  // spy, on the SAME handle the test holds.
+  let dbPath: string
+  let taskDb: TaskDB
+  let db: Database
+  let sanitizeSpy: ReturnType<typeof spyOn> | undefined
+
+  beforeEach(() => {
+    dbPath = tempDbPath('ordering-atm011')
+    taskDb = new TaskDB(dbPath)
+    taskDb.setFeatureFlag('memory_write_ordering_enabled', true)
+    // Sanitize must be ON too, or supersedeMemoryCritical never reaches the
+    // sanitize call site at all.
+    taskDb.setFeatureFlag('memory_sanitization_enabled', true)
+    db = taskDb.getHandle()
+  })
+
+  afterEach(() => {
+    sanitizeSpy?.mockRestore()
+    sanitizeSpy = undefined
+    cleanupDbFile(dbPath)
+  })
+
+  test('the sanitize call site fires while a P5 write-transaction is open on the same db handle', () => {
+    // `phase` gates which call's invocation of the spy gets recorded, so
+    // `recordedActive` is NEVER directly reassigned in this function's own
+    // straight-line code (only conditionally, inside the closure) — avoiding
+    // a TS control-flow-narrowing trap where an explicit outer-scope reset
+    // (e.g. `recordedActive = undefined`) narrows the variable to the
+    // literal `undefined` type across the subsequent supersedeMemory() call,
+    // even though that call's own (real, runtime) invocation of this closure
+    // does reassign it. Mirrors ATM-004's mechanism, extended to ignore the
+    // preceding saveMemory() call's own hit on the same spy.
+    let phase: 'save' | 'supersede' = 'save'
+    let recordedActive: boolean | undefined
+
+    // Arbitrary pass-through spy — matches P4's (content, {sourceType})
+    // signature exactly, but the SPY intentionally never inspects `db`; it
+    // closes over the outer test's own `db` variable instead.
+    sanitizeSpy = spyOn(memoryIntegrity, 'sanitizeMemoryContent').mockImplementation(
+      (content: string, _opts: { sourceType: string }) => {
+        if (phase === 'supersede') {
+          recordedActive = isWriteTxnActive(db)
+        }
+        return { text: content, neutralized: false }
+      }
+    )
+
+    const mem = new MemoryDB(taskDb)
+    const old = mem.saveMemory({ agent: 'boss', content: 'atm011 old content', category: 'fact' })
+    // saveMemory's own (flag-ON) call also hits the spy above — the `phase`
+    // guard means it never wrote to recordedActive; only supersedeMemory's
+    // invocation of the spy below does.
+    phase = 'supersede'
+
+    mem.supersedeMemory(old.id, 'atm011 new content', 'refinement')
+
+    expect(recordedActive).toBe(true)
+  })
+})

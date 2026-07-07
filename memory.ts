@@ -442,72 +442,159 @@ export class MemoryDB {
   }
 
   supersedeMemory(oldId: number, newContent: string, reason: string): { old: Memory, new: Memory } | null {
-    return this.taskDb.run(db => {
-      const existing = db.prepare('SELECT * FROM memories WHERE id = ?').get(oldId) as Memory | null
-      if (!existing) return null
+    // P5 (ATM-008/REQ-006): CLOSES finding #9 — the feature flag lives on
+    // `this.taskDb` (a TaskDB method), NEVER on the raw `db` handle passed
+    // into a run()/withMemoryWriteTxn() callback, which has no such method.
+    const orderingOn = this.taskDb.isFeatureEnabled('memory_write_ordering_enabled')
+    if (orderingOn) {
+      // P5 (REQ-026/ATM-031): invoked DIRECTLY against taskDb.getHandle() —
+      // never nested inside taskDb.run(db => ...) — so TaskDB.run()'s
+      // reconnect-and-replay can never wrap an open write transaction.
+      return withMemoryWriteTxn(this.taskDb.getHandle(), db => this.supersedeMemoryCritical(db, oldId, newContent, reason, true))
+    }
+    return this.taskDb.run(db => this.supersedeMemoryCritical(db, oldId, newContent, reason, false))
+  }
 
-      const old = db.prepare(`
+  /**
+   * P5 Stage 4 (EPIC-04): the extracted supersedeMemory critical section.
+   * Preserves ALL pre-existing behavior byte-for-byte on the
+   * `orderingOn === false` path (same SELECT, same UNCONDITIONAL old-row
+   * UPDATE with no state guard and no write_seq, same replacement INSERT SQL
+   * text, same P4 sanitize/audit rows, same final memory_superseded audit
+   * row). When `orderingOn` is true:
+   *   - the old-row UPDATE gains `AND state != 'superseded'` (REQ-007) and is
+   *     stamped with a write_seq drawn from nextWriteSeq() (REQ-010/ATM-013);
+   *     if it affects zero rows (already superseded by a prior/concurrent
+   *     call), supersedeMemory returns null WITHOUT running the replacement
+   *     INSERT, after recording a memory_supersede_blocked_duplicate audit
+   *     row (REQ-024/ATM-027);
+   *   - the replacement INSERT is ALSO stamped with its OWN write_seq drawn
+   *     from a SECOND nextWriteSeq() call (REQ-010) — two stamps per
+   *     successful supersede, mirroring saveMemory's INSERT+dedup-UPDATE
+   *     pair (ATM-013's "5 stamps across the 4-operation sequence" count).
+   * The ON/OFF SQL text is intentionally NOT shared so the OFF path never
+   * mentions write_seq or the state guard at all (REQ-022 additive-schema
+   * parity).
+   */
+  private supersedeMemoryCritical(db: Database, oldId: number, newContent: string, reason: string, orderingOn: boolean): { old: Memory, new: Memory } | null {
+    const existing = db.prepare('SELECT * FROM memories WHERE id = ?').get(oldId) as Memory | null
+    if (!existing) return null
+
+    // P5 (ATM-033/REQ-027b): read->write interleave barrier — flag-OFF branch
+    // ONLY, at the exact boundary between the existing-row SELECT above and
+    // the old-row UPDATE below. No-op unless P5_TEST_BARRIER is set. Lives
+    // here in supersedeMemoryCritical (a separate method from
+    // supersedeMemory's withMemoryWriteTxn(...) call expression), so it is
+    // never lexically inside that call — keeping the ATM-033(c) source-level
+    // regression check green. NEVER wired into the orderingOn branch (REQ-027
+    // forbids placing this seam inside a withMemoryWriteTxn()-wrapped path).
+    if (!orderingOn) {
+      waitForBarrier(db, process.env.P5_TEST_BARRIER ?? 'supersede', Number(process.env.P5_BARRIER_COUNT ?? 0))
+    }
+
+    let old: Memory
+    if (orderingOn) {
+      // P5 (ATM-009/REQ-007): state-guarded UPDATE — if the target was
+      // already superseded by a prior or concurrent call, this affects zero
+      // rows. P5 (ATM-013/REQ-010): stamp write_seq on the old-row UPDATE.
+      const seq = nextWriteSeq(db)
+      const guarded = db.prepare(`
+        UPDATE memories SET state = 'superseded', last_validated = datetime('now'), write_seq = ?
+        WHERE id = ? AND state != 'superseded'
+        RETURNING *
+      `).get(seq, oldId) as Memory | undefined
+
+      if (!guarded) {
+        // P5 (ATM-027/REQ-024): duplicate-supersede rejected — audit the
+        // decision, do NOT run the replacement INSERT, return null.
+        db.prepare(`
+          INSERT INTO audit_log (agent, action, detail, memory_id)
+          VALUES ('system', 'memory_supersede_blocked_duplicate', ?, ?)
+        `).run(`target=${oldId} reason=${reason}`, oldId)
+        return null
+      }
+      old = guarded
+    } else {
+      // Unconditional — byte-identical to pre-P5 (REQ-022).
+      old = db.prepare(`
         UPDATE memories SET state = 'superseded', last_validated = datetime('now')
         WHERE id = ?
         RETURNING *
       `).get(oldId) as Memory
+    }
 
-      // P4 (#10376048/ATM-025): flag-gated write-through sanitize for the supersede
-      // path. Flag OFF -> byte-parity with pre-P4 behavior (raw content, hardcoded
-      // state='active', no audit rows beyond the pre-existing memory_superseded one).
-      const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
+    // P4 (#10376048/ATM-025): flag-gated write-through sanitize for the supersede
+    // path. Flag OFF -> byte-parity with pre-P4 behavior (raw content, hardcoded
+    // state='active', no audit rows beyond the pre-existing memory_superseded one).
+    // This call executes on the SAME db handle/transaction instance passed into
+    // this method — when orderingOn, that is the withMemoryWriteTxn() transaction
+    // handle, so P5 wraps this whole (P4-augmented) critical section as one
+    // atomic unit (REQ-008; composition-boundary verified via isWriteTxnActive(),
+    // never by asserting on this call's own signature).
+    const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
 
-      let sr: { text: string; neutralized: boolean; tripped?: string[] } | undefined
-      let effectiveContent = newContent
-      if (sanitizeOn) {
-        sr = sanitizeMemoryContent(newContent, { sourceType: 'agent' })
-        effectiveContent = sr.text
-      }
+    let sr: { text: string; neutralized: boolean; tripped?: string[] } | undefined
+    let effectiveContent = newContent
+    if (sanitizeOn) {
+      sr = sanitizeMemoryContent(newContent, { sourceType: 'agent' })
+      effectiveContent = sr.text
+    }
 
-      // Mirrors saveMemory's agent+foundational->proposed guard, which this path
-      // otherwise bypasses since it hardcodes source_type='agent' and copies
-      // existing.classification straight through.
-      const foundationalDowngrade = sanitizeOn && existing.classification === 'foundational'
-      const state: MemoryState = sanitizeOn && (sr!.neutralized || foundationalDowngrade) ? 'proposed' : 'active'
+    // Mirrors saveMemory's agent+foundational->proposed guard, which this path
+    // otherwise bypasses since it hardcodes source_type='agent' and copies
+    // existing.classification straight through.
+    const foundationalDowngrade = sanitizeOn && existing.classification === 'foundational'
+    const state: MemoryState = sanitizeOn && (sr!.neutralized || foundationalDowngrade) ? 'proposed' : 'active'
 
-      const replacement = db.prepare(`
+    let replacement: Memory
+    if (orderingOn) {
+      // P5 (ATM-013/REQ-010): SECOND nextWriteSeq() call — the old-row
+      // UPDATE and the replacement INSERT each get their OWN stamp.
+      const newSeq = nextWriteSeq(db)
+      replacement = db.prepare(`
+        INSERT INTO memories (agent, content, category, classification, quality, state, source_type, support_count, supersedes_memory_id, write_seq)
+        VALUES (?, ?, ?, ?, 0.5, ?, 'agent', 0, ?, ?)
+        RETURNING *
+      `).get(existing.agent, effectiveContent, existing.category, existing.classification, state, oldId, newSeq) as Memory
+    } else {
+      replacement = db.prepare(`
         INSERT INTO memories (agent, content, category, classification, quality, state, source_type, support_count, supersedes_memory_id)
         VALUES (?, ?, ?, ?, 0.5, ?, 'agent', 0, ?)
         RETURNING *
       `).get(existing.agent, effectiveContent, existing.category, existing.classification, state, oldId) as Memory
+    }
 
-      if (sanitizeOn) {
-        if (sr!.neutralized) {
+    if (sanitizeOn) {
+      if (sr!.neutralized) {
+        db.prepare(`
+          INSERT INTO audit_log (agent, action, detail, memory_id)
+          VALUES ('system', 'memory_content_neutralized', ?, ?)
+        `).run(`tripped=${(sr!.tripped ?? []).join(',')}`, replacement.id)
+
+        // REQ-016 (call-site-agnostic): whenever a forged trust marker is
+        // among the tripped patterns, ALSO emit memory_marker_neutralized —
+        // mirrors saveMemory's ATM-019 audit row for this same signal.
+        if (sr!.tripped?.includes('forged-trust-marker')) {
           db.prepare(`
             INSERT INTO audit_log (agent, action, detail, memory_id)
-            VALUES ('system', 'memory_content_neutralized', ?, ?)
+            VALUES ('system', 'memory_marker_neutralized', ?, ?)
           `).run(`tripped=${(sr!.tripped ?? []).join(',')}`, replacement.id)
-
-          // REQ-016 (call-site-agnostic): whenever a forged trust marker is
-          // among the tripped patterns, ALSO emit memory_marker_neutralized —
-          // mirrors saveMemory's ATM-019 audit row for this same signal.
-          if (sr!.tripped?.includes('forged-trust-marker')) {
-            db.prepare(`
-              INSERT INTO audit_log (agent, action, detail, memory_id)
-              VALUES ('system', 'memory_marker_neutralized', ?, ?)
-            `).run(`tripped=${(sr!.tripped ?? []).join(',')}`, replacement.id)
-          }
-        }
-        if (foundationalDowngrade) {
-          db.prepare(`
-            INSERT INTO audit_log (agent, action, detail, memory_id)
-            VALUES ('system', 'memory_durability_clamped', ?, ?)
-          `).run('superseded foundational -> state proposed', replacement.id)
         }
       }
+      if (foundationalDowngrade) {
+        db.prepare(`
+          INSERT INTO audit_log (agent, action, detail, memory_id)
+          VALUES ('system', 'memory_durability_clamped', ?, ?)
+        `).run('superseded foundational -> state proposed', replacement.id)
+      }
+    }
 
-      db.prepare(`
-        INSERT INTO audit_log (agent, action, detail, memory_id)
-        VALUES ('system', 'memory_superseded', ?, ?)
-      `).run(`${reason} | old=${oldId} new=${replacement.id}`, replacement.id)
+    db.prepare(`
+      INSERT INTO audit_log (agent, action, detail, memory_id)
+      VALUES ('system', 'memory_superseded', ?, ?)
+    `).run(`${reason} | old=${oldId} new=${replacement.id}`, replacement.id)
 
-      return { old, new: replacement }
-    })
+    return { old, new: replacement }
   }
 
   /**

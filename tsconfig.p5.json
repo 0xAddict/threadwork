@@ -29,6 +29,7 @@
     "tests/fixtures/concurrency-barrier.test.ts",
     "tests/memory-ordering-concurrency.test.ts",
     "tests/fixtures/concurrent-save-memory-worker.ts",
-    "tests/fixtures/concurrent-challenge-worker.ts"
+    "tests/fixtures/concurrent-challenge-worker.ts",
+    "tests/fixtures/concurrent-supersede-worker.ts"
   ]
 }

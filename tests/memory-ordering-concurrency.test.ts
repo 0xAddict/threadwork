@@ -27,6 +27,7 @@ import { MemoryDB } from '../memory'
 
 const WORKER_PATH = new URL('./fixtures/concurrent-save-memory-worker.ts', import.meta.url).pathname
 const CHALLENGE_WORKER_PATH = new URL('./fixtures/concurrent-challenge-worker.ts', import.meta.url).pathname
+const SUPERSEDE_WORKER_PATH = new URL('./fixtures/concurrent-supersede-worker.ts', import.meta.url).pathname
 const N = 5
 const SPAWN_TIMEOUT_MS = 30_000
 
@@ -53,6 +54,16 @@ async function spawnWorker(env: Record<string, string>): Promise<number> {
 /** Spawn one concurrent-challenge-worker.ts as a real OS process; resolve its exit code. */
 async function spawnChallengeWorker(env: Record<string, string>): Promise<number> {
   const proc = Bun.spawn(['bun', CHALLENGE_WORKER_PATH], {
+    env: { ...process.env, ...env },
+    stdout: 'inherit',
+    stderr: 'inherit',
+  })
+  return proc.exited
+}
+
+/** Spawn one concurrent-supersede-worker.ts as a real OS process; resolve its exit code. */
+async function spawnSupersedeWorker(env: Record<string, string>): Promise<number> {
+  const proc = Bun.spawn(['bun', SUPERSEDE_WORKER_PATH], {
     env: { ...process.env, ...env },
     stdout: 'inherit',
     stderr: 'inherit',
@@ -275,6 +286,143 @@ describe('ATM-006 — challengeMemory cross-process read-modify-write race', () 
         expect(row.challenge_count).toBe(N)
         expect(row.state).toBe(state)
         expect(row.quality).toBeCloseTo(quality, 5)
+      } finally {
+        readDb.close()
+        cleanupDbFile(dbPath)
+      }
+    },
+    SPAWN_TIMEOUT_MS
+  )
+})
+
+// tests/memory-ordering-concurrency.test.ts — P5 EPIC-04 ATM-010.
+//
+// CROSS-PROCESS concurrency proof for supersedeMemory()'s
+// SELECT->UPDATE(old)->INSERT(new) double-supersede race — mirrors ATM-006's
+// structure exactly, but against a SINGLE seeded memory row that all N
+// workers concurrently attempt to supersede with DISTINCT replacement
+// content (rather than a shared challenge).
+//
+// (a) CONTROL — flag OFF (unguarded UPDATE, per REQ-022). Workers rendezvous
+//     at the read->write barrier (waitForBarrier, wired into
+//     supersedeMemory()'s unwrapped flag-OFF branch) so all 5 complete their
+//     existing-row SELECT before any performs its old-row UPDATE —
+//     deterministically reproducing the pre-P5 double-supersede race.
+//     Asserts MORE THAN ONE row with supersedes_memory_id = id (the race is
+//     real and the harness can detect it, not passing by scheduling luck).
+//
+// (b) FIX — flag ON. Workers rendezvous at the pre-transaction start gate
+//     (waitForStartGate, called from the worker script immediately before
+//     invoking supersedeMemory()) so all 5 hit BEGIN IMMEDIATE at
+//     approximately the same instant — real multi-process contention on the
+//     P5 lock + the REQ-007 state guard. Asserts exactly ONE row with
+//     supersedes_memory_id = id (not up to N), and the original row's
+//     state === 'superseded' exactly once (not corrupted by a second
+//     UPDATE).
+
+describe('ATM-010 — supersedeMemory cross-process double-supersede race', () => {
+  test(
+    '(a) CONTROL — flag OFF, barrier-forced interleave reproduces the double-supersede race (> 1 replacement row)',
+    async () => {
+      const dbPath = tempDbPath('atm010-control')
+      const seedDb = new TaskDB(dbPath)
+      // memory_write_ordering_enabled defaults to 0 (seeded OFF) — no explicit
+      // flag write needed for the CONTROL run.
+      const seedMem = new MemoryDB(seedDb)
+      const seeded = seedMem.saveMemory({
+        agent: 'boss',
+        content: `atm010-control-seed-${crypto.randomUUID()}`,
+        category: 'fact',
+      })
+      seedDb.close()
+
+      const runId = crypto.randomUUID()
+      const barrierName = `supersede-${runId}`
+
+      const exitCodes = await Promise.all(
+        Array.from({ length: N }, (_, i) =>
+          spawnSupersedeWorker({
+            DB_PATH: dbPath,
+            AGENT_LABEL: `worker-${i}`,
+            OLD_ID: String(seeded.id),
+            WORKER_CONTENT: `atm010-control-replacement-${i}-${runId}`,
+            P5_TEST_BARRIER: barrierName,
+            P5_BARRIER_COUNT: String(N),
+          })
+        )
+      )
+      for (const code of exitCodes) expect(code).toBe(0)
+
+      const readDb = new Database(dbPath, { readonly: true })
+      try {
+        const row = readDb
+          .prepare('SELECT COUNT(*) as c FROM memories WHERE supersedes_memory_id = ?')
+          .get(seeded.id) as { c: number }
+        // The barrier reproduced the pre-P5 double-supersede race on demand —
+        // this assertion is PART of pass/fail, not a comment (ATM-010a).
+        expect(row.c).toBeGreaterThan(1)
+      } finally {
+        readDb.close()
+        cleanupDbFile(dbPath)
+      }
+    },
+    SPAWN_TIMEOUT_MS
+  )
+
+  test(
+    '(b) FIX — flag ON, start-gate-synchronized contention yields exactly ONE replacement row, original superseded exactly once',
+    async () => {
+      const dbPath = tempDbPath('atm010-fix')
+      const seedDb = new TaskDB(dbPath)
+      seedDb.setFeatureFlag('memory_write_ordering_enabled', true)
+      const seedMem = new MemoryDB(seedDb)
+      const seeded = seedMem.saveMemory({
+        agent: 'boss',
+        content: `atm010-fix-seed-${crypto.randomUUID()}`,
+        category: 'fact',
+      })
+      seedDb.close()
+
+      const runId = crypto.randomUUID()
+      const gateName = `supersede-fix-${runId}`
+
+      const exitCodes = await Promise.all(
+        Array.from({ length: N }, (_, i) =>
+          spawnSupersedeWorker({
+            DB_PATH: dbPath,
+            AGENT_LABEL: `worker-${i}`,
+            OLD_ID: String(seeded.id),
+            WORKER_CONTENT: `atm010-fix-replacement-${i}-${runId}`,
+            P5_TEST_START_GATE: gateName,
+            P5_GATE_COUNT: String(N),
+          })
+        )
+      )
+      for (const code of exitCodes) expect(code).toBe(0)
+
+      const readDb = new Database(dbPath, { readonly: true })
+      try {
+        const replacementRows = readDb
+          .prepare('SELECT id FROM memories WHERE supersedes_memory_id = ?')
+          .all(seeded.id) as Array<{ id: number }>
+        // Exactly ONE row (not up to N) — ATM-010(b)'s core assertion.
+        expect(replacementRows).toHaveLength(1)
+
+        const originalRow = readDb
+          .prepare('SELECT state FROM memories WHERE id = ?')
+          .get(seeded.id) as { state: string }
+        // The original row's state is 'superseded' exactly once — not
+        // corrupted by a second concurrent UPDATE.
+        expect(originalRow.state).toBe('superseded')
+
+        // Bonus check on REQ-024's audit contract under real concurrency:
+        // the N-1 workers that lost the BEGIN IMMEDIATE race each hit the
+        // REQ-007 state guard and were rejected, each writing exactly one
+        // memory_supersede_blocked_duplicate audit row.
+        const blockedCount = readDb
+          .prepare("SELECT COUNT(*) as c FROM audit_log WHERE action = 'memory_supersede_blocked_duplicate' AND memory_id = ?")
+          .get(seeded.id) as { c: number }
+        expect(blockedCount.c).toBe(N - 1)
       } finally {
         readDb.close()
         cleanupDbFile(dbPath)

@@ -1062,3 +1062,107 @@ describe('P5 EPIC-03 — challengeMemory write-ordering (ATM-005/ATM-007)', () =
     expect(row.state).toBe('active')
   })
 })
+
+// --- P5 EPIC-04 (ATM-008/ATM-009/ATM-027): supersedeMemory write-ordering wiring ---
+describe('P5 EPIC-04 — supersedeMemory write-ordering (ATM-008/ATM-009/ATM-027)', () => {
+  let dbPathOn: string
+  let taskDbOn: TaskDB
+  let memOn: MemoryDB
+
+  beforeEach(() => {
+    dbPathOn = tempP5DbPath('supersede-atm008-on')
+    taskDbOn = new TaskDB(dbPathOn)
+    taskDbOn.setFeatureFlag('memory_write_ordering_enabled', true)
+    memOn = new MemoryDB(taskDbOn)
+  })
+
+  afterEach(() => {
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(dbPathOn + suffix) } catch {}
+    }
+  })
+
+  function auditRowsOn(action: string): Array<{ agent: string; action: string; detail: string; memory_id: number }> {
+    return taskDbOn.getHandle().prepare(
+      'SELECT agent, action, detail, memory_id FROM audit_log WHERE action = ? ORDER BY id'
+    ).all(action) as Array<{ agent: string; action: string; detail: string; memory_id: number }>
+  }
+
+  test('ATM-008: flag ON — a single supersedeMemory() call still returns the same {old, new} shape as pre-P5', () => {
+    const old = memOn.saveMemory({ agent: 'boss', content: 'atm008 old fact', category: 'fact' })
+    const result = memOn.supersedeMemory(old.id, 'atm008 new fact', 'updated info')
+
+    expect(result).not.toBeNull()
+    expect(result!.old.id).toBe(old.id)
+    expect(result!.old.state).toBe('superseded')
+    expect(result!.new.content).toBe('atm008 new fact')
+    expect(result!.new.supersedes_memory_id).toBe(old.id)
+    expect(result!.new.agent).toBe('boss')
+    expect(result!.new.category).toBe('fact')
+    expect(result!.new.classification).toBe(old.classification)
+    // P5-additive column: stamped when the flag is ON (REQ-010/ATM-013).
+    expect(result!.old.write_seq).not.toBeNull()
+    expect(result!.new.write_seq).not.toBeNull()
+  })
+
+  test('ATM-009: sequential double-supersede on the SAME id — first succeeds, second returns null, exactly one replacement row', () => {
+    const old = memOn.saveMemory({ agent: 'boss', content: 'atm009 old fact', category: 'fact' })
+
+    const first = memOn.supersedeMemory(old.id, 'A', 'r1')
+    expect(first).not.toBeNull()
+    expect(first!.old.state).toBe('superseded')
+
+    const second = memOn.supersedeMemory(old.id, 'B', 'r2')
+    expect(second).toBeNull()
+
+    const row = taskDbOn.getHandle().prepare(
+      'SELECT COUNT(*) as c FROM memories WHERE supersedes_memory_id = ?'
+    ).get(old.id) as { c: number }
+    expect(row.c).toBe(1)
+  })
+
+  test('ATM-027: the rejected second supersede writes exactly one memory_supersede_blocked_duplicate audit row, memory_id = target id', () => {
+    const old = memOn.saveMemory({ agent: 'boss', content: 'atm027 old fact', category: 'fact' })
+
+    const first = memOn.supersedeMemory(old.id, 'A', 'r1')
+    expect(first).not.toBeNull()
+    expect(auditRowsOn('memory_supersede_blocked_duplicate')).toHaveLength(0)
+
+    const second = memOn.supersedeMemory(old.id, 'B', 'r2')
+    expect(second).toBeNull()
+
+    const rows = auditRowsOn('memory_supersede_blocked_duplicate')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].memory_id).toBe(old.id)
+  })
+
+  test('flag OFF: sequential double-supersede is byte-parity with pre-P5 — no state guard, both calls succeed, two replacement rows', () => {
+    const dbPathOff = tempP5DbPath('supersede-atm008-off')
+    const taskDbOff = new TaskDB(dbPathOff)
+    const memOff = new MemoryDB(taskDbOff)
+
+    try {
+      const old = memOff.saveMemory({ agent: 'boss', content: 'atm008 off old fact', category: 'fact' })
+
+      const first = memOff.supersedeMemory(old.id, 'A', 'r1')
+      expect(first).not.toBeNull()
+      expect(first!.old.write_seq).toBeNull()
+      expect(first!.new.write_seq).toBeNull()
+
+      // Flag OFF: the old-row UPDATE is unconditional (REQ-022) — a SECOND
+      // supersede of the same (already-superseded) id still succeeds and
+      // creates a SECOND replacement row, unlike the flag-ON guarded path.
+      const second = memOff.supersedeMemory(old.id, 'B', 'r2')
+      expect(second).not.toBeNull()
+
+      const row = taskDbOff.getHandle().prepare(
+        'SELECT COUNT(*) as c FROM memories WHERE supersedes_memory_id = ?'
+      ).get(old.id) as { c: number }
+      expect(row.c).toBe(2)
+    } finally {
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { unlinkSync(dbPathOff + suffix) } catch {}
+      }
+    }
+  })
+})
