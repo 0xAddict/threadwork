@@ -38,7 +38,7 @@ import {
 } from './delegation-brief'
 import { AuditLog } from './audit'
 import { MemoryConsolidator } from './consolidator'
-import { sendDirectedMessage, pollDirectedMessages, ackDirectedMessage, directedMessagingDisabledError } from './agent-messages'
+import { handleSendDirectedMessageTool, handlePollDirectedMessagesTool, handleAckDirectedMessageTool } from './agent-messages'
 import { MSG_TYPES } from './agent-message-types'
 
 const db = new TaskDB(DB_PATH)
@@ -1087,28 +1087,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case 'send_directed_message': {
-        // ATM-029 (Stage 7) gates this same flag for poll/ack too; Stage 6
-        // wires the flag-gate for send only. Mirrors the existing tool-error
-        // shape used elsewhere in server.ts (e.g. nudge_agent's failure
-        // branch above) rather than throwing or silently no-opping.
-        if (!db.isFeatureEnabled('directed_messaging_enabled')) {
-          return { content: [{ type: 'text', text: 'directed messaging is disabled', isError: true }] }
-        }
-
-        // ATM-024 (P3/REQ-020, Stage 7): OPTIONAL best-effort wake nudge,
-        // fired only AFTER sendDirectedMessage()'s transaction has committed
-        // (see that function's onSent doc comment). DEFAULT OFF — when the
-        // flag is off, no onSent callback is constructed at all, so the call
-        // below is byte-identical to Stage 6's 3-arg call.
+        // R2-4 (REQ-023/ATM-029): the flag-gate + core-call + response
+        // formatting all live in agent-messages.ts's
+        // handleSendDirectedMessageTool (pure, directly unit-testable
+        // without importing server.ts). server.ts's only remaining
+        // responsibility is building the ATM-024 (P3/REQ-020) optional
+        // best-effort nudge-on-send hook — dispatchAgentNudge/nudge.ts is a
+        // server.ts-only concern, DI'd in via `opts` exactly as before, so
+        // agent-messages.ts never needs to import nudge.ts.
         const nudgeOnSend = db.isFeatureEnabled('directed_messaging_nudge_on_send')
-        const row = sendDirectedMessage(
+        return handleSendDirectedMessageTool(
           db,
           SELF_LABEL,
-          {
-            recipient: args.recipient as string,
-            msg_type: args.msg_type as string,
-            payload: args.payload,
-          },
+          args,
           nudgeOnSend
             ? {
                 onSent: (sentRow) => {
@@ -1127,32 +1118,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               }
             : undefined,
         )
-
-        return { content: [{ type: 'text', text: `Message #${row.id} sent to ${row.recipient} (type: ${row.msg_type}, seq: ${row.seq}).` }] }
       }
 
       case 'poll_directed_messages': {
-        // ATM-029/REQ-023: same flag as send_directed_message.
-        if (!db.isFeatureEnabled('directed_messaging_enabled')) {
-          return directedMessagingDisabledError()
-        }
-
-        const rows = pollDirectedMessages(db, SELF_LABEL, {
-          sinceSeq: typeof args.sinceSeq === 'number' ? (args.sinceSeq as number) : undefined,
-          includeDelivered: args.includeDelivered === true,
-        })
-
-        return { content: [{ type: 'text', text: JSON.stringify(rows) }] }
+        // R2-4 (REQ-023/ATM-029): see handleSendDirectedMessageTool comment
+        // above — same extraction for poll.
+        return handlePollDirectedMessagesTool(db, SELF_LABEL, args)
       }
 
       case 'ack_directed_message': {
-        // ATM-029/REQ-023: same flag as send_directed_message.
-        if (!db.isFeatureEnabled('directed_messaging_enabled')) {
-          return directedMessagingDisabledError()
-        }
-
-        const result = ackDirectedMessage(db, SELF_LABEL, args.message_id as number)
-        return { content: [{ type: 'text', text: `Message #${args.message_id} ack result: ${result.status}` }] }
+        // R2-4 (REQ-023/ATM-029): see handleSendDirectedMessageTool comment
+        // above — same extraction for ack.
+        return handleAckDirectedMessageTool(db, SELF_LABEL, args)
       }
 
       case 'save_memory': {

@@ -1159,6 +1159,45 @@ describe('P5 EPIC-04 — supersedeMemory write-ordering (ATM-008/ATM-009/ATM-027
     expect(rows[0].memory_id).toBe(old.id)
   })
 
+  // ---------------------------------------------------------------------
+  // R2-2 (codex round 2, GENUINE HIGH): a guard-blocked (duplicate)
+  // supersede mutates NOTHING, so it is NOT a mutating operation and MUST
+  // consume NO nextWriteSeq() call — REQ-011 requires write_sequence to
+  // contain EXACTLY N rows for N mutating operations. The pre-fix code
+  // minted a seq via nextWriteSeq() BEFORE running the guarded UPDATE, so a
+  // blocked duplicate still inserted a write_sequence row with no
+  // corresponding memories stamp (a phantom ledger row).
+  // ---------------------------------------------------------------------
+  test('R2-2: a successful supersede followed by a blocked duplicate grows write_sequence by EXACTLY 2 (not 3 — no phantom row) and both old+new rows are stamped', () => {
+    const writeSequenceCount = () =>
+      (taskDbOn.getHandle().prepare('SELECT COUNT(*) as c FROM write_sequence').get() as { c: number }).c
+
+    const old = memOn.saveMemory({ agent: 'boss', content: 'r2-2 old fact', category: 'fact' })
+    const countBefore = writeSequenceCount()
+
+    const first = memOn.supersedeMemory(old.id, 'A', 'r1')
+    expect(first).not.toBeNull()
+    expect(first!.old.write_seq).not.toBeNull()
+    expect(first!.new.write_seq).not.toBeNull()
+
+    // Successful supersede = 2 stamps (old-row UPDATE + new-row INSERT).
+    expect(writeSequenceCount() - countBefore).toBe(2)
+
+    // Duplicate supersede on the now-already-superseded id — guard blocks
+    // it, zero rows mutated, MUST consume zero additional nextWriteSeq()
+    // calls.
+    const second = memOn.supersedeMemory(old.id, 'B', 'r2')
+    expect(second).toBeNull()
+
+    const rows = auditRowsOn('memory_supersede_blocked_duplicate')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].memory_id).toBe(old.id)
+
+    // The blocked duplicate added NOTHING to write_sequence — total delta
+    // since countBefore remains EXACTLY 2, never 3 (no phantom row).
+    expect(writeSequenceCount() - countBefore).toBe(2)
+  })
+
   test('flag OFF: sequential double-supersede is byte-parity with pre-P5 — no state guard, both calls succeed, two replacement rows', () => {
     const dbPathOff = tempP5DbPath('supersede-atm008-off')
     const taskDbOff = new TaskDB(dbPathOff)

@@ -462,12 +462,18 @@ export class MemoryDB {
    * UPDATE with no state guard and no write_seq, same replacement INSERT SQL
    * text, same P4 sanitize/audit rows, same final memory_superseded audit
    * row). When `orderingOn` is true:
-   *   - the old-row UPDATE gains `AND state != 'superseded'` (REQ-007) and is
-   *     stamped with a write_seq drawn from nextWriteSeq() (REQ-010/ATM-013);
-   *     if it affects zero rows (already superseded by a prior/concurrent
-   *     call), supersedeMemory returns null WITHOUT running the replacement
-   *     INSERT, after recording a memory_supersede_blocked_duplicate audit
-   *     row (REQ-024/ATM-027);
+   *   - [R2-2 FIX, REQ-011] the guarded old-row UPDATE (`AND state !=
+   *     'superseded'`, REQ-007) runs FIRST and does NOT itself consume a
+   *     nextWriteSeq() call; if it affects zero rows (already superseded by
+   *     a prior/concurrent call), supersedeMemory returns null WITHOUT
+   *     running the replacement INSERT and WITHOUT ever having called
+   *     nextWriteSeq(), after recording a memory_supersede_blocked_duplicate
+   *     audit row (REQ-024/ATM-027) — a guard-blocked supersede mutates
+   *     nothing, so it must consume ZERO write_sequence rows (REQ-011: N
+   *     mutating operations => exactly N rows, not N+1 phantom rows);
+   *   - only once the guard has matched (we own the supersede) is a
+   *     write_seq minted via nextWriteSeq() and stamped onto the old row via
+   *     a SEPARATE UPDATE (REQ-010/ATM-013);
    *   - the replacement INSERT is ALSO stamped with its OWN write_seq drawn
    *     from a SECOND nextWriteSeq() call (REQ-010) — two stamps per
    *     successful supersede, mirroring saveMemory's INSERT+dedup-UPDATE
@@ -496,24 +502,41 @@ export class MemoryDB {
     if (orderingOn) {
       // P5 (ATM-009/REQ-007): state-guarded UPDATE — if the target was
       // already superseded by a prior or concurrent call, this affects zero
-      // rows. P5 (ATM-013/REQ-010): stamp write_seq on the old-row UPDATE.
-      const seq = nextWriteSeq(db)
+      // rows. [R2-2 FIX, REQ-011] The guard runs FIRST, WITHOUT consuming a
+      // write_seq — a guard-blocked supersede mutates NOTHING, so it is NOT
+      // a mutating operation and MUST NOT mint a nextWriteSeq() row. The
+      // prior ordering called nextWriteSeq() before this guarded UPDATE,
+      // so a blocked duplicate still inserted a phantom write_sequence row
+      // with no corresponding memories stamp, violating REQ-011's "exactly
+      // N rows for N mutating operations."
       const guarded = db.prepare(`
-        UPDATE memories SET state = 'superseded', last_validated = datetime('now'), write_seq = ?
+        UPDATE memories SET state = 'superseded', last_validated = datetime('now')
         WHERE id = ? AND state != 'superseded'
         RETURNING *
-      `).get(seq, oldId) as Memory | undefined
+      `).get(oldId) as Memory | undefined
 
       if (!guarded) {
         // P5 (ATM-027/REQ-024): duplicate-supersede rejected — audit the
-        // decision, do NOT run the replacement INSERT, return null.
+        // decision (audit_log has no write_seq column, so no seq is
+        // consumed here either), do NOT run the replacement INSERT, and —
+        // critically — NEVER call nextWriteSeq() on this path (R2-2).
         db.prepare(`
           INSERT INTO audit_log (agent, action, detail, memory_id)
           VALUES ('system', 'memory_supersede_blocked_duplicate', ?, ?)
         `).run(`target=${oldId} reason=${reason}`, oldId)
         return null
       }
-      old = guarded
+
+      // We own the supersede (the guard matched) — NOW, and only now, mint
+      // this old-row's write_seq stamp via its own nextWriteSeq() call
+      // (ATM-013/REQ-010), on a separate UPDATE from the guard above so the
+      // guard itself never touches write_seq.
+      const seq = nextWriteSeq(db)
+      old = db.prepare(`
+        UPDATE memories SET write_seq = ?
+        WHERE id = ?
+        RETURNING *
+      `).get(seq, oldId) as Memory
     } else {
       // Unconditional — byte-identical to pre-P5 (REQ-022).
       old = db.prepare(`

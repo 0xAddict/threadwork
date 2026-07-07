@@ -20,6 +20,9 @@ import {
   pollDirectedMessages,
   ackDirectedMessage,
   directedMessagingDisabledError,
+  handleSendDirectedMessageTool,
+  handlePollDirectedMessagesTool,
+  handleAckDirectedMessageTool,
   type AgentMessageRow,
 } from '../agent-messages'
 import { MSG_TYPES, isValidMsgType } from '../agent-message-types'
@@ -199,6 +202,114 @@ describe('ATM-017 — payload JSON validation', () => {
   test('a plain-object payload succeeds and round-trips through JSON.parse', () => {
     const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { a: 1, b: 'x' } })
     expect(JSON.parse(row.payload)).toEqual({ a: 1, b: 'x' })
+  })
+
+  // -------------------------------------------------------------------------
+  // R2-1 (codex round 2, GENUINE HIGH): the throwing-replacer approach only
+  // rejects nested function/symbol/undefined. It still ACCEPTS non-plain
+  // LOSSY values whose JSON round-trip silently mangles the data — REQ-014
+  // requires rejecting ANY "non-plain value" whose JSON round-trip is lossy,
+  // not merely the three JSON.stringify already refuses to serialize.
+  // -------------------------------------------------------------------------
+
+  test('a nested Map value is rejected and no row is inserted (JSON.stringify would lossily emit {})', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { m: new Map([['a', 1]]) } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('a nested Set value is rejected and no row is inserted (JSON.stringify would lossily emit {})', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { s: new Set([1]) } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('a nested RegExp value is rejected and no row is inserted (JSON.stringify would lossily emit {})', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { r: /re/ } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('a nested Error value is rejected and no row is inserted (JSON.stringify would lossily emit {})', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { e: new Error('x') } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('a NaN number value is rejected and no row is inserted (JSON.stringify would silently emit null)', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { n: NaN } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('an Infinity number value is rejected and no row is inserted (JSON.stringify would silently emit null)', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { n: Infinity } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('a -Infinity number value is rejected and no row is inserted (JSON.stringify would silently emit null)', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { n: -Infinity } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('a nested Date value is rejected and no row is inserted (JSON.stringify would silently type-change it to an ISO string)', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { d: new Date() } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('a nested BigInt value is rejected and no row is inserted', () => {
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { b: 10n } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('a class instance (non-plain prototype) is rejected and no row is inserted (JSON.stringify would emit a partial plain object)', () => {
+    class Foo { constructor(public x: number) {} }
+    expect(() => {
+      sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { f: new Foo(1) } })
+    }).toThrow()
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(0)
+  })
+
+  test('a deep plain payload is accepted and round-trips exactly through JSON.parse', () => {
+    const payload = { a: 1, b: 'x', c: true, d: null, e: [1, 2, { f: 3.5 }], g: { h: false } }
+    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload })
+    expect(JSON.parse(row.payload)).toEqual(payload)
+
+    const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(1)
   })
 })
 
@@ -724,29 +835,137 @@ describe('ATM-024 — optional post-commit onSent hook (P3, nudge-on-send)', () 
   })
 })
 
-describe('ATM-029 — directedMessagingDisabledError helper + tool-handler flag-gate presence', () => {
+describe('ATM-029 — directed-messaging tool handlers actually enforce the disabled gate (INVOCATION, not source-grep)', () => {
+  // [R2-4 FIX, codex round-2 GENUINE HIGH] The PREVIOUS version of this
+  // block only grepped server.ts's source text for the literal string
+  // `isFeatureEnabled('directed_messaging_enabled')` near each `case`
+  // block — that proves the string is PRESENT, never that the flag
+  // actually gates behavior at runtime (a handler could parse the flag and
+  // then ignore it, or the check could sit in dead code, and the grep
+  // would still pass). This rewrite INVOKES the extracted pure wrappers
+  // (handleSendDirectedMessageTool / handlePollDirectedMessagesTool /
+  // handleAckDirectedMessageTool, imported from '../agent-messages' —
+  // NEVER '../server') directly, with a real TaskDB, and asserts both the
+  // returned shape AND zero database mutation.
+
+  let dbPath: string
+  let taskDb: TaskDB
+  let db: Database
+
+  beforeEach(() => {
+    dbPath = tempDbPath('agentmsg-atm029')
+    taskDb = new TaskDB(dbPath)
+    db = taskDb.getHandle()
+  })
+
+  afterEach(() => {
+    cleanupDbFile(dbPath)
+  })
+
+  function agentMessagesCount(): number {
+    return (db.prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+  }
+
   test('directedMessagingDisabledError() returns the exact structured disabled-error shape', () => {
     expect(directedMessagingDisabledError()).toEqual({
       content: [{ type: 'text', text: 'directed messaging is disabled', isError: true }],
     })
   })
 
-  test('source-level: send_directed_message, poll_directed_messages, and ack_directed_message all gate on directed_messaging_enabled', () => {
-    const serverSrc = readFileSync(resolve(__dirname, '..', 'server.ts'), 'utf-8')
+  test('flag OFF (default): handleSendDirectedMessageTool returns the structured disabled-error and inserts zero rows', () => {
+    // directed_messaging_enabled is never set on this fresh TaskDB, so
+    // isFeatureEnabled() returns false (db.ts default-OFF semantics).
+    const before = agentMessagesCount()
 
-    for (const caseName of ['send_directed_message', 'poll_directed_messages', 'ack_directed_message']) {
-      const caseIdx = serverSrc.indexOf(`case '${caseName}':`)
-      expect(caseIdx).toBeGreaterThan(-1)
+    const result = handleSendDirectedMessageTool(taskDb, 'boss', {
+      recipient: 'steve',
+      msg_type: 'status_update',
+      payload: { ok: true },
+    })
 
-      // The flag-check must appear reasonably close to (i.e. as one of the
-      // first statements inside) this case block — not merely anywhere in
-      // the file.
-      const nextCaseIdx = serverSrc.indexOf("\n      case '", caseIdx + 1)
-      const blockEnd = nextCaseIdx === -1 ? caseIdx + 1000 : nextCaseIdx
-      const block = serverSrc.slice(caseIdx, blockEnd)
+    expect(result.content).toHaveLength(1)
+    expect(result.content[0].isError).toBe(true)
+    expect(result.content[0].text.toLowerCase()).toContain('disabled')
+    expect(agentMessagesCount()).toBe(before)
+  })
 
-      expect(block.includes("isFeatureEnabled('directed_messaging_enabled')")).toBe(true)
+  test('flag OFF (default): handlePollDirectedMessagesTool returns the structured disabled-error and mutates zero rows', () => {
+    // Seed one pending row directly (bypassing the flag) so a real mutation
+    // would be observable if the gate failed to hold.
+    db.prepare(`
+      INSERT INTO agent_messages (sender, recipient, msg_type, payload, seq)
+      VALUES ('sadie', 'boss', 'status_update', '{}', 1)
+    `).run()
+    const before = db.prepare("SELECT status FROM agent_messages").all() as Array<{ status: string }>
+
+    const result = handlePollDirectedMessagesTool(taskDb, 'boss', {})
+
+    expect(result.content).toHaveLength(1)
+    expect(result.content[0].isError).toBe(true)
+    expect(result.content[0].text.toLowerCase()).toContain('disabled')
+
+    const after = db.prepare("SELECT status FROM agent_messages").all() as Array<{ status: string }>
+    expect(after).toEqual(before)
+    expect(after.every((r) => r.status === 'pending')).toBe(true)
+  })
+
+  test('flag OFF (default): handleAckDirectedMessageTool returns the structured disabled-error and mutates zero rows', () => {
+    const seeded = db.prepare(`
+      INSERT INTO agent_messages (sender, recipient, msg_type, payload, seq, status)
+      VALUES ('sadie', 'boss', 'status_update', '{}', 1, 'delivered')
+      RETURNING *
+    `).get() as AgentMessageRow
+
+    const result = handleAckDirectedMessageTool(taskDb, 'boss', { message_id: seeded.id })
+
+    expect(result.content).toHaveLength(1)
+    expect(result.content[0].isError).toBe(true)
+    expect(result.content[0].text.toLowerCase()).toContain('disabled')
+
+    const row = db.prepare('SELECT status, acked_at FROM agent_messages WHERE id = ?').get(seeded.id) as {
+      status: string
+      acked_at: string | null
     }
+    expect(row.status).toBe('delivered')
+    expect(row.acked_at).toBeNull()
+  })
+
+  test('flag ON: handleSendDirectedMessageTool returns a success content block (smoke)', () => {
+    taskDb.setFeatureFlag('directed_messaging_enabled', true)
+
+    const result = handleSendDirectedMessageTool(taskDb, 'boss', {
+      recipient: 'steve',
+      msg_type: 'status_update',
+      payload: { ok: true },
+    })
+
+    expect(result.content).toHaveLength(1)
+    expect(result.content[0].isError).toBeUndefined()
+    expect(result.content[0].text).toContain('sent to steve')
+    expect(agentMessagesCount()).toBe(1)
+  })
+
+  test('flag ON: handlePollDirectedMessagesTool and handleAckDirectedMessageTool return success content blocks (smoke)', () => {
+    taskDb.setFeatureFlag('directed_messaging_enabled', true)
+
+    const sent = handleSendDirectedMessageTool(taskDb, 'boss', {
+      recipient: 'steve',
+      msg_type: 'status_update',
+      payload: {},
+    })
+    expect(sent.content[0].isError).toBeUndefined()
+
+    const polled = handlePollDirectedMessagesTool(taskDb, 'steve', {})
+    expect(polled.content).toHaveLength(1)
+    expect(polled.content[0].isError).toBeUndefined()
+    const rows = JSON.parse(polled.content[0].text) as AgentMessageRow[]
+    expect(rows).toHaveLength(1)
+    expect(rows[0].status).toBe('delivered')
+
+    const acked = handleAckDirectedMessageTool(taskDb, 'steve', { message_id: rows[0].id })
+    expect(acked.content).toHaveLength(1)
+    expect(acked.content[0].isError).toBeUndefined()
+    expect(acked.content[0].text).toContain('acked')
   })
 })
 

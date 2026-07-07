@@ -58,6 +58,121 @@ export interface SendDirectedMessageOptions {
 }
 
 /**
+ * R2-1 (REQ-014/ATM-017, codex round 2 GENUINE HIGH finding): strict
+ * recursive structural deep-check. A `JSON.stringify` round-trip is
+ * LOSSLESS only for a closed set of value shapes — this function ACCEPTS
+ * exactly that set and REJECTS everything else, including several values a
+ * bare `JSON.stringify()` accepts without throwing but mangles silently:
+ *
+ *   - `Map` / `Set` / a class instance -> serializes to `{}` or a partial
+ *     plain object (own enumerable data properties only; methods and
+ *     internal slots are dropped).
+ *   - `RegExp` -> serializes to `{}` (the source/flags are dropped).
+ *   - `Error` -> serializes to `{}` (message/stack are non-enumerable).
+ *   - `NaN` / `Infinity` / `-Infinity` -> silently coerced to `null`.
+ *   - `Date` -> silently TYPE-CHANGES to an ISO string.
+ *
+ * Accepted (recursively): `null`, `string`, `boolean`, a FINITE `number`, a
+ * plain `Array` (every element recursively accepted), and a plain `Object`
+ * — prototype is `Object.prototype` or `null` (an `Object.create(null)`
+ * object), no symbol-keyed own properties, every value recursively
+ * accepted.
+ *
+ * Rejected: `function`, `symbol`, `undefined`, a non-finite `number`
+ * (`NaN`/`±Infinity`), `BigInt`, any value whose prototype is not
+ * `Object.prototype`/`null` (this catches `Map`/`Set`/`RegExp`/`Date`/
+ * `Error`/any custom class instance uniformly), a symbol-keyed property,
+ * and a circular reference (an ancestor object/array re-appearing as its
+ * own descendant — tracked via a per-call `WeakSet` of currently-open
+ * ancestors, so this ALSO subsumes the classic circular-ref case without a
+ * separate check).
+ *
+ * `Date` is INTENTIONALLY rejected — this is a deliberate strict
+ * plain-only reading of REQ-014's "reject any non-plain value whose JSON
+ * round-trip is lossy" (a `Date` -> string type-change IS a lossy,
+ * unrequested transformation of the caller's data). Callers that want to
+ * persist a timestamp MUST pass an ISO string themselves
+ * (`someDate.toISOString()`) rather than a live `Date` instance.
+ *
+ * Every rejection throws an `Error` naming the offending JSON-path (e.g.
+ * `$.a.b[2]`) and the value's runtime type/tag, so callers can locate the
+ * bad value without a debugger.
+ */
+export function assertJsonPlain(value: unknown, path = '$', seen: WeakSet<object> = new WeakSet()): void {
+  if (value === null) return
+
+  const t = typeof value
+  if (t === 'string' || t === 'boolean') return
+
+  if (t === 'number') {
+    if (!Number.isFinite(value as number)) {
+      throw new Error(
+        `sendDirectedMessage: payload contains a non-finite number (${String(value)}) at path ${path} — ` +
+        `JSON has no representation for NaN/Infinity/-Infinity (JSON.stringify would silently emit "null")`
+      )
+    }
+    return
+  }
+
+  if (t === 'undefined') {
+    throw new Error(`sendDirectedMessage: payload contains undefined at path ${path}`)
+  }
+  if (t === 'function') {
+    throw new Error(`sendDirectedMessage: payload contains a function at path ${path}`)
+  }
+  if (t === 'symbol') {
+    throw new Error(`sendDirectedMessage: payload contains a symbol at path ${path}`)
+  }
+  if (t === 'bigint') {
+    throw new Error(
+      `sendDirectedMessage: payload contains a BigInt (${String(value)}) at path ${path} — ` +
+      `JSON.stringify cannot serialize BigInt; convert to a Number or String first`
+    )
+  }
+
+  // t === 'object' from here on ('null' was already handled above).
+  const obj = value as object
+
+  if (seen.has(obj)) {
+    throw new Error(`sendDirectedMessage: payload contains a circular reference at path ${path}`)
+  }
+
+  if (Array.isArray(obj)) {
+    seen.add(obj)
+    const arr = obj as unknown[]
+    for (let i = 0; i < arr.length; i++) {
+      assertJsonPlain(arr[i], `${path}[${i}]`, seen)
+    }
+    seen.delete(obj)
+    return
+  }
+
+  const proto = Object.getPrototypeOf(obj)
+  if (proto !== Object.prototype && proto !== null) {
+    // Uniformly catches Map/Set/RegExp/Date/Error/any custom class instance
+    // — anything whose prototype chain isn't the plain-object baseline.
+    const tag = Object.prototype.toString.call(obj)
+    const ctorName = (obj as { constructor?: { name?: string } })?.constructor?.name ?? 'unknown'
+    throw new Error(
+      `sendDirectedMessage: payload contains a non-plain value (${tag}, constructor=${ctorName}) at path ${path} — ` +
+      `only plain objects/arrays/strings/booleans/finite numbers/null round-trip losslessly through JSON. ` +
+      `If this is a Date, pass its .toISOString() value instead.`
+    )
+  }
+
+  const symbolKeys = Object.getOwnPropertySymbols(obj)
+  if (symbolKeys.length > 0) {
+    throw new Error(`sendDirectedMessage: payload contains a symbol-keyed property at path ${path}`)
+  }
+
+  seen.add(obj)
+  for (const key of Object.keys(obj)) {
+    assertJsonPlain((obj as Record<string, unknown>)[key], `${path}.${key}`, seen)
+  }
+  seen.delete(obj)
+}
+
+/**
  * Send a durable, typed directed message. ALWAYS wrapped in
  * withMemoryWriteTxn() — independent of `memory_write_ordering_enabled`
  * (REQ-015c is unconditional; that flag only gates memory.ts's write paths).
@@ -70,8 +185,9 @@ export interface SendDirectedMessageOptions {
  *   3. msg_type must pass isValidMsgType() (REQ-013/ATM-016), independent of
  *      whatever JSON-Schema `enum` the MCP layer already applied — else
  *      throws.
- *   4. payload must be JSON.stringify-serializable (REQ-014/ATM-017) — else
- *      throws, and no row is inserted.
+ *   4. payload must pass assertJsonPlain() — a strict, lossless-JSON-only
+ *      structural check (REQ-014/ATM-017) — else throws, and no row is
+ *      inserted.
  *   5. The INSERT (with a nextWriteSeq()-drawn `seq`) and its corresponding
  *      audit_log INSERT (`action='directed_message_sent'`) execute inside
  *      ONE withMemoryWriteTxn() call, so send + audit are all-or-nothing
@@ -99,44 +215,20 @@ export function sendDirectedMessage(
     )
   }
 
-  let payloadStr: string
-  try {
-    // [CLOSES finding H3] A plain `JSON.stringify(args.payload)` only catches
-    // thrown failures (circular refs, BigInt) and the TOP-LEVEL undefined
-    // case (handled below). A NESTED function/symbol/undefined object-
-    // property value does not throw — JSON.stringify silently DROPS that
-    // key, producing a lossy, partial payload that would otherwise persist
-    // unnoticed. This throwing replacer is invoked for every nested value
-    // (not just the top-level one), so any such value anywhere in the
-    // payload throws instead of being dropped.
-    payloadStr = JSON.stringify(args.payload, (key, value) => {
-      if (typeof value === 'function' || typeof value === 'symbol') {
-        throw new Error(`sendDirectedMessage: payload contains a non-serializable ${typeof value} value at key "${key}"`)
-      }
-      if (key !== '' && value === undefined) {
-        // Nested `undefined` object-property values are silently DROPPED by
-        // JSON.stringify (not merely coerced), which is exactly the
-        // "partial data persisted" hazard REQ-014 requires closed. `key !==
-        // ''` excludes the TOP-LEVEL call (key `''`), which is already
-        // handled below via the classic "serialized to undefined" check —
-        // this branch is only for values nested inside an object/array.
-        throw new Error(`sendDirectedMessage: payload contains a nested undefined value at key "${key}" (would be silently dropped)`)
-      }
-      return value
-    }) as string
-  } catch (err) {
-    throw new Error(
-      `sendDirectedMessage: payload is not JSON-serializable (${(err as Error)?.message ?? 'unknown error'})`
-    )
-  }
-  if (typeof payloadStr !== 'string') {
-    // JSON.stringify returns the VALUE `undefined` (not a thrown error) for
-    // top-level values it cannot represent (undefined/function/symbol) —
-    // REQ-014 requires this rejected just as loudly as a thrown circular ref.
-    throw new Error(
-      'sendDirectedMessage: payload serialized to undefined — value is not representable as JSON (e.g. undefined/function/symbol)'
-    )
-  }
+  // [CLOSES R2-1, round-2 codex finding] A throwing JSON.stringify replacer
+  // only intercepts values JSON.stringify itself would either throw on
+  // (circular refs, BigInt) or silently DROP (nested function/symbol/
+  // undefined). It still ACCEPTS plenty of non-plain values that
+  // JSON.stringify serializes WITHOUT throwing but LOSSILY — a Map/Set/
+  // RegExp/Error/class-instance collapses to `{}` (or a partial plain
+  // object), NaN/Infinity/-Infinity collapse to `null`, and a Date silently
+  // TYPE-CHANGES to an ISO string. REQ-014 requires rejecting any
+  // "non-plain value" whose JSON round-trip is lossy — not merely the
+  // subset JSON.stringify refuses outright. assertJsonPlain() performs a
+  // strict recursive structural check BEFORE we ever call JSON.stringify,
+  // so by the time we do call it below, losslessness is already guaranteed.
+  assertJsonPlain(args.payload)
+  const payloadStr = JSON.stringify(args.payload) as string
 
   const row = withMemoryWriteTxn(taskDb.getHandle(), (db) => {
     const seq = nextWriteSeq(db)
@@ -370,4 +462,88 @@ export function ackDirectedMessage(
  */
 export function directedMessagingDisabledError(): { content: Array<{ type: 'text'; text: string; isError: true }> } {
   return { content: [{ type: 'text', text: 'directed messaging is disabled', isError: true }] }
+}
+
+/** Shared MCP tool-content shape returned by the three handlers below. */
+export type DirectedMessagingToolResult = { content: Array<{ type: 'text'; text: string; isError?: true }> }
+
+/**
+ * [R2-4 FIX, REQ-023/ATM-029, codex round-2 GENUINE HIGH] TESTABLE SEAM: the
+ * ATM-029 disabled-tool contract was previously verified by grepping
+ * server.ts's SOURCE TEXT for the string
+ * `isFeatureEnabled('directed_messaging_enabled')` near each `case` block —
+ * that proves the string appears in the file, never that the flag actually
+ * gates anything at runtime (a handler could ignore the parsed boolean, or
+ * the string could sit in an unreachable branch, and the source-grep test
+ * would still pass). These three pure wrappers make the disabled-gate
+ * directly INVOKABLE and observable:
+ *   1. Each gates on `taskDb.isFeatureEnabled('directed_messaging_enabled')`
+ *      and returns `directedMessagingDisabledError()` — calling NEITHER the
+ *      wrapped core function NOR touching the database — when OFF.
+ *   2. When ON, each calls its corresponding core function
+ *      (sendDirectedMessage / pollDirectedMessages / ackDirectedMessage)
+ *      and formats the result into the same MCP `{content:[...]}` shape
+ *      server.ts's case handlers previously built inline.
+ * agent-messages.ts stays PURE (no server.ts import): server.ts's three
+ * case handlers now do nothing but
+ * `return handle*Tool(db, SELF_LABEL, args[, opts])` — same signature
+ * shape `(taskDb, selfLabel, args)` as the core functions they wrap, plus an
+ * optional trailing `opts` on the send wrapper to carry the existing
+ * ATM-024 nudge-on-send DI hook (constructed by server.ts, which is the
+ * only place allowed to know about dispatchAgentNudge/nudge.ts).
+ */
+export function handleSendDirectedMessageTool(
+  taskDb: TaskDB,
+  selfLabel: string,
+  args: Record<string, unknown>,
+  opts?: SendDirectedMessageOptions,
+): DirectedMessagingToolResult {
+  if (!taskDb.isFeatureEnabled('directed_messaging_enabled')) {
+    return directedMessagingDisabledError()
+  }
+
+  const row = sendDirectedMessage(
+    taskDb,
+    selfLabel,
+    {
+      recipient: args.recipient as string,
+      msg_type: args.msg_type as string,
+      payload: args.payload,
+    },
+    opts,
+  )
+
+  return {
+    content: [{ type: 'text', text: `Message #${row.id} sent to ${row.recipient} (type: ${row.msg_type}, seq: ${row.seq}).` }],
+  }
+}
+
+export function handlePollDirectedMessagesTool(
+  taskDb: TaskDB,
+  selfLabel: string,
+  args: Record<string, unknown>,
+): DirectedMessagingToolResult {
+  if (!taskDb.isFeatureEnabled('directed_messaging_enabled')) {
+    return directedMessagingDisabledError()
+  }
+
+  const rows = pollDirectedMessages(taskDb, selfLabel, {
+    sinceSeq: typeof args.sinceSeq === 'number' ? (args.sinceSeq as number) : undefined,
+    includeDelivered: args.includeDelivered === true,
+  })
+
+  return { content: [{ type: 'text', text: JSON.stringify(rows) }] }
+}
+
+export function handleAckDirectedMessageTool(
+  taskDb: TaskDB,
+  selfLabel: string,
+  args: Record<string, unknown>,
+): DirectedMessagingToolResult {
+  if (!taskDb.isFeatureEnabled('directed_messaging_enabled')) {
+    return directedMessagingDisabledError()
+  }
+
+  const result = ackDirectedMessage(taskDb, selfLabel, args.message_id as number)
+  return { content: [{ type: 'text', text: `Message #${args.message_id} ack result: ${result.status}` }] }
 }
