@@ -531,3 +531,90 @@ export function persistFailureClassification(
     throw err
   }
 }
+
+// ---------------------------------------------------------------------------
+// ATM-024 / REQ-013 [P1] — getFailureClassifications() (Stage 4, EPIC-05)
+// ---------------------------------------------------------------------------
+
+/**
+ * A durable failure_classifications row, as read back by
+ * getFailureClassifications(). Widens `failure_class` from the closed
+ * FailureClass union to `FailureClass | string` (via Omit + intersection,
+ * NOT a bare interface-extends, since extends cannot widen a member) so a
+ * row written by a future taxonomy version — carrying a failure_class value
+ * this build doesn't recognize — still deserializes without loss (see
+ * ATM-026). `id` and `created_at` are part of the stable contract P7/P8
+ * build against.
+ */
+export type PersistedFailureClassification = Omit<FailureClassification, 'failure_class'> & {
+  failure_class: FailureClass | string
+  id: number
+  created_at: string
+}
+
+/**
+ * Reads durable failure_classifications rows back out, in ascending id
+ * order, optionally narrowed by task_id / agent / failure_class / a
+ * created_at floor (`since`, inclusive). Read-only (SELECT only — never
+ * INSERT/UPDATE/DELETE) and performs no scoring or synthesis of its own: it
+ * is a pass-through accessor over what persistFailureClassification already
+ * wrote. `failure_class` and `taxonomy_version` are copied through AS-IS,
+ * with no validation or coercion, so a row from a newer taxonomy version
+ * stays intact for an older build reading it (forward compatibility).
+ */
+export function getFailureClassifications(
+  db: Database,
+  filter?: { taskId?: number; agent?: string; failureClass?: FailureClass; since?: string },
+): PersistedFailureClassification[] {
+  const clauses: string[] = []
+  const params: (string | number)[] = []
+
+  if (filter?.taskId !== undefined) {
+    clauses.push('task_id = ?')
+    params.push(filter.taskId)
+  }
+  if (filter?.agent !== undefined) {
+    clauses.push('agent = ?')
+    params.push(filter.agent)
+  }
+  if (filter?.failureClass !== undefined) {
+    clauses.push('failure_class = ?')
+    params.push(filter.failureClass)
+  }
+  if (filter?.since !== undefined) {
+    clauses.push('created_at >= ?')
+    params.push(filter.since)
+  }
+
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : ''
+  const rows = db
+    .prepare(`SELECT * FROM failure_classifications ${where} ORDER BY id ASC`)
+    .all(...params) as any[]
+
+  return rows.map((row): PersistedFailureClassification => {
+    let rawSignal: unknown = null
+    if (row.raw_signal_json !== null && row.raw_signal_json !== undefined) {
+      try {
+        rawSignal = JSON.parse(row.raw_signal_json)
+      } catch {
+        rawSignal = null
+      }
+    }
+
+    return {
+      id: row.id,
+      taxonomy_version: row.taxonomy_version,
+      failure_class: row.failure_class,
+      severity: row.severity,
+      transience: row.transience,
+      domain: row.domain,
+      signal_source: row.signal_source,
+      source_ref: row.source_ref,
+      task_id: row.task_id,
+      agent: row.agent,
+      summary: row.summary,
+      raw_signal: rawSignal,
+      created_at: row.created_at,
+    }
+  })
+}

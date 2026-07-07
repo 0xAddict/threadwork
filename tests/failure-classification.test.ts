@@ -10,6 +10,7 @@
 // read accessor — those land in later P6 stages (see specs/P6-spec.md).
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import type { Database } from 'bun:sqlite'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { unlinkSync } from 'node:fs'
@@ -33,6 +34,8 @@ import {
   IDLE_COUNT_STAGNATION_THRESHOLD,
   classifyFailure,
   persistFailureClassification,
+  type PersistedFailureClassification,
+  getFailureClassifications,
 } from '../verification/failure-classification'
 
 // ---------------------------------------------------------------------------
@@ -1021,5 +1024,228 @@ describe('ATM-030: audit atomicity, two-direction fault injection (REQ-018)', ()
       "SELECT * FROM audit_log WHERE action = 'failure_classified'"
     ).all()) as any[]
     expect(auditRows.length).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// EPIC-05 (Stage 4): the P7/P8 read accessor
+// ---------------------------------------------------------------------------
+// Covers ATM-024 (getFailureClassifications() filters + ordering + shape),
+// ATM-025 (scope guard: no reward computation, no cross-family critique
+// construction in this module), and ATM-026 (forward-compat pass-through for
+// rows bearing an unknown failure_class / newer taxonomy_version).
+
+/**
+ * Inserts a failure_classifications row DIRECTLY (bypassing
+ * persistFailureClassification / the feature flag) with a caller-controlled
+ * `created_at`, so `since` filtering can be tested deterministically despite
+ * the column's 1-second DEFAULT datetime('now') resolution.
+ */
+function insertClassificationRow(
+  db: Database,
+  opts: {
+    taskId: number | null
+    agent: string | null
+    failureClass: string
+    createdAt: string
+    taxonomyVersion?: number
+    severity?: string
+    transience?: string
+    domain?: string
+    signalSource?: string
+    sourceRef?: string | null
+    summary?: string
+    rawSignalJson?: string | null
+  },
+): number {
+  const row = db
+    .prepare(`
+      INSERT INTO failure_classifications (
+        taxonomy_version, failure_class, severity, transience, domain,
+        signal_source, source_ref, task_id, agent, summary, raw_signal_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING id
+    `)
+    .get(
+      opts.taxonomyVersion ?? TAXONOMY_VERSION,
+      opts.failureClass,
+      opts.severity ?? 'medium',
+      opts.transience ?? 'transient',
+      opts.domain ?? 'agent',
+      opts.signalSource ?? 'manual',
+      opts.sourceRef ?? null,
+      opts.taskId,
+      opts.agent,
+      opts.summary ?? 'seed row',
+      opts.rawSignalJson ?? null,
+      opts.createdAt,
+    ) as { id: number }
+  return row.id
+}
+
+// ---------------------------------------------------------------------------
+// ATM-024 / REQ-013 [P1] — getFailureClassifications() read accessor
+// ---------------------------------------------------------------------------
+describe('ATM-024: getFailureClassifications() — filters, ordering, shape (REQ-013)', () => {
+  const TEST_DB = '/tmp/p6-persist-atm024.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  /**
+   * 5 rows, directly inserted with controlled distinct created_at values (so
+   * the `since` sub-test is deterministic), spanning 2 task_ids, 2 agents,
+   * and 3 failure_classes:
+   *   A: task_id=1 agent=boss  failure_class=verification_failure created_at=2026-01-01
+   *   B: task_id=1 agent=steve failure_class=test_failure         created_at=2026-01-02
+   *   C: task_id=2 agent=boss  failure_class=liveness_timeout     created_at=2026-01-03
+   *   D: task_id=2 agent=steve failure_class=verification_failure created_at=2026-01-04
+   *   E: task_id=1 agent=boss  failure_class=test_failure         created_at=2026-01-05
+   * Inserted in id order A,B,C,D,E (ascending id === insertion order).
+   */
+  function seedFiveRows(db: Database): Record<'A' | 'B' | 'C' | 'D' | 'E', number> {
+    const A = insertClassificationRow(db, {
+      taskId: 1, agent: 'boss', failureClass: 'verification_failure', createdAt: '2026-01-01 00:00:00',
+      rawSignalJson: JSON.stringify({ source: 'verify_check', checkResultId: 'chk-a' }),
+    })
+    const B = insertClassificationRow(db, {
+      taskId: 1, agent: 'steve', failureClass: 'test_failure', createdAt: '2026-01-02 00:00:00',
+    })
+    const C = insertClassificationRow(db, {
+      taskId: 2, agent: 'boss', failureClass: 'liveness_timeout', createdAt: '2026-01-03 00:00:00',
+    })
+    const D = insertClassificationRow(db, {
+      taskId: 2, agent: 'steve', failureClass: 'verification_failure', createdAt: '2026-01-04 00:00:00',
+      rawSignalJson: null,
+    })
+    const E = insertClassificationRow(db, {
+      taskId: 1, agent: 'boss', failureClass: 'test_failure', createdAt: '2026-01-05 00:00:00',
+    })
+    return { A, B, C, D, E }
+  }
+
+  test('ATM-024: no-filter call returns all 5 rows in ascending id order, each with a numeric id and non-null created_at', () => {
+    const ids = taskDb.run(db => seedFiveRows(db))
+    const results = taskDb.run(db => getFailureClassifications(db))
+
+    expect(results.length).toBe(5)
+    expect(results.map(r => r.id)).toEqual([ids.A, ids.B, ids.C, ids.D, ids.E])
+    for (const r of results) {
+      expect(typeof r.id).toBe('number')
+      expect(r.created_at).not.toBeNull()
+      expect(typeof r.created_at).toBe('string')
+      expect(r.created_at.length).toBeGreaterThan(0)
+    }
+  })
+
+  test('ATM-024: filter by taskId returns exactly the matching subset in ascending id order', () => {
+    const ids = taskDb.run(db => seedFiveRows(db))
+    const results = taskDb.run(db => getFailureClassifications(db, { taskId: 1 }))
+    expect(results.map(r => r.id)).toEqual([ids.A, ids.B, ids.E])
+    for (const r of results) expect(r.task_id).toBe(1)
+  })
+
+  test('ATM-024: filter by agent returns exactly the matching subset in ascending id order', () => {
+    const ids = taskDb.run(db => seedFiveRows(db))
+    const results = taskDb.run(db => getFailureClassifications(db, { agent: 'steve' }))
+    expect(results.map(r => r.id)).toEqual([ids.B, ids.D])
+    for (const r of results) expect(r.agent).toBe('steve')
+  })
+
+  test('ATM-024: filter by failureClass returns exactly the matching subset in ascending id order', () => {
+    const ids = taskDb.run(db => seedFiveRows(db))
+    const results = taskDb.run(db => getFailureClassifications(db, { failureClass: 'verification_failure' }))
+    expect(results.map(r => r.id)).toEqual([ids.A, ids.D])
+    for (const r of results) expect(r.failure_class).toBe('verification_failure')
+  })
+
+  test('ATM-024: filter by since (inclusive) returns exactly the matching subset in ascending id order', () => {
+    const ids = taskDb.run(db => seedFiveRows(db))
+    const results = taskDb.run(db => getFailureClassifications(db, { since: '2026-01-03 00:00:00' }))
+    expect(results.map(r => r.id)).toEqual([ids.C, ids.D, ids.E])
+    for (const r of results) expect(r.created_at >= '2026-01-03 00:00:00').toBe(true)
+  })
+
+  test('ATM-024: raw_signal is parsed defensively from raw_signal_json (valid JSON -> object, null -> null)', () => {
+    const ids = taskDb.run(db => seedFiveRows(db))
+    const results = taskDb.run(db => getFailureClassifications(db))
+    const rowA = results.find(r => r.id === ids.A)!
+    const rowD = results.find(r => r.id === ids.D)!
+    expect(rowA.raw_signal).toEqual({ source: 'verify_check', checkResultId: 'chk-a' })
+    expect(rowD.raw_signal).toBeNull()
+  })
+
+  test('ATM-024: malformed raw_signal_json parses defensively to null without throwing', () => {
+    taskDb.run(db => insertClassificationRow(db, {
+      taskId: 9, agent: 'kiera', failureClass: 'unknown', createdAt: '2026-01-06 00:00:00',
+      rawSignalJson: '{not valid json',
+    }))
+    let results: PersistedFailureClassification[] = []
+    expect(() => {
+      results = taskDb.run(db => getFailureClassifications(db, { taskId: 9 }))
+    }).not.toThrow()
+    expect(results.length).toBe(1)
+    expect(results[0]!.raw_signal).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-025 / REQ-013 [P1] — scope guard: no reward, no cross-family critique
+// ---------------------------------------------------------------------------
+describe('ATM-025: scope guard — no reward computation, no cross-family critique construction (REQ-013)', () => {
+  test('ATM-025: failure-classification.ts source contains no reward-valued code and no cross-family critique construction', () => {
+    const modulePath = join(import.meta.dir, '..', 'verification', 'failure-classification.ts')
+    const source = readFileSync(modulePath, 'utf8')
+
+    // (a) No reward-valued code anywhere in this module.
+    expect(source).not.toMatch(/reward/i)
+
+    // (b) No reference to critique CONSTRUCTION. The module has one
+    // pre-existing, type-only `CritiqueSeverity` import (ATM-004's
+    // decision.ts distinctness guardrail) which is unrelated to building a
+    // critique across multiple classifications — strip that single known
+    // identifier out before scanning so it doesn't false-positive this
+    // check, then assert zero remaining occurrences of the word.
+    const withoutKnownTypeImport = source.replace(/CritiqueSeverity/g, '')
+    expect(withoutKnownTypeImport).not.toMatch(/critique/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-026 / REQ-014 [P2] — forward-compat read pass-through
+// ---------------------------------------------------------------------------
+describe('ATM-026: forward-compat read pass-through — unknown failure_class + newer taxonomy_version (REQ-014)', () => {
+  const TEST_DB = '/tmp/p6-persist-atm026.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-026: a row with an unrecognized failure_class and taxonomy_version=999 is returned unchanged, no throw', () => {
+    const id = taskDb.run(db => insertClassificationRow(db, {
+      taskId: 55,
+      agent: 'sadie',
+      failureClass: 'future_class_v2',
+      createdAt: '2026-02-01 00:00:00',
+      taxonomyVersion: 999,
+    }))
+
+    let results: PersistedFailureClassification[] = []
+    expect(() => {
+      results = taskDb.run(db => getFailureClassifications(db, { taskId: 55 }))
+    }).not.toThrow()
+
+    expect(results.length).toBe(1)
+    const row = results[0]!
+    expect(row.id).toBe(id)
+    expect(row.failure_class).toBe('future_class_v2')
+    expect(row.taxonomy_version).toBe(999)
   })
 })
