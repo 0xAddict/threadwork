@@ -1405,3 +1405,204 @@ describe('ATM-018: fromAdversarialFinding (standalone, no production call site)'
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// EPIC-06 (Stage 6): feature flag, flag-OFF parity, no-backfill discipline
+// ---------------------------------------------------------------------------
+// ATM-027 (flag seed default 0) is already covered above by the
+// "ATM-027: fresh migrate() seeds failure_classification_enabled=0, read via
+// isFeatureEnabled()" test in the ATM-019/ATM-027 persistence block (Stage 3)
+// — see line ~778. Not duplicated here.
+//
+// ATM-028 consolidates the "flag OFF -> zero failure_classifications rows,
+// everywhere" invariant across every wired call site. ATM-029 guards against
+// any future migrate() backfill that would derive synthetic
+// failure_classifications rows from pre-existing historical
+// agent_sessions/tasks/audit_log data.
+
+// ---------------------------------------------------------------------------
+// ATM-028 / REQ-016 [P1] — flag-OFF parity across ALL wired call sites
+// ---------------------------------------------------------------------------
+describe('ATM-028: flag-OFF parity across ALL wired call sites (REQ-016)', () => {
+  const TEST_DB = '/tmp/p6-persist-atm028.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    // Flag left at its migrate()-seeded default (OFF) for this whole describe block.
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-028: flag is OFF by construction (sanity precondition for the rest of this block)', () => {
+    expect(taskDb.isFeatureEnabled('failure_classification_enabled')).toBe(false)
+  })
+
+  test('ATM-028: a direct persistFailureClassification(db, c) call with flag OFF returns null, row count stays 0', () => {
+    const id = taskDb.run(db => persistFailureClassification(db, makeFailureClassification()))
+    expect(id).toBeNull()
+    const count = taskDb.run(db => (db.prepare('SELECT count(*) AS n FROM failure_classifications').get() as { n: number }).n)
+    expect(count).toBe(0)
+  })
+
+  // Reference: the per-site flag-OFF BYTE-PARITY assertions — verify.ts's
+  // summary.json output staying byte-identical, watchdog.ts's ESCALATION
+  // string plus its agent_sessions/tasks mutations staying byte-identical,
+  // and the escalation Telegram message staying byte-identical — are proven
+  // in the Stage-5 integration suites:
+  //   tests/failure-classification-watchdog-integration.test.ts
+  //   tests/failure-classification-verify-integration.test.ts
+  //   tests/failure-classification-escalation-integration.test.ts
+  // This test is the CONSOLIDATED "0 rows across every wired site when OFF"
+  // invariant: it drives the actual pure adapters wired at each of the 5
+  // watchdog.ts sites (blocked, fault-crash x2, fault-timeout, dead-session)
+  // plus the 3 verify.ts sites (verify_check, test_run, verify_idle_count)
+  // through classifyFailure() -> persistFailureClassification(), exactly as
+  // the live wiring does, and asserts the row count never leaves 0.
+  test('ATM-028: driving every wired watchdog.ts + verify.ts adapter through classifyFailure -> persist with flag OFF yields 0 rows total', () => {
+    const wiredSignals = [
+      // watchdog.ts site 1 (line ~389): blocked_dependency
+      fromWatchdogBlocked('human', { task_id: 100, agent: 'boss' }),
+      // watchdog.ts site 2 (line ~588): fault crash (task-scoped)
+      fromWatchdogFault('kiera', 'crash', { task_id: 101, agent: 'kiera' }),
+      // watchdog.ts site 3 (line ~608): dead session
+      fromWatchdogDeadSession({ task_id: 102, agent: 'steve' }),
+      // watchdog.ts site 4 (line ~711): fault timeout
+      fromWatchdogFault('sadie', 'timeout', { task_id: 103, agent: 'sadie' }),
+      // watchdog.ts site 5 (line ~1017): fault crash (agent-only, no task_id)
+      fromWatchdogFault('boss', 'crash', { agent: 'boss' }),
+    ]
+
+    for (const sig of wiredSignals) {
+      const classification = classifyFailure(sig)
+      const id = taskDb.run(db => persistFailureClassification(db, classification))
+      expect(id).toBeNull()
+    }
+
+    // verify.ts's 3 sites — same fromX -> classifyFailure -> persist pattern,
+    // using representative inputs that would otherwise yield a non-null signal.
+    const verifyCheckInput = { id: 'SG-9', description: 'x', verified: false, evidence: 'missing' }
+    const testRunInput = { tests_pass: false, test_output: 'boom' }
+    const idleCountInput = { idle_count: IDLE_COUNT_STAGNATION_THRESHOLD }
+    const verifyCheck = fromVerifyCheckResult(verifyCheckInput)
+    const testRun = fromTestRun(testRunInput)
+    const idleCount = fromIdleCount(idleCountInput)
+    expect(verifyCheck).not.toBeNull()
+    expect(testRun).not.toBeNull()
+    expect(idleCount).not.toBeNull()
+
+    for (const sig of [verifyCheck!, testRun!, idleCount!]) {
+      const classification = classifyFailure(sig)
+      const id = taskDb.run(db => persistFailureClassification(db, classification))
+      expect(id).toBeNull()
+    }
+
+    const count = taskDb.run(db => (db.prepare('SELECT count(*) AS n FROM failure_classifications').get() as { n: number }).n)
+    expect(count).toBe(0)
+  })
+
+  test('ATM-028: getFailureClassifications(db) returns [] after all flag-OFF operations above', () => {
+    // Re-run a representative slice of the flag-OFF persist attempts against
+    // this test's own taskDb instance (each test gets a fresh wiped DB via
+    // beforeEach), then confirm the read accessor sees nothing.
+    taskDb.run(db => persistFailureClassification(db, makeFailureClassification()))
+    taskDb.run(db => persistFailureClassification(db, classifyFailure(fromWatchdogFault('kiera', 'crash', { task_id: 1, agent: 'kiera' }))))
+    taskDb.run(db => persistFailureClassification(db, classifyFailure(fromWatchdogBlocked('human', { task_id: 2, agent: 'boss' }))))
+    taskDb.run(db => persistFailureClassification(db, classifyFailure(fromWatchdogDeadSession({ task_id: 3, agent: 'steve' }))))
+
+    const results = taskDb.run(db => getFailureClassifications(db))
+    expect(results).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-029 / REQ-017 [P3] — no retroactive backfill guardrail
+// ---------------------------------------------------------------------------
+describe('ATM-029: no retroactive backfill from historical fault/blocked data (REQ-017)', () => {
+  const TEST_DB = '/tmp/p6-persist-atm029.db'
+
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-029: pre-existing historical agent_sessions/tasks/audit_log fault data does NOT get swept into failure_classifications by migrate()', () => {
+    wipeDbFile(TEST_DB)
+
+    // Step 1: open a fresh TaskDB — this runs migrate() once, creating every
+    // table (agent_sessions, tasks, audit_log, failure_classifications, ...).
+    const firstOpen = new TaskDB(TEST_DB)
+
+    // Step 2: simulate an EXISTING production DB that already has historical
+    // fault/blocked data recorded BEFORE this feature ever existed — the kind
+    // of data a naive backfill migration might try to sweep into
+    // failure_classifications.
+    firstOpen.run(db => {
+      // A task that got blocked long before failure_classification_enabled
+      // existed. from_agent === to_agent so the trg_require_supervision
+      // trigger (which demands a supervisor_agent when they differ) doesn't
+      // fire — irrelevant to what this test is proving.
+      db.prepare(`
+        INSERT INTO tasks (from_agent, to_agent, description, status, blocked_reason, blocked_on)
+        VALUES ('boss', 'boss', 'historical task with a blocked reason', 'blocked', 'waiting on human review', 'human')
+      `).run()
+
+      // An agent_sessions row bearing historical crash/timeout fault data.
+      db.prepare(`
+        INSERT INTO agent_sessions (agent, state, last_fault_type, fault_count)
+        VALUES ('kiera', 'unknown', 'crash', 3)
+      `).run()
+      db.prepare(`
+        INSERT INTO agent_sessions (agent, state, last_fault_type, fault_count)
+        VALUES ('sadie', 'unknown', 'timeout', 1)
+      `).run()
+
+      // audit_log rows describing historical faults, predating this feature.
+      db.prepare(`
+        INSERT INTO audit_log (agent, action, detail)
+        VALUES ('kiera', 'fault_detected', '{"faultType":"crash"}')
+      `).run()
+      db.prepare(`
+        INSERT INTO audit_log (agent, action, detail)
+        VALUES ('boss', 'task_blocked', '{"blocked_on":"human"}')
+      `).run()
+    })
+
+    // Sanity: the historical data landed as expected, and failure_classifications
+    // is empty immediately after the FIRST migrate() too (no backfill on initial
+    // creation either).
+    const preReopenCount = firstOpen.run(db =>
+      (db.prepare('SELECT count(*) AS n FROM failure_classifications').get() as { n: number }).n,
+    )
+    expect(preReopenCount).toBe(0)
+
+    // Step 3: re-open the SAME db file — TaskDB's constructor re-runs
+    // migrate() (proven idempotent by ATM-019's "re-running migrate() ... is
+    // idempotent" test). If migrate() ever grew a backfill job that derives
+    // failure_classifications rows from historical agent_sessions.last_fault_type,
+    // tasks.blocked_reason/blocked_on, or audit_log fault/blocked entries, this
+    // second migrate() pass is precisely where it would fire.
+    let secondOpen: TaskDB
+    expect(() => { secondOpen = new TaskDB(TEST_DB) }).not.toThrow()
+
+    const postReopenCount = secondOpen!.run(db =>
+      (db.prepare('SELECT count(*) AS n FROM failure_classifications').get() as { n: number }).n,
+    )
+    expect(postReopenCount).toBe(0)
+
+    // And the read accessor agrees: nothing to see, forward-accumulation only.
+    const rows = secondOpen!.run(db => getFailureClassifications(db))
+    expect(rows).toEqual([])
+
+    // Confirm the historical seed data really is still there (so this test
+    // is proving "no backfill", not "table doesn't exist" / "insert silently
+    // failed").
+    const taskRow = secondOpen!.run(db =>
+      db.prepare("SELECT blocked_reason, blocked_on FROM tasks WHERE description = 'historical task with a blocked reason'").get(),
+    ) as { blocked_reason: string; blocked_on: string } | undefined
+    expect(taskRow?.blocked_reason).toBe('waiting on human review')
+    expect(taskRow?.blocked_on).toBe('human')
+
+    const sessionRow = secondOpen!.run(db =>
+      db.prepare("SELECT last_fault_type FROM agent_sessions WHERE agent = 'kiera'").get(),
+    ) as { last_fault_type: string } | undefined
+    expect(sessionRow?.last_fault_type).toBe('crash')
+  })
+})
