@@ -38,7 +38,7 @@ import {
 } from './delegation-brief'
 import { AuditLog } from './audit'
 import { MemoryConsolidator } from './consolidator'
-import { sendDirectedMessage } from './agent-messages'
+import { sendDirectedMessage, pollDirectedMessages, ackDirectedMessage, directedMessagingDisabledError } from './agent-messages'
 import { MSG_TYPES } from './agent-message-types'
 
 const db = new TaskDB(DB_PATH)
@@ -226,6 +226,32 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           payload: { type: 'object', description: 'Structured JSON payload.' },
         },
         required: ['recipient', 'msg_type', 'payload'],
+      },
+    },
+    {
+      // ATM-020/021/022 (Stage 7, REQ-016/017/018): ordered receive + ack
+      // for the durable directed-message store above. NO `recipient`
+      // property (C4) — the effective recipient is always your own
+      // identity, never caller-suppliable.
+      name: 'poll_directed_messages',
+      description: 'Poll for durable directed messages addressed to you. Delivery is at-least-once: a message can be redelivered (e.g. via includeDelivered, for crash/redelivery recovery) until it is acked, so callers must dedup and act idempotently by the message id field and ack each id exactly once conceptually (repeated acks of the same id are themselves idempotent). Recipient is always your own identity — never caller-suppliable.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sinceSeq: { type: 'number', description: 'Only claim NEW pending messages with seq greater than this cursor. Does not suppress includeDelivered redelivery of already-delivered-but-not-acked messages.' },
+          includeDelivered: { type: 'boolean', description: 'Also return already-delivered-but-not-yet-acked messages (for at-least-once redelivery / crash recovery). Dedup these by id — ack() is idempotent.' },
+        },
+      },
+    },
+    {
+      name: 'ack_directed_message',
+      description: 'Acknowledge (mark acked) a directed message you received via poll_directed_messages, by its id. Idempotent — acking an already-acked id is a no-op success, not an error.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          message_id: { type: 'number', description: 'The id of the message to acknowledge.' },
+        },
+        required: ['message_id'],
       },
     },
     {
@@ -1069,13 +1095,64 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: 'directed messaging is disabled', isError: true }] }
         }
 
-        const row = sendDirectedMessage(db, SELF_LABEL, {
-          recipient: args.recipient as string,
-          msg_type: args.msg_type as string,
-          payload: args.payload,
-        })
+        // ATM-024 (P3/REQ-020, Stage 7): OPTIONAL best-effort wake nudge,
+        // fired only AFTER sendDirectedMessage()'s transaction has committed
+        // (see that function's onSent doc comment). DEFAULT OFF — when the
+        // flag is off, no onSent callback is constructed at all, so the call
+        // below is byte-identical to Stage 6's 3-arg call.
+        const nudgeOnSend = db.isFeatureEnabled('directed_messaging_nudge_on_send')
+        const row = sendDirectedMessage(
+          db,
+          SELF_LABEL,
+          {
+            recipient: args.recipient as string,
+            msg_type: args.msg_type as string,
+            payload: args.payload,
+          },
+          nudgeOnSend
+            ? {
+                onSent: (sentRow) => {
+                  // Fire-and-forget: dispatchAgentNudge is async and MUST NOT
+                  // block (or be awaited by) the already-committed send. The
+                  // .catch() below AND sendDirectedMessage's own try/catch
+                  // around onSent are both defensive — either alone is
+                  // sufficient to guarantee a nudge failure never surfaces
+                  // to the caller of this tool.
+                  void dispatchAgentNudge(
+                    sentRow.recipient,
+                    `New directed message #${sentRow.id} (${sentRow.msg_type}) from ${SELF_LABEL}`,
+                    { source: SELF_LABEL },
+                  ).catch(() => {})
+                },
+              }
+            : undefined,
+        )
 
         return { content: [{ type: 'text', text: `Message #${row.id} sent to ${row.recipient} (type: ${row.msg_type}, seq: ${row.seq}).` }] }
+      }
+
+      case 'poll_directed_messages': {
+        // ATM-029/REQ-023: same flag as send_directed_message.
+        if (!db.isFeatureEnabled('directed_messaging_enabled')) {
+          return directedMessagingDisabledError()
+        }
+
+        const rows = pollDirectedMessages(db, SELF_LABEL, {
+          sinceSeq: typeof args.sinceSeq === 'number' ? (args.sinceSeq as number) : undefined,
+          includeDelivered: args.includeDelivered === true,
+        })
+
+        return { content: [{ type: 'text', text: JSON.stringify(rows) }] }
+      }
+
+      case 'ack_directed_message': {
+        // ATM-029/REQ-023: same flag as send_directed_message.
+        if (!db.isFeatureEnabled('directed_messaging_enabled')) {
+          return directedMessagingDisabledError()
+        }
+
+        const result = ackDirectedMessage(db, SELF_LABEL, args.message_id as number)
+        return { content: [{ type: 'text', text: `Message #${args.message_id} ack result: ${result.status}` }] }
       }
 
       case 'save_memory': {

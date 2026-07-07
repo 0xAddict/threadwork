@@ -603,6 +603,11 @@ export class TaskDB {
     // agent-messages store is wired to any production call site in this stage.
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('memory_write_ordering_enabled', 0)")
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('directed_messaging_enabled', 0)")
+    // P5 Stage 7 (ATM-024/REQ-020, P3 non-blocking): OPTIONAL best-effort wake
+    // nudge fired after a directed message send commits. DEFAULT OFF — when
+    // off, send_directed_message's behavior is byte-identical to Stage 6
+    // (no onSent callback is constructed or passed).
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('directed_messaging_nudge_on_send', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [

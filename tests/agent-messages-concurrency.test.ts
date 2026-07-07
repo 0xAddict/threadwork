@@ -28,8 +28,10 @@ import { describe, test, expect } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { unlinkSync } from 'fs'
 import { TaskDB } from '../db'
+import { sendDirectedMessage } from '../agent-messages'
 
 const WORKER_PATH = new URL('./fixtures/concurrent-send-message-worker.ts', import.meta.url).pathname
+const POLL_WORKER_PATH = new URL('./fixtures/concurrent-poll-worker.ts', import.meta.url).pathname
 const N = 5
 const SPAWN_TIMEOUT_MS = 30_000
 
@@ -130,6 +132,96 @@ describe('ATM-019 — sendDirectedMessage cross-process concurrency proof', () =
         expect(auditCount).toBe(N)
       } finally {
         readDb.close()
+        cleanupDbFile(dbPath)
+      }
+    },
+    SPAWN_TIMEOUT_MS
+  )
+})
+
+/**
+ * Spawn one concurrent-poll-worker.ts as a real OS process; resolve its exit
+ * code + captured stdout (the worker's last stdout line is a JSON array of
+ * `{id, seq}` for the rows IT claimed).
+ */
+async function spawnPollWorker(env: Record<string, string>): Promise<{ code: number; output: string }> {
+  const proc = Bun.spawn(['bun', POLL_WORKER_PATH], {
+    env: { ...process.env, ...env },
+    stdout: 'pipe',
+    stderr: 'inherit',
+  })
+  const output = await new Response(proc.stdout).text()
+  const code = await proc.exited
+  return { code, output }
+}
+
+describe('ATM-020(b) — pollDirectedMessages cross-process CONCURRENT DISJOINT claim', () => {
+  test(
+    '2 same-recipient poll workers, start-gate-synchronized: union of claimed ids === all N sent, intersection === empty, each worker\'s own result is seq-ascending',
+    async () => {
+      const dbPath = tempDbPath('atm020b-poll')
+      const POLL_RECIPIENT = 'steve'
+      const N_MESSAGES = 6
+      const N_WORKERS = 2
+
+      // Seed the DB (schema + WAL/busy_timeout) AND the 6 pending messages
+      // from the main thread BEFORE any worker opens the file — mirrors
+      // ATM-019's seedDb rationale (a brand-new file being opened by N
+      // racing fresh connections would itself contend).
+      const seedDb = new TaskDB(dbPath)
+      const allIds: number[] = []
+      for (let i = 0; i < N_MESSAGES; i++) {
+        const row = sendDirectedMessage(seedDb, 'boss', {
+          recipient: POLL_RECIPIENT,
+          msg_type: 'status_update',
+          payload: { i },
+        })
+        allIds.push(row.id)
+      }
+      seedDb.close()
+
+      const runId = crypto.randomUUID()
+      const gateName = `poll-fix-${runId}`
+
+      const results = await Promise.all(
+        Array.from({ length: N_WORKERS }, () =>
+          spawnPollWorker({
+            DB_PATH: dbPath,
+            AGENT_LABEL: POLL_RECIPIENT,
+            P5_TEST_START_GATE: gateName,
+            P5_GATE_COUNT: String(N_WORKERS),
+          })
+        )
+      )
+
+      try {
+        for (const r of results) expect(r.code).toBe(0)
+
+        const claimedSets = results.map((r) => {
+          const lines = r.output.trim().split('\n').filter((l) => l.length > 0)
+          const lastLine = lines[lines.length - 1]
+          return JSON.parse(lastLine) as Array<{ id: number; seq: number }>
+        })
+
+        // Each worker's OWN returned set is seq-ascending.
+        for (const set of claimedSets) {
+          for (let i = 0; i < set.length - 1; i++) {
+            expect(set[i].seq).toBeLessThan(set[i + 1].seq)
+          }
+        }
+
+        const idSets = claimedSets.map((s) => new Set(s.map((r) => r.id)))
+
+        // UNION === all 6 ids sent — no lost/unclaimed messages.
+        const union = new Set<number>()
+        for (const s of idSets) for (const id of s) union.add(id)
+        expect(union.size).toBe(N_MESSAGES)
+        expect([...union].sort((a, b) => a - b)).toEqual([...allIds].sort((a, b) => a - b))
+
+        // INTERSECTION === empty — no double delivery across the two workers.
+        const intersection = [...idSets[0]].filter((id) => idSets[1].has(id))
+        expect(intersection).toEqual([])
+      } finally {
         cleanupDbFile(dbPath)
       }
     },

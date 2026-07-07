@@ -12,9 +12,16 @@
 
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import type { Database } from 'bun:sqlite'
-import { unlinkSync } from 'fs'
+import { unlinkSync, readFileSync } from 'fs'
+import { resolve } from 'path'
 import { TaskDB } from '../db'
-import { sendDirectedMessage, type AgentMessageRow } from '../agent-messages'
+import {
+  sendDirectedMessage,
+  pollDirectedMessages,
+  ackDirectedMessage,
+  directedMessagingDisabledError,
+  type AgentMessageRow,
+} from '../agent-messages'
 import { MSG_TYPES, isValidMsgType } from '../agent-message-types'
 
 function tempDbPath(name: string): string {
@@ -301,5 +308,427 @@ describe('ATM-028 (send portion) — audit_log atomicity for directed_message_se
       "SELECT COUNT(*) as c FROM audit_log WHERE action = 'directed_message_sent'"
     ).get() as { c: number }).c
     expect(auditCount).toBe(0)
+  })
+})
+
+// =============================================================================
+// Stage 7 (EPIC-07): ordered receive/poll/ack — ATM-020/021/022, deliver+ack
+// portions of ATM-028 (REQ-025/C7), ATM-024 (P3), ATM-029 (REQ-023).
+// =============================================================================
+
+describe('ATM-020 — pollDirectedMessages ordering + cross-agent isolation', () => {
+  let dbPath: string
+  let taskDb: TaskDB
+  let db: Database
+
+  beforeEach(() => {
+    dbPath = tempDbPath('agentmsg-atm020')
+    taskDb = new TaskDB(dbPath)
+    db = taskDb.getHandle()
+  })
+
+  afterEach(() => {
+    cleanupDbFile(dbPath)
+  })
+
+  test('ATM-020(a): 3 messages from distinct senders arrive strictly seq-ascending; a second pending-only poll is empty; rows are not deleted', () => {
+    sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'status_update', payload: { n: 1 } })
+    sendDirectedMessage(taskDb, 'sadie', { recipient: 'steve', msg_type: 'status_update', payload: { n: 2 } })
+    sendDirectedMessage(taskDb, 'kiera', { recipient: 'steve', msg_type: 'status_update', payload: { n: 3 } })
+
+    const first = pollDirectedMessages(taskDb, 'steve')
+    expect(first).toHaveLength(3)
+    for (let i = 0; i < first.length - 1; i++) {
+      expect(first[i].seq).toBeLessThan(first[i + 1].seq)
+    }
+    expect(first.every((r) => r.status === 'delivered')).toBe(true)
+
+    const second = pollDirectedMessages(taskDb, 'steve')
+    expect(second).toEqual([])
+
+    // Rows are transitioned, never deleted.
+    const count = (db.prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
+    expect(count).toBe(3)
+  })
+
+  test('ATM-020(c) cross-agent negative: messages addressed to boss only; polling as steve returns [] and boss\'s pending rows are untouched', () => {
+    sendDirectedMessage(taskDb, 'sadie', { recipient: 'boss', msg_type: 'status_update', payload: {} })
+    sendDirectedMessage(taskDb, 'kiera', { recipient: 'boss', msg_type: 'status_update', payload: {} })
+
+    const result = pollDirectedMessages(taskDb, 'steve')
+    expect(result).toEqual([])
+
+    const bossRows = db.prepare("SELECT status FROM agent_messages WHERE recipient = 'boss'").all() as Array<{ status: string }>
+    expect(bossRows).toHaveLength(2)
+    expect(bossRows.every((r) => r.status === 'pending')).toBe(true)
+  })
+})
+
+describe('ATM-021 — ackDirectedMessage idempotency + cross-agent negative', () => {
+  let dbPath: string
+  let taskDb: TaskDB
+  let db: Database
+
+  beforeEach(() => {
+    dbPath = tempDbPath('agentmsg-atm021')
+    taskDb = new TaskDB(dbPath)
+    db = taskDb.getHandle()
+  })
+
+  afterEach(() => {
+    cleanupDbFile(dbPath)
+  })
+
+  test('ATM-021(a): ack idempotency — acking twice is a no-op success the second time, acked_at unchanged, no second audit row', () => {
+    const sent = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'status_update', payload: {} })
+    pollDirectedMessages(taskDb, 'steve')
+
+    const first = ackDirectedMessage(taskDb, 'steve', sent.id)
+    expect(first.status).toBe('acked')
+    expect(first.row?.acked_at).toBeTruthy()
+    const firstAckedAt = first.row!.acked_at
+
+    const second = ackDirectedMessage(taskDb, 'steve', sent.id)
+    expect(second.status).toBe('noop_already_acked')
+    expect(second.row?.acked_at).toBe(firstAckedAt)
+
+    // Only ONE ack event was ever audited — the no-op second call did not
+    // re-mutate or re-audit (this holds regardless of datetime('now')'s
+    // second-level granularity, unlike a bare acked_at-equality check alone).
+    const auditCount = (
+      db.prepare("SELECT COUNT(*) as c FROM audit_log WHERE action = 'directed_message_acked'").get() as { c: number }
+    ).c
+    expect(auditCount).toBe(1)
+  })
+
+  test('ATM-021(b) cross-agent negative: acking as a non-recipient yields a distinct not_recipient outcome and mutates nothing', () => {
+    const sent = sendDirectedMessage(taskDb, 'sadie', { recipient: 'boss', msg_type: 'status_update', payload: {} })
+    pollDirectedMessages(taskDb, 'boss')
+
+    const result = ackDirectedMessage(taskDb, 'steve', sent.id)
+    expect(result.status).toBe('not_recipient')
+    expect(result.status).not.toBe('noop_already_acked')
+    expect(result.row).toBeUndefined()
+
+    const row = db.prepare('SELECT status, acked_at FROM agent_messages WHERE id = ?').get(sent.id) as {
+      status: string
+      acked_at: string | null
+    }
+    expect(row.status).toBe('delivered')
+    expect(row.acked_at).toBeNull()
+  })
+
+  test('ackDirectedMessage on a nonexistent id returns a distinct not_found outcome', () => {
+    const result = ackDirectedMessage(taskDb, 'steve', 999999)
+    expect(result.status).toBe('not_found')
+    expect(result.row).toBeUndefined()
+  })
+})
+
+describe('ATM-022 — includeDelivered redelivery + sinceSeq cannot suppress it', () => {
+  let dbPath: string
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    dbPath = tempDbPath('agentmsg-atm022')
+    taskDb = new TaskDB(dbPath)
+  })
+
+  afterEach(() => {
+    cleanupDbFile(dbPath)
+  })
+
+  test('ATM-022(a): a delivered-not-acked row is redelivered via includeDelivered; stops being redelivered once acked', () => {
+    const sent = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'status_update', payload: {} })
+
+    const firstPoll = pollDirectedMessages(taskDb, 'steve')
+    expect(firstPoll.map((r) => r.id)).toEqual([sent.id])
+
+    // Without acking, poll again with includeDelivered — same row comes back.
+    const secondPoll = pollDirectedMessages(taskDb, 'steve', { includeDelivered: true })
+    expect(secondPoll.map((r) => r.id)).toEqual([sent.id])
+    expect(secondPoll[0].status).toBe('delivered')
+
+    ackDirectedMessage(taskDb, 'steve', sent.id)
+
+    // Now that it's acked, includeDelivered no longer surfaces it.
+    const thirdPoll = pollDirectedMessages(taskDb, 'steve', { includeDelivered: true })
+    expect(thirdPoll).toEqual([])
+  })
+
+  test('ATM-022(b): sinceSeq cannot suppress includeDelivered redelivery of an already-delivered row', () => {
+    const sent = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'status_update', payload: {} })
+    const [delivered] = pollDirectedMessages(taskDb, 'steve')
+    expect(delivered.seq).toBe(sent.seq)
+
+    // sinceSeq === the row's own seq would normally exclude it from a NEW
+    // pending claim, but includeDelivered's redelivery branch ignores
+    // sinceSeq entirely — the row must still come back.
+    const poll = pollDirectedMessages(taskDb, 'steve', { includeDelivered: true, sinceSeq: delivered.seq })
+    expect(poll.map((r) => r.id)).toEqual([sent.id])
+  })
+})
+
+describe('ATM-028 (deliver/ack portion) — audit_log atomicity for directed_message_delivered/_acked', () => {
+  let dbPath: string
+  let taskDb: TaskDB
+  let db: Database
+
+  beforeEach(() => {
+    dbPath = tempDbPath('agentmsg-atm028de')
+    taskDb = new TaskDB(dbPath)
+    db = taskDb.getHandle()
+  })
+
+  afterEach(() => {
+    cleanupDbFile(dbPath)
+  })
+
+  test('a send -> poll -> ack cycle on one message produces exactly one audit row of each action, in that order', () => {
+    const sent = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'status_update', payload: {} })
+    const polled = pollDirectedMessages(taskDb, 'steve')
+    expect(polled).toHaveLength(1)
+    const ackResult = ackDirectedMessage(taskDb, 'steve', sent.id)
+    expect(ackResult.status).toBe('acked')
+
+    const auditRows = db.prepare(
+      `SELECT action FROM audit_log
+       WHERE action IN ('directed_message_sent', 'directed_message_delivered', 'directed_message_acked')
+       ORDER BY id ASC`
+    ).all() as Array<{ action: string }>
+
+    expect(auditRows.map((r) => r.action)).toEqual([
+      'directed_message_sent',
+      'directed_message_delivered',
+      'directed_message_acked',
+    ])
+  })
+
+  test('FAULT-INJECTION: the poll claim UPDATE throwing leaves no directed_message_delivered audit row (message stays pending)', () => {
+    const sent = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'status_update', payload: {} })
+
+    const original = db.prepare.bind(db)
+    const prepareSpy = spyOn(db, 'prepare').mockImplementation((sql: any, ...rest: any[]) => {
+      if (typeof sql === 'string' && sql.includes("SET status = 'delivered'")) {
+        return {
+          get: () => { throw new Error('atm028-deliver simulated claim UPDATE fault') },
+          all: () => { throw new Error('atm028-deliver simulated claim UPDATE fault') },
+          run: () => { throw new Error('atm028-deliver simulated claim UPDATE fault') },
+        } as any
+      }
+      return original(sql, ...rest)
+    })
+
+    try {
+      expect(() => pollDirectedMessages(taskDb, 'steve')).toThrow('atm028-deliver simulated claim UPDATE fault')
+    } finally {
+      prepareSpy.mockRestore()
+    }
+
+    const row = db.prepare('SELECT status FROM agent_messages WHERE id = ?').get(sent.id) as { status: string }
+    expect(row.status).toBe('pending')
+
+    const auditCount = (
+      db.prepare("SELECT COUNT(*) as c FROM audit_log WHERE action = 'directed_message_delivered'").get() as { c: number }
+    ).c
+    expect(auditCount).toBe(0)
+  })
+
+  test('FAULT-INJECTION: the poll directed_message_delivered audit INSERT throwing rolls back the claim too (message stays pending)', () => {
+    const sent = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'status_update', payload: {} })
+
+    const original = db.prepare.bind(db)
+    const prepareSpy = spyOn(db, 'prepare').mockImplementation((sql: any, ...rest: any[]) => {
+      if (typeof sql === 'string' && sql.includes('INSERT INTO audit_log') && sql.includes('directed_message_delivered')) {
+        return {
+          get: () => { throw new Error('atm028-deliver simulated audit INSERT fault') },
+          all: () => { throw new Error('atm028-deliver simulated audit INSERT fault') },
+          run: () => { throw new Error('atm028-deliver simulated audit INSERT fault') },
+        } as any
+      }
+      return original(sql, ...rest)
+    })
+
+    try {
+      expect(() => pollDirectedMessages(taskDb, 'steve')).toThrow('atm028-deliver simulated audit INSERT fault')
+    } finally {
+      prepareSpy.mockRestore()
+    }
+
+    const row = db.prepare('SELECT status FROM agent_messages WHERE id = ?').get(sent.id) as { status: string }
+    expect(row.status).toBe('pending')
+
+    const auditCount = (
+      db.prepare("SELECT COUNT(*) as c FROM audit_log WHERE action = 'directed_message_delivered'").get() as { c: number }
+    ).c
+    expect(auditCount).toBe(0)
+  })
+
+  test('FAULT-INJECTION: the ack claim UPDATE throwing leaves no directed_message_acked audit row (message stays delivered)', () => {
+    const sent = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'status_update', payload: {} })
+    pollDirectedMessages(taskDb, 'steve')
+
+    const original = db.prepare.bind(db)
+    const prepareSpy = spyOn(db, 'prepare').mockImplementation((sql: any, ...rest: any[]) => {
+      if (typeof sql === 'string' && sql.includes("SET status = 'acked'")) {
+        return {
+          get: () => { throw new Error('atm028-ack simulated claim UPDATE fault') },
+          all: () => { throw new Error('atm028-ack simulated claim UPDATE fault') },
+          run: () => { throw new Error('atm028-ack simulated claim UPDATE fault') },
+        } as any
+      }
+      return original(sql, ...rest)
+    })
+
+    try {
+      expect(() => ackDirectedMessage(taskDb, 'steve', sent.id)).toThrow('atm028-ack simulated claim UPDATE fault')
+    } finally {
+      prepareSpy.mockRestore()
+    }
+
+    const row = db.prepare('SELECT status, acked_at FROM agent_messages WHERE id = ?').get(sent.id) as {
+      status: string
+      acked_at: string | null
+    }
+    expect(row.status).toBe('delivered')
+    expect(row.acked_at).toBeNull()
+
+    const auditCount = (
+      db.prepare("SELECT COUNT(*) as c FROM audit_log WHERE action = 'directed_message_acked'").get() as { c: number }
+    ).c
+    expect(auditCount).toBe(0)
+  })
+
+  test('FAULT-INJECTION: the ack directed_message_acked audit INSERT throwing rolls back the claim too (message stays delivered)', () => {
+    const sent = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'status_update', payload: {} })
+    pollDirectedMessages(taskDb, 'steve')
+
+    const original = db.prepare.bind(db)
+    const prepareSpy = spyOn(db, 'prepare').mockImplementation((sql: any, ...rest: any[]) => {
+      if (typeof sql === 'string' && sql.includes('INSERT INTO audit_log') && sql.includes('directed_message_acked')) {
+        return {
+          get: () => { throw new Error('atm028-ack simulated audit INSERT fault') },
+          all: () => { throw new Error('atm028-ack simulated audit INSERT fault') },
+          run: () => { throw new Error('atm028-ack simulated audit INSERT fault') },
+        } as any
+      }
+      return original(sql, ...rest)
+    })
+
+    try {
+      expect(() => ackDirectedMessage(taskDb, 'steve', sent.id)).toThrow('atm028-ack simulated audit INSERT fault')
+    } finally {
+      prepareSpy.mockRestore()
+    }
+
+    const row = db.prepare('SELECT status, acked_at FROM agent_messages WHERE id = ?').get(sent.id) as {
+      status: string
+      acked_at: string | null
+    }
+    expect(row.status).toBe('delivered')
+    expect(row.acked_at).toBeNull()
+
+    const auditCount = (
+      db.prepare("SELECT COUNT(*) as c FROM audit_log WHERE action = 'directed_message_acked'").get() as { c: number }
+    ).c
+    expect(auditCount).toBe(0)
+  })
+})
+
+describe('ATM-024 — optional post-commit onSent hook (P3, nudge-on-send)', () => {
+  let dbPath: string
+  let taskDb: TaskDB
+  let db: Database
+
+  beforeEach(() => {
+    dbPath = tempDbPath('agentmsg-atm024')
+    taskDb = new TaskDB(dbPath)
+    db = taskDb.getHandle()
+  })
+
+  afterEach(() => {
+    cleanupDbFile(dbPath)
+  })
+
+  test('onSent is invoked with the already-committed row', () => {
+    let receivedRow: AgentMessageRow | undefined
+    const row = sendDirectedMessage(
+      taskDb,
+      'boss',
+      { recipient: 'steve', msg_type: 'status_update', payload: {} },
+      { onSent: (r) => { receivedRow = r } },
+    )
+
+    expect(receivedRow).toBeDefined()
+    expect(receivedRow!.id).toBe(row.id)
+
+    // The row is already durably committed and queryable by the time onSent fires.
+    const persisted = db.prepare('SELECT id FROM agent_messages WHERE id = ?').get(row.id)
+    expect(persisted).not.toBeNull()
+  })
+
+  test('an onSent that throws does not affect the returned row or roll back the already-committed send', () => {
+    const row = sendDirectedMessage(
+      taskDb,
+      'boss',
+      { recipient: 'steve', msg_type: 'status_update', payload: {} },
+      { onSent: () => { throw new Error('simulated nudge failure') } },
+    )
+
+    expect(row.id).toBeGreaterThan(0)
+
+    const persisted = db.prepare('SELECT id, status FROM agent_messages WHERE id = ?').get(row.id) as {
+      id: number
+      status: string
+    }
+    expect(persisted.status).toBe('pending')
+  })
+
+  test('omitting opts entirely (no onSent) behaves exactly as the Stage 6 3-arg call', () => {
+    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'status_update', payload: {} })
+    expect(row.status).toBe('pending')
+  })
+})
+
+describe('ATM-029 — directedMessagingDisabledError helper + tool-handler flag-gate presence', () => {
+  test('directedMessagingDisabledError() returns the exact structured disabled-error shape', () => {
+    expect(directedMessagingDisabledError()).toEqual({
+      content: [{ type: 'text', text: 'directed messaging is disabled', isError: true }],
+    })
+  })
+
+  test('source-level: send_directed_message, poll_directed_messages, and ack_directed_message all gate on directed_messaging_enabled', () => {
+    const serverSrc = readFileSync(resolve(__dirname, '..', 'server.ts'), 'utf-8')
+
+    for (const caseName of ['send_directed_message', 'poll_directed_messages', 'ack_directed_message']) {
+      const caseIdx = serverSrc.indexOf(`case '${caseName}':`)
+      expect(caseIdx).toBeGreaterThan(-1)
+
+      // The flag-check must appear reasonably close to (i.e. as one of the
+      // first statements inside) this case block — not merely anywhere in
+      // the file.
+      const nextCaseIdx = serverSrc.indexOf("\n      case '", caseIdx + 1)
+      const blockEnd = nextCaseIdx === -1 ? caseIdx + 1000 : nextCaseIdx
+      const block = serverSrc.slice(caseIdx, blockEnd)
+
+      expect(block.includes("isFeatureEnabled('directed_messaging_enabled')")).toBe(true)
+    }
+  })
+})
+
+describe('ATM-032 — poll_directed_messages tool description documents at-least-once delivery + id-based dedup/idempotency', () => {
+  test('the registered description contains both "at-least-once" and idempotency/dedup language referencing message id', () => {
+    const serverSrc = readFileSync(resolve(__dirname, '..', 'server.ts'), 'utf-8')
+
+    const toolIdx = serverSrc.indexOf("name: 'poll_directed_messages'")
+    expect(toolIdx).toBeGreaterThan(-1)
+
+    const descMatch = serverSrc.slice(toolIdx, toolIdx + 1000).match(/description:\s*'([^']*)'/)
+    expect(descMatch).not.toBeNull()
+
+    const description = descMatch![1]
+    expect(description.toLowerCase()).toContain('at-least-once')
+    expect(description.toLowerCase()).toContain('idempotent')
+    expect(description).toMatch(/\bid\b/)
   })
 })

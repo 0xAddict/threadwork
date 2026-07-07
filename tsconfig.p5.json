@@ -33,6 +33,8 @@
     "tests/fixtures/concurrent-supersede-worker.ts",
     "tests/agent-messages.test.ts",
     "tests/agent-messages-concurrency.test.ts",
-    "tests/fixtures/concurrent-send-message-worker.ts"
+    "tests/fixtures/concurrent-send-message-worker.ts",
+    "tests/fixtures/concurrent-poll-worker.ts",
+    "tests/guardrails/no-nudge-agent-signature-drift.test.ts"
   ]
 }
