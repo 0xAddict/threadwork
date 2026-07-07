@@ -38,6 +38,8 @@ import {
 } from './delegation-brief'
 import { AuditLog } from './audit'
 import { MemoryConsolidator } from './consolidator'
+import { handleSendDirectedMessageTool, handlePollDirectedMessagesTool, handleAckDirectedMessageTool } from './agent-messages'
+import { MSG_TYPES } from './agent-message-types'
 
 const db = new TaskDB(DB_PATH)
 const mem = new MemoryDB(db)
@@ -204,6 +206,52 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           message: { type: 'string', description: 'The message to send' },
         },
         required: ['agent', 'message'],
+      },
+    },
+    {
+      // P5 (REQ-012/013/014/015, ATM-015/016/017/018): durable, typed,
+      // directed agent->agent message store. Additive/complementary to
+      // nudge_agent (EPIC-07/REQ-019-020) — that tool stays untouched. Unlike
+      // nudge_agent (ephemeral tmux wake, no ack, untyped string), this
+      // persists a typed row for later poll/ack retrieval (poll/ack tools
+      // land in Stage 7). Sender is ALWAYS the caller's own SELF_LABEL —
+      // there is deliberately NO `sender` property in this inputSchema.
+      name: 'send_directed_message',
+      description: 'Send a durable, typed directed message to another agent (persisted for poll/ack, unlike the ephemeral nudge_agent wake signal). Sender is always your own identity — never caller-suppliable.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          recipient: { type: 'string', description: 'Target agent: boss, steve, sadie, kiera, or snoopy.' },
+          msg_type: { type: 'string', enum: [...MSG_TYPES], description: 'Message kind.' },
+          payload: { type: 'object', description: 'Structured JSON payload.' },
+        },
+        required: ['recipient', 'msg_type', 'payload'],
+      },
+    },
+    {
+      // ATM-020/021/022 (Stage 7, REQ-016/017/018): ordered receive + ack
+      // for the durable directed-message store above. NO `recipient`
+      // property (C4) — the effective recipient is always your own
+      // identity, never caller-suppliable.
+      name: 'poll_directed_messages',
+      description: 'Poll for durable directed messages addressed to you. Delivery is at-least-once: a message can be redelivered (e.g. via includeDelivered, for crash/redelivery recovery) until it is acked, so callers must dedup and act idempotently by the message id field and ack each id exactly once conceptually (repeated acks of the same id are themselves idempotent). Recipient is always your own identity — never caller-suppliable.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sinceSeq: { type: 'number', description: 'Only claim NEW pending messages with seq greater than this cursor. Does not suppress includeDelivered redelivery of already-delivered-but-not-acked messages.' },
+          includeDelivered: { type: 'boolean', description: 'Also return already-delivered-but-not-yet-acked messages (for at-least-once redelivery / crash recovery). Dedup these by id — ack() is idempotent.' },
+        },
+      },
+    },
+    {
+      name: 'ack_directed_message',
+      description: 'Acknowledge (mark acked) a directed message you received via poll_directed_messages, by its id. Idempotent — acking an already-acked id is a no-op success, not an error.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          message_id: { type: 'number', description: 'The id of the message to acknowledge.' },
+        },
+        required: ['message_id'],
       },
     },
     {
@@ -1036,6 +1084,52 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // successful sendTmux path only — this is the single canonical write site
         // (sprint #256 gate 3). Do NOT re-add a direct write here.
         return { content: [{ type: 'text', text: `Nudged ${agent}: ${message}` }] }
+      }
+
+      case 'send_directed_message': {
+        // R2-4 (REQ-023/ATM-029): the flag-gate + core-call + response
+        // formatting all live in agent-messages.ts's
+        // handleSendDirectedMessageTool (pure, directly unit-testable
+        // without importing server.ts). server.ts's only remaining
+        // responsibility is building the ATM-024 (P3/REQ-020) optional
+        // best-effort nudge-on-send hook — dispatchAgentNudge/nudge.ts is a
+        // server.ts-only concern, DI'd in via `opts` exactly as before, so
+        // agent-messages.ts never needs to import nudge.ts.
+        const nudgeOnSend = db.isFeatureEnabled('directed_messaging_nudge_on_send')
+        return handleSendDirectedMessageTool(
+          db,
+          SELF_LABEL,
+          args,
+          nudgeOnSend
+            ? {
+                onSent: (sentRow) => {
+                  // Fire-and-forget: dispatchAgentNudge is async and MUST NOT
+                  // block (or be awaited by) the already-committed send. The
+                  // .catch() below AND sendDirectedMessage's own try/catch
+                  // around onSent are both defensive — either alone is
+                  // sufficient to guarantee a nudge failure never surfaces
+                  // to the caller of this tool.
+                  void dispatchAgentNudge(
+                    sentRow.recipient,
+                    `New directed message #${sentRow.id} (${sentRow.msg_type}) from ${SELF_LABEL}`,
+                    { source: SELF_LABEL },
+                  ).catch(() => {})
+                },
+              }
+            : undefined,
+        )
+      }
+
+      case 'poll_directed_messages': {
+        // R2-4 (REQ-023/ATM-029): see handleSendDirectedMessageTool comment
+        // above — same extraction for poll.
+        return handlePollDirectedMessagesTool(db, SELF_LABEL, args)
+      }
+
+      case 'ack_directed_message': {
+        // R2-4 (REQ-023/ATM-029): see handleSendDirectedMessageTool comment
+        // above — same extraction for ack.
+        return handleAckDirectedMessageTool(db, SELF_LABEL, args)
       }
 
       case 'save_memory': {

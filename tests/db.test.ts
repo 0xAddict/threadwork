@@ -4,6 +4,27 @@ import { unlinkSync } from 'fs'
 
 const TEST_DB = '/tmp/task-board-test.db'
 
+// P5 (ATM-025): both new write-ordering / directed-messaging flags default OFF.
+describe('P5 write-ordering / directed-messaging feature flags (ATM-025)', () => {
+  let flagsDbPath: string
+
+  beforeEach(() => {
+    flagsDbPath = `/tmp/p5-flags-${crypto.randomUUID()}.db`
+  })
+
+  test('a fresh TaskDB seeds memory_write_ordering_enabled and directed_messaging_enabled both false', () => {
+    const db = new TaskDB(flagsDbPath)
+    try {
+      expect(db.isFeatureEnabled('memory_write_ordering_enabled')).toBe(false)
+      expect(db.isFeatureEnabled('directed_messaging_enabled')).toBe(false)
+    } finally {
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { unlinkSync(flagsDbPath + suffix) } catch {}
+      }
+    }
+  })
+})
+
 describe('TaskDB', () => {
   let db: TaskDB
 

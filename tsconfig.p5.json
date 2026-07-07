@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "esnext",
+    "lib": ["esnext", "dom"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "typeRoots": ["./.typeroots"],
+    "types": ["bun-types", "node"]
+  },
+  "include": [
+    "types/bun-sqlite-widen.d.ts",
+    "memory-ordering.ts",
+    "agent-message-types.ts",
+    "agent-messages.ts",
+    "memory.ts",
+    "db.ts",
+    "config.ts",
+    "nudge.ts",
+    "memory-integrity.ts",
+    "memory-integrity-patterns.ts",
+    "tests/fixtures/concurrency-barrier.ts",
+    "tests/memory-ordering.test.ts",
+    "tests/fixtures/concurrency-barrier.test.ts",
+    "tests/memory-ordering-concurrency.test.ts",
+    "tests/fixtures/concurrent-save-memory-worker.ts",
+    "tests/fixtures/concurrent-challenge-worker.ts",
+    "tests/fixtures/concurrent-supersede-worker.ts",
+    "tests/agent-messages.test.ts",
+    "tests/agent-messages-concurrency.test.ts",
+    "tests/fixtures/concurrent-send-message-worker.ts",
+    "tests/fixtures/concurrent-poll-worker.ts",
+    "tests/guardrails/no-nudge-agent-signature-drift.test.ts"
+  ]
+}
