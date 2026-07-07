@@ -1,0 +1,15 @@
+{
+  "versions": {
+    "1": [
+      "verification_failure",
+      "test_failure",
+      "liveness_timeout",
+      "blocked_dependency",
+      "infrastructure_transient",
+      "contract_scope_conformance",
+      "resource_budget_exhaustion",
+      "correctness_adversarial_finding",
+      "unknown"
+    ]
+  }
+}
