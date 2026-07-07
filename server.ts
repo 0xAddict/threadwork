@@ -25,6 +25,7 @@ import {
 import { DB_PATH, SELF_LABEL, AGENT_SESSIONS, TMUX_PATH, TEAM_AGENTS, assertAgentIdentity } from './config'
 
 import { MemoryDB } from './memory'
+import { handleSaveMemory, handleGetBootBriefing, handleWriteHandoff } from './memory-handlers'
 import { isDenseEnabled } from './dense'
 import { DecisionDB, expireStaleDecisions } from './decision'
 import { forceDebrief } from './debrief'
@@ -239,6 +240,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['content', 'category'],
+      },
+    },
+    {
+      name: 'write_handoff',
+      description: 'Write an authorized session-handoff memory (recycle SOP). Wraps your body in a server-constructed [session-handoff:<you>:<ts>] marker at source_type=system, so it survives sanitization and session-boot.sh can rehydrate it. Use this instead of save_memory for handoff writes.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', description: 'The handoff body text (what the next session should know). Do NOT include the [session-handoff:...] marker yourself — it is server-constructed.' },
+        },
+        required: ['content'],
       },
     },
     {
@@ -1027,28 +1039,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case 'save_memory': {
-        const content = args.content as string
+        // ATM-026 (Stage 2b, #10376051): parsing + persistence extracted into
+        // memory-handlers.ts (handleSaveMemory) so it can be tested WITHOUT
+        // importing server.ts (which connects to the live DB / MCP transport
+        // at module load time). Keep a local `category` for the audit.log call
+        // below, which the extracted handler doesn't need to expose.
         const category = args.category as string
-        const importance = (args.importance as number) ?? 3
-        const pinned = (args.pinned as boolean) ?? false
-        const classification = args.classification as string | undefined
-        const quality = args.quality as number | undefined
-        const source_type = args.source_type as string | undefined
-        const evidence = args.evidence as string | undefined
-        const supersedes_memory_id = args.supersedes_memory_id as number | undefined
-
-        const memory = mem.saveMemory({
-          agent: SELF_LABEL,
-          content,
-          category,
-          importance,
-          pinned,
-          classification: classification as import('./memory').Classification | undefined,
-          quality,
-          source_type: source_type as import('./memory').SourceType | undefined,
-          evidence,
-          supersedes_memory_id,
-        })
+        const memory = handleSaveMemory(args, { mem, selfLabel: SELF_LABEL })
         audit.log(SELF_LABEL, 'memory_saved', { category, importance: memory.importance }, undefined, memory.id)
 
         // GAP-4b Phase-2 (#10060808): keep the dense index in sync on write. Only
@@ -1063,6 +1060,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         return { content: [{ type: 'text', text: `Memory #${memory.id} saved (importance: ${memory.importance}${memory.pinned ? ', pinned' : ''})` }] }
+      }
+
+      case 'write_handoff': {
+        // Stage 7 KO-3 (#10376058): authorized system-tier handoff write path.
+        // handleWriteHandoff (memory-handlers.ts) constructs the
+        // [session-handoff:<SELF_LABEL>:<server-ts>] marker itself — the caller
+        // supplies ONLY the body text. See that function's doc comment for the
+        // full anti-laundering contract (server-constructed marker, agent-tier
+        // body sanitize before wrap, hardcoded source_type: 'system').
+        const body = (args.content ?? args.body) as string
+        const memory = handleWriteHandoff({ body }, { mem, selfLabel: SELF_LABEL })
+        audit.log(SELF_LABEL, 'handoff_written', { importance: memory.importance }, undefined, memory.id)
+        return { content: [{ type: 'text', text: `Handoff memory #${memory.id} written for ${SELF_LABEL}.` }] }
       }
 
       case 'recall_memories': {
@@ -1107,8 +1117,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           })
         }
 
-        const bootQuery = args.query as string | undefined
-        const briefing = mem.getBootBriefing(SELF_LABEL, db, bootQuery)
+        const briefing = handleGetBootBriefing(args, { mem, taskDb: db, selfLabel: SELF_LABEL })
         const sections: string[] = []
 
         if (briefing.role.length > 0) {
@@ -1163,7 +1172,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case 'promote_memory': {
         const memoryId = args.memory_id as number
-        const promoted = mem.promoteMemory(memoryId)
+        // ATM-029 (REQ-023): caller authority is resolved from the AUTHENTICATED
+        // identity (SELF_LABEL), never from a caller-supplied args field — that
+        // would just reopen the self-assertion laundering vector P4 closes.
+        const callerSourceType = mem.inferSourceType(SELF_LABEL)
+        const promoted = mem.promoteMemory(memoryId, callerSourceType)
 
         if (!promoted) {
           return { content: [{ type: 'text', text: `Memory #${memoryId} not found.`, isError: true }] }
@@ -1175,7 +1188,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case 'pin_memory': {
         const memoryId = args.memory_id as number
-        const toggled = mem.pinMemory(memoryId)
+        // ATM-029 (REQ-023): same rationale as promote_memory above — resolve
+        // caller authority from SELF_LABEL, not a caller-supplied args field.
+        const callerSourceType = mem.inferSourceType(SELF_LABEL)
+        const toggled = mem.pinMemory(memoryId, callerSourceType)
 
         if (!toggled) {
           return { content: [{ type: 'text', text: `Memory #${memoryId} not found.`, isError: true }] }

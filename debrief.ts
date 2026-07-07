@@ -5,11 +5,36 @@
 // Phases: Gather, Solicit, Synthesize, Persist.
 
 import type { TaskDB, Task } from './db'
-import type { MemoryDB, Memory } from './memory'
+import type { MemoryDB, Memory, Classification } from './memory'
 import { DecisionDB } from './decision'
 import { AuditLog } from './audit'
 import { postToGroup } from './notify'
 import { DEBRIEF_DEFAULTS, TEAM_AGENTS } from './config'
+import { sanitizeMemoryContent, escapeFenceFragment } from './memory-integrity'
+
+// ---------------------------------------------------------------------------
+// P4 anti-laundering, Stage 4 (#10376048/EPIC-03): defense-in-depth on the
+// DebriefDaemon. All behavior below is gated on memory_sanitization_enabled;
+// flag OFF -> every function in this file is byte-for-byte the pre-P4
+// implementation. See build brief EPIC-03 (ATM-010/011/012/013/021).
+// ---------------------------------------------------------------------------
+
+// Tier order, most-privileged first. Mirrors memory.ts's Classification union.
+const CLASSIFICATION_ORDER: Classification[] = [
+  'foundational', 'strategic', 'operational', 'observational', 'ephemeral',
+]
+
+/**
+ * ATM-013: classification cap. Returns `classification`, unless it outranks
+ * `cap` (i.e. sits at a MORE privileged tier), in which case it is clamped
+ * down to `cap`. A guard against a future change accidentally raising the
+ * classification of a memory built from a neutralized agent span.
+ */
+function capClassification(classification: Classification, cap: Classification): Classification {
+  const classRank = CLASSIFICATION_ORDER.indexOf(classification)
+  const capRank = CLASSIFICATION_ORDER.indexOf(cap)
+  return classRank < capRank ? cap : classification
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -265,6 +290,7 @@ export class DebriefDaemon {
    * Gather all context since the last debrief.
    */
   gatherContext(): DebriefContext {
+    const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
     return this.taskDb.run(db => {
       // Find the last debrief run
       const lastRun = db.prepare(`
@@ -316,6 +342,48 @@ export class DebriefDaemon {
       for (const t of completedTasks) activeAgentSet.add(t.agent)
       for (const b of blockers) activeAgentSet.add(b.agent)
       const activeAgents = Array.from(activeAgentSet)
+
+      // ATM-010: sanitize agent-authored spans (agent tier) before this
+      // context is handed to solicit/synthesize/persist. newMemories.content
+      // is already write-sanitized by saveMemory (Stage 2a) — left untouched.
+      // Flag OFF -> completedTasks/blockers/escalations returned exactly as
+      // selected above (byte-parity).
+      if (sanitizeOn) {
+        let anyNeutralized = false
+
+        for (const t of completedTasks) {
+          const descSr = sanitizeMemoryContent(t.description, { sourceType: 'agent' })
+          t.description = descSr.text
+          anyNeutralized = anyNeutralized || descSr.neutralized
+
+          if (t.result !== null) {
+            const resultSr = sanitizeMemoryContent(t.result, { sourceType: 'agent' })
+            t.result = resultSr.text
+            anyNeutralized = anyNeutralized || resultSr.neutralized
+          }
+        }
+
+        for (const b of blockers) {
+          const detailSr = sanitizeMemoryContent(b.detail, { sourceType: 'agent' })
+          b.detail = detailSr.text
+          anyNeutralized = anyNeutralized || detailSr.neutralized
+        }
+
+        for (const e of escalations) {
+          const detailSr = sanitizeMemoryContent(e.detail, { sourceType: 'agent' })
+          e.detail = detailSr.text
+          anyNeutralized = anyNeutralized || detailSr.neutralized
+        }
+
+        // ATM-021: once-per-run audit row when gatherContext neutralized
+        // anything, so the sanitize is observable even before persist runs.
+        if (anyNeutralized) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'debrief_content_sanitized', ?, NULL)
+          `).run(`gatherContext since=${since}`)
+        }
+      }
 
       return {
         completedTasks,
@@ -408,6 +476,10 @@ export class DebriefDaemon {
    * Generate a synthesis and finalize the decision.
    */
   synthesize(context: DebriefContext, decisionId: number): string {
+    // ATM-011: when ON, wrap each gathered agent-text line in a stable
+    // attribution fence so a later consumer can tell "the agent said this"
+    // from real system prose. Flag OFF -> plain lines (byte-parity).
+    const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
     const sections: string[] = []
 
     // Work summary
@@ -421,7 +493,8 @@ export class DebriefDaemon {
       for (const [agent, tasks] of byAgent) {
         sections.push(`${agent}: ${tasks.length} tasks completed`)
         for (const t of tasks) {
-          sections.push(`  #${t.id}: ${t.description}`)
+          const line = sanitizeOn ? `<agent-said agent="${escapeFenceFragment(agent)}">${escapeFenceFragment(t.description)}</agent-said>` : t.description
+          sections.push(`  #${t.id}: ${line}`)
         }
       }
     } else {
@@ -439,7 +512,9 @@ export class DebriefDaemon {
         uniqueBlockers.get(key)!.push(b.detail)
       }
       for (const [key, details] of uniqueBlockers) {
-        sections.push(`${key}: ${details[0]}`)
+        const agent = key.slice(0, key.indexOf(':'))
+        const line = sanitizeOn ? `<agent-said agent="${escapeFenceFragment(agent)}">${escapeFenceFragment(details[0])}</agent-said>` : details[0]
+        sections.push(`${key}: ${line}`)
       }
     }
 
@@ -537,19 +612,66 @@ export class DebriefDaemon {
     }
 
     // Save blocker patterns as learning if multiple blockers from same source
+    //
+    // P4 (#10376048/ATM-012/013/021): flag-gated pre-sanitize of the embedded
+    // agent-authored span BEFORE it is folded into the saveMemory content.
+    // Flag OFF -> detailsJoined/classification/saveMemory call are exactly
+    // the pre-P4 values (byte-parity, no UPDATE, no audit row).
+    const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
     const blockerAgents = new Set(context.blockers.map(b => b.agent))
     for (const agent of blockerAgents) {
       const agentBlockers = context.blockers.filter(b => b.agent === agent)
       if (agentBlockers.length >= 2) {
-        this.mem.saveMemory({
+        let spanNeutralized = false
+        let detailsJoined: string
+        let classification: Classification = 'operational'
+
+        if (sanitizeOn) {
+          const sanitizedDetails = agentBlockers.map(b => {
+            const sr = sanitizeMemoryContent(b.detail, { sourceType: 'agent' })
+            spanNeutralized = spanNeutralized || sr.neutralized
+            return sr.text
+          })
+          detailsJoined = sanitizedDetails.join('; ')
+          // ATM-013: classification cap — a memory built from a neutralized
+          // span can never persist above 'operational', even if a future
+          // change raises the hardcoded value below.
+          if (spanNeutralized) {
+            classification = capClassification(classification, 'operational')
+          }
+        } else {
+          detailsJoined = agentBlockers.map(b => b.detail).join('; ')
+        }
+
+        const saved = this.mem.saveMemory({
           agent: 'shared',
-          content: `Agent ${agent} encountered ${agentBlockers.length} blockers in session (${context.since} to ${context.until}): ${agentBlockers.map(b => b.detail).join('; ')}`,
+          content: `Agent ${agent} encountered ${agentBlockers.length} blockers in session (${context.since} to ${context.until}): ${detailsJoined}`,
           category: 'learning',
           importance: 3,
-          classification: 'operational',
+          classification,
           quality: 0.6,
           source_type: 'system',
         })
+
+        if (sanitizeOn) {
+          // codex R4 F2 fold: STRUCTURAL quarantine. When the flag is ON, force
+          // the agent-derived blocker-span memory to state='proposed'
+          // UNCONDITIONALLY — regardless of whether the detector tripped. A
+          // detector MISS must never promote agent-authored blocker text into
+          // active trusted shared recall (mirrors the r3 write_handoff
+          // state='proposed' structural guarantee). The
+          // 'debrief_content_sanitized' audit row still fires ONLY when content
+          // was actually neutralized (semantic accuracy + ATM-021).
+          this.taskDb.run(db => {
+            db.prepare(`UPDATE memories SET state = 'proposed' WHERE id = ?`).run(saved.id)
+            if (spanNeutralized) {
+              db.prepare(`
+                INSERT INTO audit_log (agent, action, detail, memory_id)
+                VALUES ('system', 'debrief_content_sanitized', ?, ?)
+              `).run(`persist blocker-span agent=${agent}`, saved.id)
+            }
+          })
+        }
       }
     }
 

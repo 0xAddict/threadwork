@@ -3,6 +3,7 @@
 import { TaskDB } from './db'
 import { MemoryDB } from './memory'
 import type { Memory } from './memory'
+import { sanitizeBootBriefing } from './memory-integrity'
 import { DB_PATH } from './config'
 import { mkdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
@@ -85,9 +86,19 @@ export function generateBriefing(
   taskDb: TaskDB,
   briefingDir: string = BRIEFING_DIR,
 ): void {
-  const briefing = mem.getBootBriefing(agent, taskDb)
+  const raw = mem.getBootBriefing(agent, taskDb)
   mkdirSync(briefingDir, { recursive: true })
-  writeFileSync(join(briefingDir, `${agent}.json`), JSON.stringify(briefing, null, 2))
+
+  // ATM-030 wiring / ATM-016 / ATM-017: flag OFF writes the RAW briefing with
+  // NO `sanitized` key at all (byte-parity with pre-P4 output — the key must
+  // be ABSENT, not `false`). Flag ON sanitizes every free-text field and
+  // stamps `sanitized: true` so downstream consumers can tell the file was
+  // produced under the P4 anti-laundering pipeline.
+  const out: unknown = taskDb.isFeatureEnabled('memory_sanitization_enabled')
+    ? { ...sanitizeBootBriefing(raw), sanitized: true }
+    : raw
+
+  writeFileSync(join(briefingDir, `${agent}.json`), JSON.stringify(out, null, 2))
 }
 
 export function runStatusTtl(taskDb: TaskDB, maxAgeHours: number = 24): number {

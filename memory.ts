@@ -4,6 +4,7 @@ import {
   cosineNormalized, rrfFuse, vectorTableExists,
   denseRrfK, denseBm25K, denseDenseK,
 } from './dense'
+import { sanitizeMemoryContent } from './memory-integrity'
 
 export type Classification = 'foundational' | 'strategic' | 'operational' | 'observational' | 'ephemeral'
 export type MemoryState = 'proposed' | 'active' | 'disputed' | 'superseded' | 'archived'
@@ -127,10 +128,37 @@ export class MemoryDB {
     return 'agent'
   }
 
+  /** ATM-026: exposes the P4 sanitization flag so extracted handlers (memory-handlers.ts)
+   * can gate their own behavior without importing TaskDB directly. */
+  isSanitizationEnabled(): boolean {
+    return this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
+  }
+
   saveMemory(input: SaveMemoryInput): Memory {
     return this.taskDb.run(db => {
+      // P4 (#10376048): flag-gated anti-laundering hardening. When OFF, every
+      // branch below is a strict no-op and this function is byte-for-byte the
+      // pre-P4 implementation (same INSERT values, same state, no sanitize, no
+      // clamp, no audit rows). See build brief Stage 2a for the full contract.
+      const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
+
+      // ATM-002: resolve source_type FIRST — caller-identity-only trust
+      // resolution must be decided before any content is touched, and BEFORE
+      // the dedup-normalize step (moved ahead of where it used to sit).
+      const sourceType = input.source_type ?? this.inferSourceType(input.agent)
+
+      // ATM-002: sanitize (flag ON) before dedup-normalize, so both the dedup
+      // check and the persisted row see the neutralized text. Flag OFF ->
+      // effectiveContent is the raw input, unchanged (byte parity).
+      let sanitizeResult: { text: string; neutralized: boolean; tripped?: string[] } | undefined
+      let effectiveContent = input.content
+      if (sanitizeOn) {
+        sanitizeResult = sanitizeMemoryContent(input.content, { sourceType })
+        effectiveContent = sanitizeResult.text
+      }
+
       // Dedup check: normalize content and look for existing active memory
-      const normalized = this.normalizeContent(input.content)
+      const normalized = this.normalizeContent(effectiveContent)
       const existing = db.prepare(`
         SELECT * FROM memories
         WHERE agent = ? AND state = 'active'
@@ -138,6 +166,7 @@ export class MemoryDB {
       `).get(input.agent, normalized) as Memory | null
 
       if (existing) {
+        // No new INSERT happens on this path -> no P4 audit rows (flag OFF or ON).
         return db.prepare(`
           UPDATE memories SET support_count = support_count + 1, last_accessed = datetime('now')
           WHERE id = ?
@@ -145,8 +174,8 @@ export class MemoryDB {
         `).get(existing.id) as Memory
       }
 
+      // === ATM-006 classification/state block start ===
       const classification = input.classification ?? this.inferClassification(input.content, input.category)
-      const sourceType = input.source_type ?? this.inferSourceType(input.agent)
       const quality = input.quality ?? 0.5
       const evidence = input.evidence ?? null
       const supersedes = input.supersedes_memory_id ?? null
@@ -157,18 +186,47 @@ export class MemoryDB {
         state = 'proposed'
       }
 
+      // ATM-003: a neutralized (laundered) memory can never look active,
+      // regardless of source_type/classification — applies even to
+      // source_type:'human'. Flag-gated only.
+      if (sanitizeOn && sanitizeResult?.neutralized) {
+        state = 'proposed'
+      }
+      // === ATM-006 classification/state block end ===
+
+      // ATM-009: agent-tier durability clamp. A sanitized agent-authored write
+      // cannot self-grant durability (high importance / pinned survival).
+      // Flag OFF -> no clamp, values pass through exactly as before.
+      let importance = input.importance ?? 3
+      let pinned = input.pinned ? 1 : 0
+      let durabilityClampDetail: string | null = null
+      if (sanitizeOn && sourceType === 'agent') {
+        const clampedImportance = Math.min(importance, 3)
+        const clampedPinned = 0
+        const parts: string[] = []
+        if (clampedImportance !== importance) {
+          parts.push(`importance ${importance}->${clampedImportance}`)
+        }
+        if (pinned !== clampedPinned) {
+          parts.push(`pinned ${pinned ? 'true' : 'false'}->${clampedPinned ? 'true' : 'false'}`)
+        }
+        importance = clampedImportance
+        pinned = clampedPinned
+        if (parts.length > 0) durabilityClampDetail = parts.join(', ')
+      }
+
       const stmt = db.prepare(`
         INSERT INTO memories (agent, content, category, importance, pinned, source_task_id,
           classification, quality, state, source_type, evidence, supersedes_memory_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING *
       `)
-      return stmt.get(
+      const saved = stmt.get(
         input.agent,
-        input.content,
+        effectiveContent,
         input.category,
-        input.importance ?? 3,
-        input.pinned ? 1 : 0,
+        importance,
+        pinned,
         input.source_task_id ?? null,
         classification,
         quality,
@@ -177,6 +235,36 @@ export class MemoryDB {
         evidence,
         supersedes,
       ) as Memory
+
+      // P4 audit trail (flag ON only; only reached on a genuine new INSERT —
+      // the dedup early-return above never runs this).
+      if (sanitizeOn) {
+        if (sanitizeResult?.neutralized) {
+          // ATM-018
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'memory_content_neutralized', ?, ?)
+          `).run(`tripped=${(sanitizeResult.tripped ?? []).join(',')}`, saved.id)
+
+          // ATM-019
+          if (sanitizeResult.tripped?.includes('forged-trust-marker')) {
+            db.prepare(`
+              INSERT INTO audit_log (agent, action, detail, memory_id)
+              VALUES ('system', 'memory_marker_neutralized', ?, ?)
+            `).run(`tripped=${(sanitizeResult.tripped ?? []).join(',')}`, saved.id)
+          }
+        }
+
+        // ATM-020
+        if (durabilityClampDetail) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'memory_durability_clamped', ?, ?)
+          `).run(durabilityClampDetail, saved.id)
+        }
+      }
+
+      return saved
     })
   }
 
@@ -221,11 +309,54 @@ export class MemoryDB {
         RETURNING *
       `).get(oldId) as Memory
 
+      // P4 (#10376048/ATM-025): flag-gated write-through sanitize for the supersede
+      // path. Flag OFF -> byte-parity with pre-P4 behavior (raw content, hardcoded
+      // state='active', no audit rows beyond the pre-existing memory_superseded one).
+      const sanitizeOn = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
+
+      let sr: { text: string; neutralized: boolean; tripped?: string[] } | undefined
+      let effectiveContent = newContent
+      if (sanitizeOn) {
+        sr = sanitizeMemoryContent(newContent, { sourceType: 'agent' })
+        effectiveContent = sr.text
+      }
+
+      // Mirrors saveMemory's agent+foundational->proposed guard, which this path
+      // otherwise bypasses since it hardcodes source_type='agent' and copies
+      // existing.classification straight through.
+      const foundationalDowngrade = sanitizeOn && existing.classification === 'foundational'
+      const state: MemoryState = sanitizeOn && (sr!.neutralized || foundationalDowngrade) ? 'proposed' : 'active'
+
       const replacement = db.prepare(`
         INSERT INTO memories (agent, content, category, classification, quality, state, source_type, support_count, supersedes_memory_id)
-        VALUES (?, ?, ?, ?, 0.5, 'active', 'agent', 0, ?)
+        VALUES (?, ?, ?, ?, 0.5, ?, 'agent', 0, ?)
         RETURNING *
-      `).get(existing.agent, newContent, existing.category, existing.classification, oldId) as Memory
+      `).get(existing.agent, effectiveContent, existing.category, existing.classification, state, oldId) as Memory
+
+      if (sanitizeOn) {
+        if (sr!.neutralized) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'memory_content_neutralized', ?, ?)
+          `).run(`tripped=${(sr!.tripped ?? []).join(',')}`, replacement.id)
+
+          // REQ-016 (call-site-agnostic): whenever a forged trust marker is
+          // among the tripped patterns, ALSO emit memory_marker_neutralized —
+          // mirrors saveMemory's ATM-019 audit row for this same signal.
+          if (sr!.tripped?.includes('forged-trust-marker')) {
+            db.prepare(`
+              INSERT INTO audit_log (agent, action, detail, memory_id)
+              VALUES ('system', 'memory_marker_neutralized', ?, ?)
+            `).run(`tripped=${(sr!.tripped ?? []).join(',')}`, replacement.id)
+          }
+        }
+        if (foundationalDowngrade) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'memory_durability_clamped', ?, ?)
+          `).run('superseded foundational -> state proposed', replacement.id)
+        }
+      }
 
       db.prepare(`
         INSERT INTO audit_log (agent, action, detail, memory_id)
@@ -613,16 +744,73 @@ export class MemoryDB {
     return results
   }
 
-  promoteMemory(id: number): Memory | null {
-    return this.taskDb.run(db => db.prepare(`
-      UPDATE memories SET agent = 'shared' WHERE id = ? RETURNING *
-    `).get(id) as Memory | null)
+  /**
+   * ATM-029 (REQ-023): authority guard, flag-gated. An agent-authored memory
+   * still sitting in 'proposed' state (i.e. not yet reviewed/accepted) cannot
+   * be self- or peer-promoted to 'shared' by another agent — only a 'system'
+   * or 'human' caller may do so. Flag OFF -> guard is skipped entirely and
+   * behavior is byte-identical to pre-P4 (unconditional UPDATE).
+   */
+  promoteMemory(id: number, callerSourceType: SourceType): Memory | null {
+    return this.taskDb.run(db => {
+      if (this.isSanitizationEnabled()) {
+        const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as Memory | null
+        if (
+          row && row.source_type === 'agent' && row.state === 'proposed' &&
+          callerSourceType !== 'system' && callerSourceType !== 'human'
+        ) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'pin_promote_authority_denied', ?, ?)
+          `).run(`promote denied: memory #${id} is agent-authored/proposed; caller source_type=${callerSourceType}`, id)
+          return null
+        }
+      }
+      return db.prepare(`
+        UPDATE memories SET agent = 'shared' WHERE id = ? RETURNING *
+      `).get(id) as Memory | null
+    })
   }
 
-  pinMemory(id: number): Memory | null {
+  /**
+   * Stage 7 KO-3 quarantine (P4 defense-in-depth, #10376063): force a
+   * memory's state to 'proposed', regardless of its current state.
+   *
+   * Used by handleWriteHandoff (memory-handlers.ts) so a DETECTOR MISS in
+   * an agent-tier-sanitized handoff body cannot reach active-filtered
+   * trusted recall (topMemories/sharedMemories/getBootBriefing all filter
+   * state='active') — the one path where a miss would otherwise elevate
+   * trust+durability, since write_handoff itself asserts source_type:
+   * 'system'/importance:5. session-boot.sh (the sole legitimate handoff
+   * consumer) is widened to match state IN ('active','proposed') so a
+   * quarantined handoff is still found for rehydration.
+   */
+  markMemoryProposed(id: number): Memory {
     return this.taskDb.run(db => db.prepare(`
-      UPDATE memories SET pinned = CASE WHEN pinned = 0 THEN 1 ELSE 0 END WHERE id = ? RETURNING *
-    `).get(id) as Memory | null)
+      UPDATE memories SET state = 'proposed' WHERE id = ? RETURNING *
+    `).get(id) as Memory)
+  }
+
+  /** ATM-029 (REQ-023): same authority guard as promoteMemory, for pin. */
+  pinMemory(id: number, callerSourceType: SourceType): Memory | null {
+    return this.taskDb.run(db => {
+      if (this.isSanitizationEnabled()) {
+        const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as Memory | null
+        if (
+          row && row.source_type === 'agent' && row.state === 'proposed' &&
+          callerSourceType !== 'system' && callerSourceType !== 'human'
+        ) {
+          db.prepare(`
+            INSERT INTO audit_log (agent, action, detail, memory_id)
+            VALUES ('system', 'pin_promote_authority_denied', ?, ?)
+          `).run(`pin denied: memory #${id} is agent-authored/proposed; caller source_type=${callerSourceType}`, id)
+          return null
+        }
+      }
+      return db.prepare(`
+        UPDATE memories SET pinned = CASE WHEN pinned = 0 THEN 1 ELSE 0 END WHERE id = ? RETURNING *
+      `).get(id) as Memory | null
+    })
   }
 
   /**
@@ -703,20 +891,40 @@ export class MemoryDB {
         // since these memories ARE being surfaced to the agent on boot.
         const ranked = this.recall(agent, { query: relevantQuery, limit: RELEVANT_LIMIT })
 
+        // P4 gate #5 (flag-OFF byte-parity): the active-only filter on this
+        // TRUSTED boot-briefing section is FLAG-GATED, read the same way P4
+        // reads it in saveMemory/supersedeMemory (this.taskDb.isFeatureEnabled).
+        //  - Flag OFF -> EXACT 921328b baseline: relevance-led admits ANY ranked
+        //    row (recall()'s candidate pool is state != 'superseded'), and the
+        //    pinned backfill uses state != 'superseded'. Byte parity restored.
+        //  - Flag ON  -> active-only, matching role/topMemories/sharedMemories,
+        //    so the P4 Stage-7 KO-3 write_handoff quarantine (state='proposed',
+        //    #10376063) cannot ride a query-overlapping quarantined handoff into
+        //    this trusted section — preserving "a detector miss can't reach
+        //    active/trusted recall".
+        const activeOnly = this.taskDb.isFeatureEnabled('memory_sanitization_enabled')
+
         const seen = new Set<number>()
         const merged: Memory[] = []
-        // 1. Relevance-led: BM25 hits first (pinned-or-not).
+        // 1. Relevance-led: BM25 hits first (pinned-or-not). Flag ON additionally
+        //    enforces active-only here (see activeOnly note above); flag OFF is
+        //    the 921328b baseline that admits non-active ranked rows.
         for (const m of ranked) {
           if (merged.length >= RELEVANT_LIMIT) break
+          if (activeOnly && m.state !== 'active') continue
           if (!seen.has(m.id)) { seen.add(m.id); merged.push(m) }
         }
         // 2. Backfill any leftover slots with top pinned/role rows so a slow day
         //    (few/no relevant hits) still yields a useful section. Ordered by
-        //    quality/importance; capped by the leftover slot count.
+        //    quality/importance; capped by the leftover slot count. The state
+        //    clause is flag-gated to match (1): flag ON -> state = 'active' (no
+        //    proposed/disputed backfill into trusted recall); flag OFF ->
+        //    state != 'superseded' (921328b baseline).
         if (merged.length < RELEVANT_LIMIT) {
+          const pinnedStateClause = activeOnly ? "state = 'active'" : "state != 'superseded'"
           const pinned = db.prepare(
             `SELECT * FROM memories
-             WHERE (agent = ? OR agent = 'shared') AND pinned = 1 AND state != 'superseded'
+             WHERE (agent = ? OR agent = 'shared') AND pinned = 1 AND ${pinnedStateClause}
              ORDER BY quality DESC, importance DESC
              LIMIT ?`
           ).all(agent, RELEVANT_LIMIT) as Memory[]

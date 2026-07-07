@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "esnext",
+    "lib": ["esnext", "dom"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "typeRoots": ["./.typeroots"],
+    "types": ["bun-types", "node"]
+  },
+  "include": [
+    "types/bun-sqlite-widen.d.ts",
+    "memory-integrity.ts",
+    "memory-integrity-patterns.ts",
+    "tests/memory-integrity-signature.test.ts",
+    "memory.ts",
+    "memory-handlers.ts",
+    "tests/memory-handlers.test.ts",
+    "decision.ts",
+    "debrief.ts",
+    "consolidate.ts",
+    "consolidator.ts",
+    "tests/memory-integrity.test.ts",
+    "tests/memory-integrity-corpus.test.ts",
+    "memory-integrity-cli.ts",
+    "tests/memory-integrity-cli.test.ts",
+    "tests/memory.test.ts",
+    "tests/debrief.test.ts",
+    "tests/consolidate.test.ts",
+    "tests/decision.test.ts",
+    "tests/consolidator.test.ts"
+  ]
+}
