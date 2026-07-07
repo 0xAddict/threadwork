@@ -430,12 +430,20 @@ describe('R5 — structural reconstruct-then-persist (prototype-spoof internal-s
   test('a prototype-spoofed Map (internal-slot data invisible to Reflect.ownKeys) does not throw and persists exactly the validated reconstruction, never the original entries', () => {
     const m = new Map([['secret', 'leaked-if-buggy']])
     Object.setPrototypeOf(m, Object.prototype)
+    const payload = { m }
 
-    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { m } })
+    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload })
+
+    // [R6 strengthening, HIGH-2] Identity property: the persisted bytes are
+    // THE SAME string produced by a single, direct serialization of the
+    // original payload — not a value independently recomputed via a
+    // parallel round-trip that could happen to agree by coincidence even if
+    // the implementation re-observed/re-serialized something else internally.
+    expect(row.payload).toBe(JSON.stringify(payload))
 
     // The persisted bytes must equal the canonical JSON reconstruction of the
     // original payload — never diverge from what was validated.
-    const expected = JSON.stringify(JSON.parse(JSON.stringify({ m })))
+    const expected = JSON.stringify(JSON.parse(JSON.stringify(payload)))
     expect(row.payload).toBe(expected)
 
     // Documents the accepted footgun precisely: the Map's real entry is GONE
@@ -447,10 +455,15 @@ describe('R5 — structural reconstruct-then-persist (prototype-spoof internal-s
   test('a prototype-spoofed Set (internal-slot data invisible to Reflect.ownKeys) does not throw and persists exactly the validated reconstruction', () => {
     const s = new Set(['leaked-if-buggy'])
     Object.setPrototypeOf(s, Object.prototype)
+    const payload = { s }
 
-    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { s } })
+    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload })
 
-    const expected = JSON.stringify(JSON.parse(JSON.stringify({ s })))
+    // [R6 strengthening, HIGH-2] Identity property — see comment on the Map
+    // case above.
+    expect(row.payload).toBe(JSON.stringify(payload))
+
+    const expected = JSON.stringify(JSON.parse(JSON.stringify(payload)))
     expect(row.payload).toBe(expected)
     expect(row.payload).not.toContain('leaked-if-buggy')
     expect(JSON.parse(row.payload)).toEqual({ s: {} })
@@ -459,10 +472,15 @@ describe('R5 — structural reconstruct-then-persist (prototype-spoof internal-s
   test('a prototype-spoofed Date (internal-slot data invisible to Reflect.ownKeys) does not throw and persists exactly the validated reconstruction', () => {
     const d = new Date('2020-01-01T00:00:00.000Z')
     Object.setPrototypeOf(d, Object.prototype)
+    const payload = { d }
 
-    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload: { d } })
+    const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload })
 
-    const expected = JSON.stringify(JSON.parse(JSON.stringify({ d })))
+    // [R6 strengthening, HIGH-2] Identity property — see comment on the Map
+    // case above.
+    expect(row.payload).toBe(JSON.stringify(payload))
+
+    const expected = JSON.stringify(JSON.parse(JSON.stringify(payload)))
     expect(row.payload).toBe(expected)
     expect(row.payload).not.toContain('2020-01-01')
     expect(JSON.parse(row.payload)).toEqual({ d: {} })
@@ -471,6 +489,10 @@ describe('R5 — structural reconstruct-then-persist (prototype-spoof internal-s
   test('persisted-equals-validated property: for an ordinary deep-plain payload, the persisted row.payload is byte-identical to JSON.stringify of the validated reconstruction', () => {
     const payload = { a: 1, b: 'x', c: true, d: null, e: [1, 2, { f: 3.5 }], g: { h: false } }
     const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload })
+
+    // [R6 strengthening, HIGH-2] Identity property — see comment on the Map
+    // case above.
+    expect(row.payload).toBe(JSON.stringify(payload))
 
     const reconstructed = JSON.parse(JSON.stringify(payload))
     expect(row.payload).toBe(JSON.stringify(reconstructed))
@@ -516,6 +538,100 @@ describe('R5 — structural reconstruct-then-persist (prototype-spoof internal-s
 
     const count = (taskDb.getHandle().prepare('SELECT COUNT(*) as c FROM agent_messages').get() as { c: number }).c
     expect(count).toBe(0)
+  })
+})
+
+// -----------------------------------------------------------------------------
+// R6 (Gwei-authorized bounded fold, TG 7660): persist `payloadStr` BY IDENTITY.
+// Closes the codex R5 GENUINE HIGH: the R5 code re-observed `reconstructed` via
+// a SECOND `JSON.stringify(reconstructed)` call at the persist site — a
+// stateful getter installed on `Object.prototype.toJSON` (precondition:
+// in-process code execution, e.g. a compromised dependency) fires DURING that
+// final stringify (with `this === reconstructed`) and can mutate it, so the
+// persisted bytes diverged from the reconstruction `assertJsonPlain` had just
+// validated. The R6 fix persists `payloadStr` itself — the primitive string
+// produced and validated BEFORE `reconstructed` even exists — so there is no
+// observable read left between "what was validated" and "what gets
+// persisted": a getter cannot mutate a string already in hand.
+// -----------------------------------------------------------------------------
+
+describe('R6 — persist payloadStr by identity (Object.prototype.toJSON pollution regression)', () => {
+  let dbPath: string
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    dbPath = tempDbPath('agentmsg-r6')
+    taskDb = new TaskDB(dbPath)
+  })
+
+  afterEach(() => {
+    cleanupDbFile(dbPath)
+  })
+
+  test('codex R5 repro: a stateful Object.prototype.toJSON getter cannot pollute the persisted bytes (calibrated N=5 — see comment)', () => {
+    // CALIBRATION (empirical — measured against unmodified commit 811228e via
+    // a throwaway script BEFORE this fix landed, using this exact payload):
+    // installing a COUNT-ONLY getter (no mutation) on Object.prototype.toJSON
+    // and calling sendDirectedMessage(taskDb, 'boss', {recipient:'steve',
+    // msg_type:'custom', payload:{a:1}}) ONCE produces EXACTLY 5 reads of
+    // `.toJSON` before the function returns:
+    //   #1 assertJsonPlain(args.payload)'s own toJSON check (Layer A, on the
+    //      caller's original object)
+    //   #2 the native JSON.stringify(args.payload) call (payloadStr)
+    //   #3 the native JSON.stringify(validatedClone) call (Layer B compare)
+    //   #4 assertJsonPlain(reconstructed)'s toJSON check (post-reconstruction
+    //      Layer A re-validation)
+    //   #5 the pre-R6 SECOND JSON.stringify(reconstructed) call at the
+    //      persist site — the vulnerable line this test targets
+    // Mutating exactly on get #5 proves the mutation lands inside that
+    // specific final re-serialization, not anywhere earlier in the pipeline.
+    // Confirmed at unmodified 811228e: this makes the persisted row contain
+    // an "evil" key absent from the original payload (RED). Post-fix, the R6
+    // code never performs a get #5 at all (there is no second stringify left
+    // to attack), so the mutation trigger is never reached (GREEN).
+    const CALIBRATED_N = 5
+
+    const payload = { a: 1 }
+    // Captured BEFORE the getter below is installed, from the pristine,
+    // never-yet-observed payload — this is the pre-reconstruction
+    // `payloadStr` byte-for-byte (what a correct implementation validates
+    // AND persists). Capturing it any later — even read-only, even on a
+    // DIFFERENT object — would itself consume one of the finite `.toJSON`
+    // gets tallied below and could shift which call lands on
+    // CALIBRATED_N, corrupting the very baseline this test compares against.
+    const expectedPayloadStr = JSON.stringify(payload)
+
+    let gets = 0
+    const original = Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON')
+
+    try {
+      Object.defineProperty(Object.prototype, 'toJSON', {
+        configurable: true,
+        get() {
+          gets += 1
+          if (gets === CALIBRATED_N) {
+            ;(this as Record<string, unknown>).evil = 'post-validation'
+          }
+          return undefined
+        },
+      })
+
+      const row = sendDirectedMessage(taskDb, 'boss', { recipient: 'steve', msg_type: 'custom', payload })
+
+      expect(row.payload).toBe(expectedPayloadStr)
+      expect(JSON.parse(row.payload)).toEqual({ a: 1 })
+      expect(row.payload).not.toContain('evil')
+    } finally {
+      // CLEANUP IS CRITICAL: a leaked Object.prototype.toJSON getter would
+      // poison every later test in this process. Restore (or delete)
+      // immediately, inside finally, keeping the installed window as narrow
+      // as possible (install -> call -> read row -> finally delete).
+      if (original) {
+        Object.defineProperty(Object.prototype, 'toJSON', original)
+      } else {
+        delete (Object.prototype as { toJSON?: unknown }).toJSON
+      }
+    }
   })
 })
 

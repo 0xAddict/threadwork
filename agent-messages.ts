@@ -354,16 +354,15 @@ export function sendDirectedMessage(
   // EQUALITY CHECK that a hostile stateful getter/proxy could in principle
   // still race), the object is passed THROUGH the JSON boundary FIRST, and
   // the reconstruction — never the original — is what gets validated a
-  // second time and persisted. `persisted === validated` therefore holds BY
-  // CONSTRUCTION (there is no second, independent read of the caller's
-  // object between "what we validated" and "what we store"), not merely by
-  // an equality check that happens to imply it. A getter/proxy that answers
-  // differently on its two reads (Layer A's walk vs. this reconstruction
-  // read) is still caught: `payloadStr` (the reconstruction read) is
-  // compared against Layer A's own clone serialization, and any divergence
-  // is refused rather than persisted — this preserves the R4 divergence
-  // guard exactly, so a hostile stateful getter/proxy is rejected exactly as
-  // before, never silently reconstructed from its second, unvalidated read.
+  // second time. `persisted === validated` holds BY IDENTITY (see the R6
+  // comment at the `payloadStr` INSERT binding below), not merely by an
+  // equality check that happens to imply it. A getter/proxy that answers
+  // differently on its two reads (Layer A's walk vs. the `payloadStr` read
+  // immediately below) is still caught: `payloadStr` is compared against
+  // Layer A's own clone serialization, and any divergence is refused rather
+  // than persisted — this preserves the R4 divergence guard exactly, so a
+  // hostile stateful getter/proxy is rejected exactly as before, never
+  // silently reconstructed from its second, unvalidated read.
   const validatedClone = assertJsonPlain(args.payload)
 
   let payloadStr: string
@@ -392,17 +391,36 @@ export function sendDirectedMessage(
     )
   }
 
-  // Reconstruct-then-persist: `reconstructed` is parsed FROM `payloadStr` —
-  // the exact string about to be persisted — so re-validating it and
-  // re-deriving the persisted string from IT (rather than from a fresh read
-  // of `args.payload`) makes `persisted === validated` a structural fact,
-  // not an inference from the equality check above. assertJsonPlain() on a
-  // freshly-JSON.parse'd value can never fail (JSON.parse only ever produces
-  // plain objects/arrays/strings/finite numbers/booleans/null) — this call
-  // is defense-in-depth / documents the invariant, not a live rejection path.
+  // R6 fix (persist-by-identity, Gwei-authorized TG 7660, closes codex R5
+  // GENUINE HIGH): `reconstructed` is parsed FROM `payloadStr` purely to
+  // re-validate it via assertJsonPlain() as defense-in-depth documentation of
+  // the invariant — JSON.parse() can only ever produce plain
+  // objects/arrays/strings/finite numbers/booleans/null, so this call can
+  // never actually reject anything; it is not a live rejection path. Critically,
+  // `reconstructed` is NEVER re-serialized. The R5 code used to call
+  // `JSON.stringify(reconstructed)` here and persist THAT — a second,
+  // independent read of `reconstructed`, observable through an inherited
+  // `Object.prototype.toJSON` accessor (precondition: in-process code
+  // execution, e.g. a compromised dependency). A stateful getter installed
+  // there fires during that read and can mutate `reconstructed` in place,
+  // so the bytes actually persisted could diverge from the bytes
+  // `assertJsonPlain` had just validated one line above — violating
+  // REQ-014's persisted-equals-validated guarantee.
+  //
+  // The fix: persist `payloadStr` ITSELF — the exact primitive string whose
+  // parse produced `reconstructed`, computed and validated (Layer A + Layer
+  // B, above) BEFORE `reconstructed` ever existed. A getter cannot mutate a
+  // primitive string already in hand, and there is no second read of
+  // `payloadStr` between here and the INSERT below — `persisted ===
+  // validated` therefore holds BY IDENTITY (the same string value, not
+  // merely an equal one produced by a fresh, independently re-attackable
+  // serialization), not by construction-then-reserialization. Any mutation
+  // an attacker manages to inflict on `reconstructed` during its
+  // (unavoidable, defense-in-depth) assertJsonPlain() re-validation above is
+  // harmless: `reconstructed` is discarded immediately afterward and never
+  // read again.
   const reconstructed = JSON.parse(payloadStr)
   assertJsonPlain(reconstructed)
-  const finalPayloadStr = JSON.stringify(reconstructed)
 
   const row = withMemoryWriteTxn(taskDb.getHandle(), (db) => {
     const seq = nextWriteSeq(db)
@@ -410,7 +428,7 @@ export function sendDirectedMessage(
       INSERT INTO agent_messages (sender, recipient, msg_type, payload, seq)
       VALUES (?, ?, ?, ?, ?)
       RETURNING *
-    `).get(sender, recipient, msgType, finalPayloadStr, seq) as AgentMessageRow
+    `).get(sender, recipient, msgType, payloadStr, seq) as AgentMessageRow
 
     // REQ-025/C7 (ATM-028 send portion): SAME transaction as the INSERT above
     // — an audit-INSERT failure rolls back the message row, and a message
