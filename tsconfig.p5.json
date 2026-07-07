@@ -23,6 +23,9 @@
     "config.ts",
     "nudge.ts",
     "memory-integrity.ts",
-    "memory-integrity-patterns.ts"
+    "memory-integrity-patterns.ts",
+    "tests/fixtures/concurrency-barrier.ts",
+    "tests/memory-ordering.test.ts",
+    "tests/fixtures/concurrency-barrier.test.ts"
   ]
 }

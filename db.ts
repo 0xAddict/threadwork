@@ -249,6 +249,16 @@ export class TaskDB {
       CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
       CREATE INDEX IF NOT EXISTS idx_audit_task ON audit_log(task_id);
       CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
+
+      -- P5 (REQ-009 / ATM-012): append-only monotonic write-sequence log.
+      -- Each row is minted by memory-ordering.ts's nextWriteSeq() and never
+      -- updated/deleted; it is the well-defined, strictly-ordered TOTAL order
+      -- across agents/processes that memories.write_seq (a per-row, OVERWRITABLE
+      -- latest-touch marker — REQ-010) cannot by itself reconstruct.
+      CREATE TABLE IF NOT EXISTS write_sequence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
     `)
 
     // Add nudge_count column if missing (safe migration for existing DBs)
@@ -270,6 +280,10 @@ export class TaskDB {
       "ALTER TABLE memories ADD COLUMN challenge_count INTEGER DEFAULT 0",
       "ALTER TABLE memories ADD COLUMN supersedes_memory_id INTEGER REFERENCES memories(id)",
       "ALTER TABLE memories ADD COLUMN last_validated TEXT DEFAULT (datetime('now'))",
+      // P5 (REQ-010 / ATM-013): nullable latest-write marker, stamped by
+      // nextWriteSeq() only when memory_write_ordering_enabled=1. NULL on every
+      // row written while the flag is OFF (byte-parity, REQ-022).
+      "ALTER TABLE memories ADD COLUMN write_seq INTEGER",
     ]
     for (const sql of dtcColumns) {
       try { this.db.exec(sql) } catch { /* column already exists */ }
@@ -563,6 +577,12 @@ export class TaskDB {
     // sanitizeMemoryContent() (memory-integrity.ts) is not yet wired into any save/consolidate
     // path in this stage.
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('memory_sanitization_enabled', 0)")
+    // P5 (REQ-021 / ATM-025): concurrent-write ordering + directed messaging.
+    // DEFAULT OFF (boss-confirmed build decision) — Stage 1 scaffold only; neither
+    // withMemoryWriteTxn()-wrapping of memory.ts write paths nor the directed
+    // agent-messages store is wired to any production call site in this stage.
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('memory_write_ordering_enabled', 0)")
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('directed_messaging_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
