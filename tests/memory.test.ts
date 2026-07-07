@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { MemoryDB } from '../memory'
 import { TaskDB } from '../db'
 import { unlinkSync, readFileSync } from 'fs'
@@ -983,5 +983,82 @@ describe('P5 EPIC-02 — saveMemory write-ordering (ATM-002)', () => {
         try { unlinkSync(dbPathOff + suffix) } catch {}
       }
     }
+  })
+})
+
+// --- P5 EPIC-03 (ATM-005/ATM-007): challengeMemory write-ordering wiring ---
+describe('P5 EPIC-03 — challengeMemory write-ordering (ATM-005/ATM-007)', () => {
+  let dbPathOn: string
+  let taskDbOn: TaskDB
+  let memOn: MemoryDB
+
+  beforeEach(() => {
+    dbPathOn = tempP5DbPath('challenge-atm005-on')
+    taskDbOn = new TaskDB(dbPathOn)
+    taskDbOn.setFeatureFlag('memory_write_ordering_enabled', true)
+    memOn = new MemoryDB(taskDbOn)
+  })
+
+  afterEach(() => {
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(dbPathOn + suffix) } catch {}
+    }
+  })
+
+  test('ATM-005: flag ON — a single challengeMemory() call still returns the same shape/values as pre-P5', () => {
+    const m = memOn.saveMemory({ agent: 'boss', content: 'atm005 fact', category: 'fact' })
+    const challenged = memOn.challengeMemory(m.id, 'atm005 outdated info')
+
+    expect(challenged).not.toBeNull()
+    expect(challenged!.id).toBe(m.id)
+    expect(challenged!.challenge_count).toBe(1)
+    expect(challenged!.state).toBe('disputed')
+    expect(challenged!.quality).toBeCloseTo(0.3, 1)
+    // Full pre-P5 Memory shape intact (all original columns present/typed).
+    expect(challenged!.agent).toBe('boss')
+    expect(challenged!.content).toBe('atm005 fact')
+    expect(challenged!.support_count).toBe(0)
+    expect(typeof challenged!.last_validated).toBe('string')
+    // P5-additive column: stamped when the flag is ON (REQ-010/ATM-013).
+    expect(challenged!.write_seq).not.toBeNull()
+  })
+
+  test('ATM-005: flag ON — returns null for a nonexistent memory (unchanged pre-P5 behavior)', () => {
+    expect(memOn.challengeMemory(999999, 'reason')).toBeNull()
+  })
+
+  test('ATM-007: fault-injection — UPDATE throws mid-critical-section leaves no orphaned audit_log row (all-or-nothing)', () => {
+    const m = memOn.saveMemory({ agent: 'boss', content: 'atm007 fact', category: 'fact' })
+    const db = taskDbOn.getHandle()
+    const original = db.prepare.bind(db)
+
+    const prepareSpy = spyOn(db, 'prepare').mockImplementation((sql: any, ...rest: any[]) => {
+      if (typeof sql === 'string' && sql.includes('UPDATE memories') && sql.includes('challenge_count')) {
+        return {
+          get: () => { throw new Error('atm007 simulated UPDATE fault') },
+          run: () => { throw new Error('atm007 simulated UPDATE fault') },
+        } as any
+      }
+      return original(sql, ...rest)
+    })
+
+    try {
+      expect(() => memOn.challengeMemory(m.id, 'atm007 reason')).toThrow('atm007 simulated UPDATE fault')
+    } finally {
+      prepareSpy.mockRestore()
+    }
+
+    const auditCount = db.prepare(
+      "SELECT COUNT(*) as c FROM audit_log WHERE action = 'memory_challenged' AND memory_id = ?"
+    ).get(m.id) as { c: number }
+    expect(auditCount.c).toBe(0)
+
+    // All-or-nothing: the mutation itself must also be rolled back — the row
+    // is unchanged from its pre-call state, not partially applied.
+    const row = db.prepare(
+      'SELECT challenge_count, quality, state FROM memories WHERE id = ?'
+    ).get(m.id) as { challenge_count: number; quality: number; state: string }
+    expect(row.challenge_count).toBe(0)
+    expect(row.state).toBe('active')
   })
 })

@@ -364,29 +364,81 @@ export class MemoryDB {
   }
 
   challengeMemory(id: number, reason: string): Memory | null {
-    return this.taskDb.run(db => {
-      const existing = db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as Memory | null
-      if (!existing) return null
+    // P5 (ATM-005/REQ-004): CLOSES finding #9 — the feature flag lives on
+    // `this.taskDb` (a TaskDB method), NEVER on the raw `db` handle passed
+    // into a run()/withMemoryWriteTxn() callback, which has no such method.
+    const orderingOn = this.taskDb.isFeatureEnabled('memory_write_ordering_enabled')
+    if (orderingOn) {
+      // P5 (REQ-026/ATM-031): invoked DIRECTLY against taskDb.getHandle() —
+      // never nested inside taskDb.run(db => ...) — so TaskDB.run()'s
+      // reconnect-and-replay can never wrap an open write transaction.
+      return withMemoryWriteTxn(this.taskDb.getHandle(), db => this.challengeMemoryCritical(db, id, reason, true))
+    }
+    return this.taskDb.run(db => this.challengeMemoryCritical(db, id, reason, false))
+  }
 
-      const newChallengeCount = existing.challenge_count + 1
-      const shouldDispute = newChallengeCount > existing.support_count
-      const newQuality = shouldDispute ? Math.max(existing.quality - 0.2, 0) : existing.quality
-      const newState = shouldDispute ? 'disputed' : existing.state
+  /**
+   * P5 Stage 3 (EPIC-03): the extracted challengeMemory critical section.
+   * Preserves ALL pre-existing behavior byte-for-byte on the
+   * `orderingOn === false` path (same SELECT, same compute, same UPDATE SQL
+   * text, same audit_log INSERT). When `orderingOn` is true, the UPDATE is
+   * ADDITIONALLY stamped with a `write_seq` drawn from `nextWriteSeq()`
+   * (REQ-010) — the ON/OFF SQL text is intentionally NOT shared so the OFF
+   * path never mentions `write_seq` at all (REQ-022 additive-schema parity).
+   * The audit_log INSERT (REQ-005/ATM-007) stays in the SAME critical section
+   * as the UPDATE — on the ON path that means the SAME withMemoryWriteTxn()
+   * transaction, so an UPDATE failure means no audit row, and (since the
+   * audit INSERT is the last statement before the transaction commits) an
+   * audit-INSERT failure would also roll back the UPDATE — all-or-nothing.
+   */
+  private challengeMemoryCritical(db: Database, id: number, reason: string, orderingOn: boolean): Memory | null {
+    const existing = db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as Memory | null
+    if (!existing) return null
 
-      const updated = db.prepare(`
+    // P5 (ATM-033/REQ-027b): read->write interleave barrier — flag-OFF branch
+    // ONLY, at the exact boundary between the SELECT above and the
+    // compute+UPDATE below. No-op unless P5_TEST_BARRIER is set. Lives here
+    // in challengeMemoryCritical (a separate method from challengeMemory's
+    // withMemoryWriteTxn(...) call expression), so it is never lexically
+    // inside that call — keeping the ATM-033(c) source-level regression check
+    // green. NEVER wired into the orderingOn branch (REQ-027 forbids placing
+    // this seam inside a withMemoryWriteTxn()-wrapped path).
+    if (!orderingOn) {
+      waitForBarrier(db, process.env.P5_TEST_BARRIER ?? 'challenge', Number(process.env.P5_BARRIER_COUNT ?? 0))
+    }
+
+    const newChallengeCount = existing.challenge_count + 1
+    const shouldDispute = newChallengeCount > existing.support_count
+    const newQuality = shouldDispute ? Math.max(existing.quality - 0.2, 0) : existing.quality
+    const newState = shouldDispute ? 'disputed' : existing.state
+
+    let updated: Memory
+    if (orderingOn) {
+      // P5 (ATM-013/REQ-010): stamp write_seq on the UPDATE. The ON/OFF SQL
+      // text is branched (not shared) so the OFF path never mentions
+      // write_seq at all (REQ-022 additive-schema parity).
+      const seq = nextWriteSeq(db)
+      updated = db.prepare(`
+        UPDATE memories
+        SET challenge_count = ?, quality = ?, state = ?, last_validated = datetime('now'), write_seq = ?
+        WHERE id = ?
+        RETURNING *
+      `).get(newChallengeCount, newQuality, newState, seq, id) as Memory
+    } else {
+      updated = db.prepare(`
         UPDATE memories
         SET challenge_count = ?, quality = ?, state = ?, last_validated = datetime('now')
         WHERE id = ?
         RETURNING *
       `).get(newChallengeCount, newQuality, newState, id) as Memory
+    }
 
-      db.prepare(`
-        INSERT INTO audit_log (agent, action, detail, memory_id)
-        VALUES ('system', 'memory_challenged', ?, ?)
-      `).run(reason, id)
+    db.prepare(`
+      INSERT INTO audit_log (agent, action, detail, memory_id)
+      VALUES ('system', 'memory_challenged', ?, ?)
+    `).run(reason, id)
 
-      return updated
-    })
+    return updated
   }
 
   supersedeMemory(oldId: number, newContent: string, reason: string): { old: Memory, new: Memory } | null {
