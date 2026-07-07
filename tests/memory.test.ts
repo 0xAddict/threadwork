@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { MemoryDB } from '../memory'
 import { TaskDB } from '../db'
 import { unlinkSync, readFileSync } from 'fs'
@@ -898,5 +898,90 @@ describe('supersedeMemory P4 anti-laundering (Stage 3, ATM-025)', () => {
     expect(result!.new.state).toBe('active')
     expect(auditRows('memory_content_neutralized')).toHaveLength(0)
     expect(auditRows('memory_durability_clamped')).toHaveLength(0)
+  })
+})
+
+// --- P5 EPIC-02 (ATM-002/ATM-013): saveMemory write-ordering wiring ---
+// Every test here uses its own explicit /tmp/p5-*-<uuid>.db TaskDB — never a
+// no-arg `new TaskDB()` (which would hit the live DB_PATH default).
+function tempP5DbPath(name: string): string {
+  return `/tmp/p5-${name}-${crypto.randomUUID()}.db`
+}
+
+describe('P5 EPIC-02 — saveMemory write-ordering (ATM-002)', () => {
+  let dbPathOn: string
+  let taskDbOn: TaskDB
+  let memOn: MemoryDB
+
+  beforeEach(() => {
+    dbPathOn = tempP5DbPath('savemem-atm002-on')
+    taskDbOn = new TaskDB(dbPathOn)
+    taskDbOn.setFeatureFlag('memory_write_ordering_enabled', true)
+    memOn = new MemoryDB(taskDbOn)
+  })
+
+  afterEach(() => {
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(dbPathOn + suffix) } catch {}
+    }
+  })
+
+  test('flag ON: two sequential saveMemory calls with identical normalized content dedup to ONE row, support_count === 1', () => {
+    const first = memOn.saveMemory({ agent: 'boss', content: 'atm002 dup content', category: 'fact' })
+    expect(first.support_count).toBe(0)
+
+    const second = memOn.saveMemory({ agent: 'boss', content: 'ATM002   Dup Content', category: 'fact' })
+    expect(second.id).toBe(first.id)
+    expect(second.support_count).toBe(1)
+
+    const row = taskDbOn.getHandle().prepare(
+      "SELECT COUNT(*) as c FROM memories WHERE agent = 'boss' AND state = 'active'"
+    ).get() as { c: number }
+    expect(row.c).toBe(1)
+  })
+
+  test('flag ON: write_seq stamped non-NULL on INSERT, re-stamped (larger) on the dedup UPDATE, and write_sequence grows by one row per stamp', () => {
+    const first = memOn.saveMemory({ agent: 'boss', content: 'atm013 seq content', category: 'fact' })
+    expect(first.write_seq).not.toBeNull()
+
+    const countAfterFirst = (
+      taskDbOn.getHandle().prepare('SELECT COUNT(*) as c FROM write_sequence').get() as { c: number }
+    ).c
+
+    const second = memOn.saveMemory({ agent: 'boss', content: 'ATM013   Seq   Content', category: 'fact' })
+    expect(second.id).toBe(first.id)
+    expect(second.write_seq).not.toBeNull()
+    expect(second.write_seq!).toBeGreaterThan(first.write_seq!)
+
+    const countAfterSecond = (
+      taskDbOn.getHandle().prepare('SELECT COUNT(*) as c FROM write_sequence').get() as { c: number }
+    ).c
+    expect(countAfterSecond).toBe(countAfterFirst + 1)
+
+    // The row's write_seq was OVERWRITTEN to the later dedup-UPDATE value —
+    // demonstrating why memories.write_seq alone cannot reconstruct history.
+    const row = taskDbOn.getHandle().prepare('SELECT write_seq FROM memories WHERE id = ?').get(first.id) as { write_seq: number }
+    expect(row.write_seq).toBe(second.write_seq)
+  })
+
+  test('flag OFF: single-process dedup behavior unchanged from pre-P5, write_seq stays NULL (REQ-022 parity)', () => {
+    const dbPathOff = tempP5DbPath('savemem-atm002-off')
+    const taskDbOff = new TaskDB(dbPathOff)
+    const memOff = new MemoryDB(taskDbOff)
+
+    try {
+      const first = memOff.saveMemory({ agent: 'boss', content: 'atm002 off dup content', category: 'fact' })
+      expect(first.support_count).toBe(0)
+      expect(first.write_seq).toBeNull()
+
+      const second = memOff.saveMemory({ agent: 'boss', content: 'ATM002   OFF   Dup Content', category: 'fact' })
+      expect(second.id).toBe(first.id)
+      expect(second.support_count).toBe(1)
+      expect(second.write_seq).toBeNull()
+    } finally {
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { unlinkSync(dbPathOff + suffix) } catch {}
+      }
+    }
   })
 })

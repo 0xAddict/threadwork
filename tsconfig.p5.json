@@ -26,6 +26,8 @@
     "memory-integrity-patterns.ts",
     "tests/fixtures/concurrency-barrier.ts",
     "tests/memory-ordering.test.ts",
-    "tests/fixtures/concurrency-barrier.test.ts"
+    "tests/fixtures/concurrency-barrier.test.ts",
+    "tests/memory-ordering-concurrency.test.ts",
+    "tests/fixtures/concurrent-save-memory-worker.ts"
   ]
 }

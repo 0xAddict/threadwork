@@ -1,14 +1,17 @@
 // tests/memory-ordering.test.ts — P5 Stage 1: ATM-001, ATM-030, ATM-031, ATM-012.
+// Stage 2 adds ATM-004 (saveMemory composition-boundary check).
 //
 // Every test opens its own explicit /tmp/p5-*-<uuid>.db TaskDB — NEVER
 // `new TaskDB()` with no argument (that would hit the live DB_PATH default,
 // which has P4 memory-sanitization LIVE at flag=1 in production).
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { Worker } from 'worker_threads'
 import { unlinkSync } from 'fs'
 import { TaskDB } from '../db'
+import { MemoryDB } from '../memory'
+import * as memoryIntegrity from '../memory-integrity'
 import {
   withMemoryWriteTxn,
   nextWriteSeq,
@@ -254,5 +257,74 @@ describe('nextWriteSeq — ATM-012', () => {
     expect(seqInsideTxn).toBeGreaterThan(0)
     const row = db.prepare('SELECT id FROM write_sequence WHERE id = ?').get(seqInsideTxn as number)
     expect(row).toBeNull()
+  })
+})
+
+describe('saveMemory composition boundary — ATM-004 (REQ-003)', () => {
+  // [CLOSES adversarial finding #4] Proves P5's withMemoryWriteTxn() wraps
+  // wherever P4's sanitize call lands, WITHOUT asserting anything about
+  // sanitizeMemoryContent()'s own signature (P4 locks that to
+  // `(content, {sourceType})` — no `db` param). We replace the module-level
+  // `sanitizeMemoryContent` export with a spy that calls the P5-OWNED
+  // isWriteTxnActive(db) hook on the SAME handle the test holds, and records
+  // the boolean. The spy itself never receives/inspects a `db` argument —
+  // it closes over the test's own `db` reference instead.
+  //
+  // Direct reassignment of an ES module namespace export
+  // (`memoryIntegrity.sanitizeMemoryContent = spy`) throws under Bun
+  // ("Attempted to assign to readonly property") — live ESM bindings are
+  // non-writable. `mock.module()` (the spec's documented fallback) was tried
+  // first, but is UNSAFE here: Bun's `mock.module()` replacements are NOT
+  // reliably file-scoped and `mock.restore()` does not undo them (confirmed
+  // empirically, and a known upstream limitation — oven-sh/bun#7823,
+  // oven-sh/bun#12823), so a `mock.module()` call in this file would
+  // permanently corrupt tests/memory.test.ts's real (unmocked)
+  // sanitizeMemoryContent assertions whenever both files run in the same
+  // `bun test` invocation (as required by this project's P5 gate command).
+  //
+  // Instead, this uses `spyOn(namespaceObject, 'exportName')` on a `import *
+  // as memoryIntegrity` namespace reference: Bun's `spyOn` CAN patch a live
+  // ESM binding (verified empirically) and its returned spy's
+  // `.mockRestore()` reliably reverts JUST that one property, both within a
+  // single test and across test files in the same process/invocation —
+  // avoiding the whole-module-registry-replacement class of bug entirely.
+  let dbPath: string
+  let taskDb: TaskDB
+  let db: Database
+  let sanitizeSpy: ReturnType<typeof spyOn> | undefined
+
+  beforeEach(() => {
+    dbPath = tempDbPath('ordering-atm004')
+    taskDb = new TaskDB(dbPath)
+    taskDb.setFeatureFlag('memory_write_ordering_enabled', true)
+    // Sanitize must be ON too, or saveMemoryCritical never reaches the
+    // sanitize call site at all.
+    taskDb.setFeatureFlag('memory_sanitization_enabled', true)
+    db = taskDb.getHandle()
+  })
+
+  afterEach(() => {
+    sanitizeSpy?.mockRestore()
+    sanitizeSpy = undefined
+    cleanupDbFile(dbPath)
+  })
+
+  test('the sanitize call site fires while a P5 write-transaction is open on the same db handle', () => {
+    let recordedActive: boolean | undefined
+
+    // Arbitrary pass-through spy — matches P4's (content, {sourceType})
+    // signature exactly, but the SPY intentionally never inspects `db`; it
+    // closes over the outer test's own `db` variable instead.
+    sanitizeSpy = spyOn(memoryIntegrity, 'sanitizeMemoryContent').mockImplementation(
+      (content: string, _opts: { sourceType: string }) => {
+        recordedActive = isWriteTxnActive(db)
+        return { text: content, neutralized: false }
+      }
+    )
+
+    const mem = new MemoryDB(taskDb)
+    mem.saveMemory({ agent: 'boss', content: 'atm004 composition content', category: 'fact' })
+
+    expect(recordedActive).toBe(true)
   })
 })
