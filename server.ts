@@ -50,6 +50,9 @@ import {
   getMandatoryCrossFamilyReviewClassifications,
   annotateWithFailureClass,
 } from './verification/cross-family-critique'
+// P8 Stage 6 (EPIC-04 wiring, REQ-013/ATM-020/021) — additive import of the
+// single ternary-reward orchestrator. See the finalize_decision hook below.
+import { assessAndPersistTernaryRewardForDecision } from './verification/ternary-reward'
 
 const db = new TaskDB(DB_PATH)
 const mem = new MemoryDB(db)
@@ -1821,6 +1824,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             outcome,
             memory_id: result.memory.id,
           })
+          // P8 Stage 6 (EPIC-04 wiring, REQ-013/ATM-020/021) — additive,
+          // flag-gated, try/catch-SWALLOWED ternary-reward assignment. Runs
+          // AFTER dec.finalizeDecision()/postToGroup/audit.log above have
+          // already fully succeeded. OQ-3 INVARIANT (REQ-013(a)): this block is
+          // SELF-CONTAINED — its OWN inner try/catch, with the
+          // ternary_reward_enabled flag-READ INSIDE it, so ANY throw (flag
+          // read, P6/P7 read, assign, or persist) is swallowed HERE and can
+          // NEVER reach the handler's pre-existing OUTER catch (:below) — the
+          // success response returned below, the decisions row already written
+          // by dec.finalizeDecision(), and the postToGroup/audit.log
+          // ('decision_finalized') calls above are completely unaffected.
+          try {
+            if (db.isFeatureEnabled('ternary_reward_enabled')) {
+              const rawDb = db.getHandle()
+              assessAndPersistTernaryRewardForDecision(rawDb, result.decision)
+            }
+          } catch {
+            // REQ-013(a): swallow — see the block comment above.
+          }
           return { content: [{ type: 'text', text: `Decision #${decisionId} finalized. Outcome: ${outcome}. Memory #${result.memory.id} created.` }] }
         } catch (err: any) {
           return { content: [{ type: 'text', text: `Finalize failed: ${err.message}`, isError: true }] }

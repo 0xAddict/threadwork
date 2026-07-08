@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "rewards": [-1, 0, 1],
+  "decisionTable": [
+    { "row": 1, "reward": -1, "match": { "cross_family_verdict": ["block"] } },
+    { "row": 2, "reward": -1, "match": { "failure_severity": ["critical", "high"] } },
+    {
+      "row": 3,
+      "reward": 1,
+      "match": {
+        "cross_family_verdict": ["concur"],
+        "failure_signal_available": [true],
+        "failure_severity": [null, "low"]
+      }
+    },
+    { "row": 4, "reward": 0, "match": { "cross_family_verdict": ["dissent"] } },
+    { "row": 5, "reward": 0, "match": {} }
+  ]
+}

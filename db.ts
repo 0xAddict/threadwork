@@ -619,6 +619,11 @@ export class TaskDB {
     // production call site in this stage (server.ts wiring lands in a later
     // stage).
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('cross_family_critique_enabled', 0)")
+    // P8 EPIC-06 (REQ-016/ATM-025): durable ternary-reward persistence. DEFAULT
+    // OFF — persistTernaryReward() (verification/ternary-reward.ts) is a
+    // flag-gated no-op and the finalize_decision wiring hook is inert until this
+    // flag is turned ON (server.ts wiring lands in a later stage).
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('ternary_reward_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
@@ -1143,6 +1148,36 @@ export class TaskDB {
       CREATE INDEX IF NOT EXISTS idx_cross_family_critiques_decision ON cross_family_critiques(decision_id);
       CREATE INDEX IF NOT EXISTS idx_cross_family_critiques_verdict ON cross_family_critiques(verdict);
       CREATE INDEX IF NOT EXISTS idx_cross_family_critiques_created ON cross_family_critiques(created_at);
+    `)
+
+    // P8 EPIC-04 (REQ-010/ATM-016): durable ternary-reward persistence.
+    // Mirrors the cross_family_critiques idiom above (CREATE TABLE IF NOT
+    // EXISTS + supporting indexes) — a NEW companion table layered over
+    // decision.ts's existing finalize path, editing zero lines of the existing
+    // decisions/decision_positions/decision_critiques/cross_family_critiques/
+    // failure_classifications table definitions. Written by
+    // persistTernaryReward() in verification/ternary-reward.ts. The
+    // failure_signal_available column is NOT NULL with NO SQL DEFAULT — every
+    // insert path MUST populate it EXPLICITLY (0=UNKNOWN, 1=P6 signal read), so
+    // an omitted value is a hard NOT-NULL error and is never silently treated
+    // as "available" (REQ-010/REQ-011(b)).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ternary_rewards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        policy_version INTEGER NOT NULL,
+        decision_id INTEGER REFERENCES decisions(id),
+        task_id INTEGER,
+        subject_kind TEXT NOT NULL,
+        cross_family_verdict TEXT,
+        failure_severity TEXT,
+        failure_signal_available INTEGER NOT NULL,
+        reward INTEGER NOT NULL CHECK(reward IN (-1,0,1)),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ternary_rewards_decision ON ternary_rewards(decision_id);
+      CREATE INDEX IF NOT EXISTS idx_ternary_rewards_reward ON ternary_rewards(reward);
+      CREATE INDEX IF NOT EXISTS idx_ternary_rewards_created ON ternary_rewards(created_at);
     `)
   }
 
