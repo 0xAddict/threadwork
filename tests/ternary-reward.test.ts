@@ -29,11 +29,12 @@
 // This file grows in later P8 build stages (EPIC-04 onward) — do NOT
 // add persistence/wiring tests here yet (later stages).
 
-import { describe, test, expect } from 'bun:test'
-import { readFileSync } from 'node:fs'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Database } from 'bun:sqlite'
 import taxonomySnapshot from './fixtures/ternary-reward-taxonomy.snapshot.json'
+import { TaskDB } from '../db'
 import {
   TernaryReward,
   TernaryRewardValue,
@@ -48,11 +49,52 @@ import {
   aggregateCrossFamilyVerdict,
   worstMandatoryFailureSeverity,
   resolveTernaryRewardSignal,
+  persistTernaryReward,
+  hasTernaryReward,
+  type TernaryRewardRecord,
 } from '../verification/ternary-reward'
 import { ALL_FAILURE_CLASSES, ALL_FAILURE_SEVERITIES } from '../verification/failure-classification'
 import { ALL_CROSS_FAMILY_VERDICTS } from '../verification/cross-family-critique'
 import type { PersistedCrossFamilyCritique } from '../verification/cross-family-critique'
 import type { PersistedFailureClassification } from '../verification/failure-classification'
+
+/** Removes a sqlite db file plus its -shm/-wal sidecars, tolerating "doesn't exist". */
+function wipeDbFile(path: string): void {
+  for (const suffix of ['', '-shm', '-wal']) {
+    try {
+      unlinkSync(path + suffix)
+    } catch {
+      /* doesn't exist yet */
+    }
+  }
+}
+
+/** Inserts a real decisions row, returning its id (mirrors P7's insertDecision helper). */
+function insertDecisionRow(db: Database, opts: { taskId?: number | null } = {}): number {
+  const row = db
+    .prepare(`
+      INSERT INTO decisions (title, context, opened_by, task_id)
+      VALUES (?, ?, ?, ?)
+      RETURNING id
+    `)
+    .get('p8 test decision', null, 'boss', opts.taskId === undefined ? null : opts.taskId) as { id: number }
+  return row.id
+}
+
+/** Builds a TernaryRewardRecord with sane defaults, override-able per test. */
+function makeRewardRecord(overrides: Partial<TernaryRewardRecord> = {}): TernaryRewardRecord {
+  return {
+    policy_version: 1,
+    decision_id: null,
+    task_id: null,
+    subject_kind: 'decision',
+    cross_family_verdict: null,
+    failure_severity: null,
+    failure_signal_available: false,
+    reward: 0,
+    ...overrides,
+  }
+}
 
 const MODULE_SOURCE = readFileSync(join(import.meta.dir, '..', 'verification', 'ternary-reward.ts'), 'utf8')
 
@@ -1041,5 +1083,394 @@ describe('ATM-015: import-scope guardrail (only the two read accessors + type-on
         /import\s*\{\s*getFailureClassifications\s*\}/.test(line)
       expect(ok).toBe(true)
     }
+  })
+})
+
+// ===========================================================================
+// STAGE 4 of build-p8/PLAN.md: EPIC-04 (Persistence + read predicate + audit
+// atomicity) — ATM-016, ATM-017, ATM-018, ATM-019, ATM-028 (+ the ATM-025
+// flag-seed precondition). These use a REAL fixture TaskDB (bun:sqlite,
+// migrate()'d in its constructor); all assertions live in this P8-OWNED file
+// (NOT the shared tests/db.test.ts), mirroring how P7 kept its own db
+// assertions in tests/cross-family-critique.test.ts.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// ATM-016 / REQ-010 [P1] — ternary_rewards table + 3 indexes
+// ---------------------------------------------------------------------------
+describe('ATM-016: ternary_rewards table + indexes (REQ-010)', () => {
+  const TEST_DB = '/tmp/p8-tr-atm016.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-016: ternary_rewards has exactly the documented columns', () => {
+    const columns = taskDb.run((db) => db.prepare("PRAGMA table_info('ternary_rewards')").all()) as {
+      name: string
+    }[]
+    const columnNames = columns.map((c) => c.name).sort()
+    expect(columnNames).toEqual(
+      [
+        'id',
+        'policy_version',
+        'decision_id',
+        'task_id',
+        'subject_kind',
+        'cross_family_verdict',
+        'failure_severity',
+        'failure_signal_available',
+        'reward',
+        'created_at',
+      ].sort(),
+    )
+  })
+
+  test('ATM-016: failure_signal_available is NOT NULL with NO SQL default (notnull=1, dflt_value=NULL)', () => {
+    const columns = taskDb.run((db) => db.prepare("PRAGMA table_info('ternary_rewards')").all()) as {
+      name: string
+      notnull: number
+      dflt_value: string | null
+    }[]
+    const col = columns.find((c) => c.name === 'failure_signal_available')
+    expect(col).toBeDefined()
+    expect(col!.notnull).toBe(1)
+    expect(col!.dflt_value).toBeNull()
+  })
+
+  test('ATM-016: reward column carries a CHECK constraint (reward IN (-1,0,1))', () => {
+    const sql = taskDb.run(
+      (db) =>
+        (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='ternary_rewards'").get() as {
+          sql: string
+        }).sql,
+    )
+    expect(sql).toMatch(/CHECK\s*\(\s*reward\s+IN\s*\(\s*-1\s*,\s*0\s*,\s*1\s*\)\s*\)/i)
+  })
+
+  test('ATM-016: 3 indexes exist covering decision_id, reward, and created_at', () => {
+    const indexes = taskDb.run((db) => db.prepare("PRAGMA index_list('ternary_rewards')").all()) as {
+      name: string
+    }[]
+    const coveredColumns = new Set<string>()
+    for (const idx of indexes) {
+      const infoRows = taskDb.run((db) => db.prepare(`PRAGMA index_info('${idx.name}')`).all()) as { name: string }[]
+      for (const row of infoRows) coveredColumns.add(row.name)
+    }
+    expect(coveredColumns.has('decision_id')).toBe(true)
+    expect(coveredColumns.has('reward')).toBe(true)
+    expect(coveredColumns.has('created_at')).toBe(true)
+  })
+
+  test('ATM-016: existing decision/P6/P7 table schemas are UNCHANGED by this additive edit', () => {
+    const cols = (name: string) =>
+      (taskDb.run((db) => db.prepare(`PRAGMA table_info('${name}')`).all()) as { name: string }[]).map((c) => c.name)
+
+    expect(cols('decisions')).toEqual([
+      'id',
+      'title',
+      'context',
+      'opened_by',
+      'status',
+      'finalized_by',
+      'outcome',
+      'outcome_rationale',
+      'expires_at',
+      'memory_id',
+      'task_id',
+      'created_at',
+      'updated_at',
+      'finalized_at',
+    ])
+    expect(cols('decision_positions')).toEqual([
+      'id',
+      'decision_id',
+      'agent',
+      'position',
+      'rationale',
+      'evidence',
+      'created_at',
+    ])
+    expect(cols('decision_critiques')).toEqual([
+      'id',
+      'decision_id',
+      'position_id',
+      'agent',
+      'critique',
+      'severity',
+      'created_at',
+    ])
+    expect(cols('cross_family_critiques')).toEqual([
+      'id',
+      'taxonomy_version',
+      'decision_id',
+      'critique_id',
+      'position_id',
+      'producer_agent',
+      'producer_family',
+      'critic_agent',
+      'critic_family',
+      'is_cross_family',
+      'verdict',
+      'linked_failure_class',
+      'created_at',
+    ])
+    expect(cols('failure_classifications')).toEqual([
+      'id',
+      'taxonomy_version',
+      'failure_class',
+      'severity',
+      'transience',
+      'domain',
+      'signal_source',
+      'source_ref',
+      'task_id',
+      'agent',
+      'summary',
+      'raw_signal_json',
+      'created_at',
+    ])
+  })
+
+  test('ATM-025 (flag-seed precondition): ternary_reward_enabled defaults to 0 (OFF) on fresh migrate()', () => {
+    expect(taskDb.isFeatureEnabled('ternary_reward_enabled')).toBe(false)
+    const row = taskDb.run(
+      (db) => db.prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'ternary_reward_enabled'").get(),
+    ) as { enabled: number } | null
+    expect(row).not.toBeNull()
+    expect(row!.enabled).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-017 / REQ-011 [P1] — persistTernaryReward()
+// ---------------------------------------------------------------------------
+describe('ATM-017: persistTernaryReward() (REQ-011)', () => {
+  const TEST_DB = '/tmp/p8-tr-atm017.db'
+  let taskDb: TaskDB
+  let decisionId: number
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    taskDb.setFeatureFlag('ternary_reward_enabled', true)
+    decisionId = taskDb.run((db) => insertDecisionRow(db, { taskId: 501 }))
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-017: 3 sequential inserts → 3 rows, strictly increasing ids, created_at populated, full round-trip', () => {
+    const ids: (number | null)[] = []
+    for (let i = 0; i < 3; i++) {
+      ids.push(
+        taskDb.run((db) =>
+          persistTernaryReward(
+            db,
+            makeRewardRecord({
+              decision_id: decisionId,
+              task_id: 501,
+              reward: (i - 1) as TernaryReward, // -1, 0, 1
+              cross_family_verdict: 'concur',
+              failure_severity: 'low',
+              failure_signal_available: true,
+            }),
+          ),
+        ),
+      )
+    }
+    expect(ids.every((id) => typeof id === 'number')).toBe(true)
+    expect((ids[1] as number) > (ids[0] as number)).toBe(true)
+    expect((ids[2] as number) > (ids[1] as number)).toBe(true)
+
+    const rows = taskDb.run((db) =>
+      db.prepare('SELECT * FROM ternary_rewards ORDER BY id ASC').all(),
+    ) as Record<string, unknown>[]
+    expect(rows.length).toBe(3)
+    for (const r of rows) {
+      expect(r.created_at).toBeTruthy()
+      expect(r.subject_kind).toBe('decision')
+      expect(r.decision_id).toBe(decisionId)
+      expect(r.policy_version).toBe(1)
+    }
+  })
+
+  test('ATM-017: failure_signal_available is persisted EXPLICITLY as 1 (true) and 0 (false)', () => {
+    taskDb.run((db) =>
+      persistTernaryReward(db, makeRewardRecord({ decision_id: decisionId, failure_signal_available: true, reward: 1, cross_family_verdict: 'concur' })),
+    )
+    taskDb.run((db) =>
+      persistTernaryReward(db, makeRewardRecord({ decision_id: decisionId, failure_signal_available: false, reward: 0 })),
+    )
+    const rows = taskDb.run((db) =>
+      db.prepare('SELECT failure_signal_available FROM ternary_rewards ORDER BY id ASC').all(),
+    ) as { failure_signal_available: number }[]
+    expect(rows[0].failure_signal_available).toBe(1)
+    expect(rows[1].failure_signal_available).toBe(0)
+  })
+
+  test('ATM-017: source-level — persistTernaryReward uses a LOCAL BEGIN IMMEDIATE, imports NO memory-ordering symbol, and populates failure_signal_available explicitly', () => {
+    expect(MODULE_SOURCE).toMatch(/db\.prepare\(\s*['"]BEGIN IMMEDIATE['"]\s*\)\.run\(\)/)
+    expect(MODULE_SOURCE).not.toContain('memory-ordering')
+    expect(MODULE_SOURCE).not.toContain('withMemoryWriteTxn')
+    expect(MODULE_SOURCE).not.toContain('nextWriteSeq')
+    // explicit 0/1 coercion at the insert site, not a DB default
+    expect(MODULE_SOURCE).toMatch(/record\.failure_signal_available\s*\?\s*1\s*:\s*0/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-018 / REQ-011(a) [P1] — flag gate
+// ---------------------------------------------------------------------------
+describe('ATM-018: persistTernaryReward() flag gate (REQ-011(a))', () => {
+  const TEST_DB = '/tmp/p8-tr-atm018.db'
+  let taskDb: TaskDB
+  let decisionId: number
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    decisionId = taskDb.run((db) => insertDecisionRow(db, { taskId: 601 }))
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-018: flag OFF → returns null, no row inserted, no transaction', () => {
+    // flag defaults to 0 (OFF) — do NOT enable.
+    const id = taskDb.run((db) => persistTernaryReward(db, makeRewardRecord({ decision_id: decisionId })))
+    expect(id).toBeNull()
+    const count = taskDb.run(
+      (db) => (db.prepare('SELECT count(*) AS n FROM ternary_rewards').get() as { n: number }).n,
+    )
+    expect(count).toBe(0)
+  })
+
+  test('ATM-018: flag ON → row inserted, non-null id returned', () => {
+    taskDb.setFeatureFlag('ternary_reward_enabled', true)
+    const id = taskDb.run((db) => persistTernaryReward(db, makeRewardRecord({ decision_id: decisionId, reward: -1, cross_family_verdict: 'block' })))
+    expect(id).not.toBeNull()
+    expect(typeof id).toBe('number')
+    const count = taskDb.run(
+      (db) => (db.prepare('SELECT count(*) AS n FROM ternary_rewards').get() as { n: number }).n,
+    )
+    expect(count).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-019 / REQ-012 [P1] — hasTernaryReward()
+// ---------------------------------------------------------------------------
+describe('ATM-019: hasTernaryReward() (REQ-012)', () => {
+  const TEST_DB = '/tmp/p8-tr-atm019.db'
+  let taskDb: TaskDB
+  let decisionId: number
+  let otherDecisionId: number
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    taskDb.setFeatureFlag('ternary_reward_enabled', true)
+    decisionId = taskDb.run((db) => insertDecisionRow(db, { taskId: 700 }))
+    otherDecisionId = taskDb.run((db) => insertDecisionRow(db, { taskId: 701 }))
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-019: 0 rows → false; own row → true; other decision row → still false; non-existent → false', () => {
+    expect(taskDb.run((db) => hasTernaryReward(db, decisionId))).toBe(false)
+
+    taskDb.run((db) => persistTernaryReward(db, makeRewardRecord({ decision_id: decisionId, reward: 1, cross_family_verdict: 'concur', failure_signal_available: true, failure_severity: 'low' })))
+    expect(taskDb.run((db) => hasTernaryReward(db, decisionId))).toBe(true)
+
+    // a row for a DIFFERENT decision does not flip our decision's predicate
+    expect(taskDb.run((db) => hasTernaryReward(db, otherDecisionId))).toBe(false)
+
+    // a non-existent decisionId → false, no throw
+    expect(taskDb.run((db) => hasTernaryReward(db, 999999))).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-028 / REQ-019 [P2] — audit atomicity, two-direction fault injection
+// ---------------------------------------------------------------------------
+describe('ATM-028: audit atomicity, two-direction fault injection (REQ-019)', () => {
+  const TEST_DB = '/tmp/p8-tr-atm028.db'
+  let taskDb: TaskDB
+  let decisionId: number
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    taskDb.setFeatureFlag('ternary_reward_enabled', true)
+    decisionId = taskDb.run((db) => insertDecisionRow(db, { taskId: 950 }))
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-028 (a) happy path: exactly ONE audit_log row action=ternary_reward_assigned, detail carries all 5 fields', () => {
+    const id = taskDb.run((db) =>
+      persistTernaryReward(
+        db,
+        makeRewardRecord({
+          decision_id: decisionId,
+          task_id: 950,
+          reward: -1,
+          cross_family_verdict: 'block',
+          failure_severity: 'high',
+          failure_signal_available: true,
+        }),
+      ),
+    )
+    expect(id).not.toBeNull()
+
+    const auditRows = taskDb.run((db) =>
+      db.prepare("SELECT * FROM audit_log WHERE action = 'ternary_reward_assigned'").all(),
+    ) as Record<string, unknown>[]
+    expect(auditRows.length).toBe(1)
+    expect(auditRows[0].task_id).toBe(950)
+
+    const detail = JSON.parse(auditRows[0].detail as string)
+    expect(detail.decision_id).toBe(decisionId)
+    expect(detail.reward).toBe(-1)
+    expect(detail.cross_family_verdict).toBe('block')
+    expect(detail.failure_severity).toBe('high')
+    expect(detail.failure_signal_available).toBe(true)
+  })
+
+  test('ATM-028 (b) audit direction: forcing the AUDIT insert to throw rolls back the ternary_rewards row too (0 rows), persist rethrows', () => {
+    taskDb.run((db) => db.exec('ALTER TABLE audit_log RENAME TO audit_log_atm028_bak'))
+    try {
+      let threw = false
+      try {
+        taskDb.run((db) => persistTernaryReward(db, makeRewardRecord({ decision_id: decisionId, reward: 1, cross_family_verdict: 'concur', failure_signal_available: true })))
+      } catch {
+        threw = true
+      }
+      expect(threw).toBe(true)
+      const count = taskDb.run(
+        (db) => (db.prepare('SELECT count(*) AS n FROM ternary_rewards').get() as { n: number }).n,
+      )
+      expect(count).toBe(0)
+    } finally {
+      taskDb.run((db) => db.exec('ALTER TABLE audit_log_atm028_bak RENAME TO audit_log'))
+    }
+  })
+
+  test('ATM-028 (b) ternary direction: forcing the ternary_rewards insert to throw leaves NO audit_log row', () => {
+    taskDb.run((db) => db.exec('ALTER TABLE ternary_rewards RENAME TO ternary_rewards_atm028_bak'))
+    try {
+      let threw = false
+      try {
+        taskDb.run((db) => persistTernaryReward(db, makeRewardRecord({ decision_id: decisionId, reward: 1, cross_family_verdict: 'concur', failure_signal_available: true })))
+      } catch {
+        threw = true
+      }
+      expect(threw).toBe(true)
+    } finally {
+      taskDb.run((db) => db.exec('ALTER TABLE ternary_rewards_atm028_bak RENAME TO ternary_rewards'))
+    }
+
+    const auditRows = taskDb.run((db) =>
+      db.prepare("SELECT * FROM audit_log WHERE action = 'ternary_reward_assigned'").all(),
+    ) as Record<string, unknown>[]
+    expect(auditRows.length).toBe(0)
   })
 })

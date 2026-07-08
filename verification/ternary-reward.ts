@@ -327,3 +327,121 @@ export function resolveTernaryRewardSignal(
 
   return { cross_family_verdict, failure_severity, failure_signal_available }
 }
+
+// ---------------------------------------------------------------------------
+// EPIC-04 / REQ-010, REQ-011, REQ-012, REQ-019 (ATM-016..019, ATM-028) —
+// Persistence, read predicate & audit atomicity.
+//
+// The `ternary_rewards` table + `ternary_reward_enabled` flag are created in
+// TaskDB.migrate() (db.ts, additive). persistTernaryReward() mirrors P7's
+// persistCrossFamilyCritique() EXACTLY: flag-gate BEFORE any transaction, a
+// LOCAL `BEGIN IMMEDIATE` wrapping the row INSERT + the audit INSERT (so the
+// two are all-or-nothing), ROLLBACK+rethrow on any throw, and ZERO import of
+// any P5 write-ordering symbol (its write-transaction wrapper or its sequence
+// minter).
+// ---------------------------------------------------------------------------
+
+/**
+ * The write payload for persistTernaryReward(). `failure_signal_available` is
+ * a boolean here and is persisted EXPLICITLY as `0`/`1` (the column carries no
+ * SQL DEFAULT — REQ-010/REQ-011(b)). `reward` is CHECK-constrained to
+ * `{-1,0,1}` at the DB level.
+ */
+export interface TernaryRewardRecord {
+  policy_version: number
+  decision_id: number | null
+  task_id: number | null
+  subject_kind: string
+  cross_family_verdict: string | null
+  failure_severity: string | null
+  failure_signal_available: boolean
+  reward: TernaryReward
+}
+
+/**
+ * ATM-017/ATM-018/ATM-028 / REQ-011/REQ-019 — Persists a TernaryRewardRecord
+ * as a durable row in ternary_rewards (migrate()'d in db.ts), plus a matching
+ * audit_log row (action='ternary_reward_assigned') — both inside ONE LOCAL
+ * `BEGIN IMMEDIATE` transaction, so a failure on either write rolls back both
+ * (ATM-028 two-direction fault injection). Gated on the ternary_reward_enabled
+ * feature flag (REQ-011(a)): when the flag row is missing or `enabled` is not
+ * exactly 1, this returns null WITHOUT opening any transaction or inserting any
+ * row.
+ *
+ * Takes a raw `db: Database` handle (mirrors P6/P7's own persist fns). The
+ * `failure_signal_available` boolean is written EXPLICITLY as `0`/`1`
+ * (REQ-011(b)); the column has no SQL DEFAULT. This module imports NO P5
+ * write-ordering symbol — build-order independence from P5 is structural.
+ */
+export function persistTernaryReward(db: Database, record: TernaryRewardRecord): number | null {
+  // REQ-011(a): flag gate, checked BEFORE any transaction is opened.
+  const flagRow = db
+    .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'ternary_reward_enabled'")
+    .get() as { enabled: number } | null
+  if (!flagRow || flagRow.enabled !== 1) {
+    return null
+  }
+
+  db.prepare('BEGIN IMMEDIATE').run()
+  try {
+    const inserted = db
+      .prepare(`
+        INSERT INTO ternary_rewards (
+          policy_version, decision_id, task_id, subject_kind,
+          cross_family_verdict, failure_severity, failure_signal_available, reward
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING id
+      `)
+      .get(
+        record.policy_version,
+        record.decision_id,
+        record.task_id,
+        record.subject_kind,
+        record.cross_family_verdict,
+        record.failure_severity,
+        record.failure_signal_available ? 1 : 0, // EXPLICIT 0/1 — no DB default (REQ-011(b))
+        record.reward,
+      ) as { id: number }
+
+    // REQ-019/ATM-028: audit row, same local transaction, all-or-nothing with
+    // the insert above. action is DISTINCT from finalize_decision's own
+    // 'decision_finalized' row. detail records the full reward provenance.
+    const detail = {
+      decision_id: record.decision_id,
+      reward: record.reward,
+      cross_family_verdict: record.cross_family_verdict,
+      failure_severity: record.failure_severity,
+      failure_signal_available: record.failure_signal_available,
+    }
+    db.prepare(`
+      INSERT INTO audit_log (agent, action, detail, task_id)
+      VALUES (?, ?, ?, ?)
+    `).run('system', 'ternary_reward_assigned', JSON.stringify(detail), record.task_id)
+
+    db.prepare('COMMIT').run()
+    return inserted.id
+  } catch (err) {
+    try {
+      db.prepare('ROLLBACK').run()
+    } catch {}
+    throw err
+  }
+}
+
+/**
+ * ATM-019 / REQ-012 — READ-ONLY predicate: does this decision have >=1
+ * recorded ternary reward? Returns `true` IFF a ternary_rewards row exists for
+ * `decisionId`, `false` otherwise (INCLUDING for a non-existent decisionId).
+ * Mutates no table, and NEVER throws — any unexpected error is swallowed to
+ * `false`.
+ */
+export function hasTernaryReward(db: Database, decisionId: number): boolean {
+  try {
+    const row = db
+      .prepare('SELECT 1 AS present FROM ternary_rewards WHERE decision_id = ? LIMIT 1')
+      .get(decisionId) as { present: number } | null
+    return row !== null && row !== undefined
+  } catch {
+    return false
+  }
+}
