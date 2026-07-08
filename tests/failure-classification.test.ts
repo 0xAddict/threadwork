@@ -1121,6 +1121,77 @@ describe('ATM-022: append-only — no UPDATE/DELETE against failure_classificati
     }
     expect(offenders).toEqual([])
   })
+
+  // Codex round-3 fold (Finding 3 / REQ-011): the full-diff scan above is
+  // still a per-LINE regex (`updateRe.test(line)` / `deleteRe.test(line)`),
+  // so it only catches a SAME-LINE, unqualified UPDATE/DELETE statement —
+  // i.e. the verb and the table name sharing one physical line. Two
+  // bypasses slip past that:
+  //   (a) MULTI-LINE SQL — e.g. a `db.prepare()` template literal whose verb
+  //       token (matching `UPDATE\s+failure_classifications`, own line) and
+  //       table-name token land on separate physical lines — the per-line
+  //       regex never sees the two tokens together on one line.
+  //   (b) SCHEMA-QUALIFIED table names — e.g. a statement matching
+  //       `DELETE\s+FROM\s+main\.failure_classifications` — an intervening
+  //       schema prefix breaks the ORIGINAL regex's unqualified same-token
+  //       expectation (it has no `(\w+\.)?` allowance).
+  // This test closes both: it reads each changed file's FULL content (not
+  // diff), collapses every run of whitespace (including newlines) to a
+  // single space so a statement split across lines becomes scannable as one
+  // line, and allows an optional schema-qualifier prefix (`\w+\.`) before
+  // the table name.
+  test('ATM-022 (Codex round-3 Finding 3): multi-line and schema-qualified UPDATE/DELETE against failure_classifications are also caught (whitespace-normalized scan)', () => {
+    const REPO = join(import.meta.dir, '..')
+    const BASE_COMMIT = '5014d7f'
+
+    let proc: ReturnType<typeof Bun.spawnSync>
+    try {
+      proc = Bun.spawnSync(['git', '-C', REPO, 'diff', '--name-only', BASE_COMMIT], { cwd: REPO })
+    } catch (err) {
+      throw new Error(`ATM-022: git is unavailable — cannot verify the multi-line/schema-qualified append-only scan: ${err}`)
+    }
+    if (proc.exitCode !== 0) {
+      const stderr = proc.stderr?.toString() ?? '(no stderr)'
+      throw new Error(
+        `ATM-022: 'git diff --name-only ${BASE_COMMIT}' exited ${proc.exitCode} — cannot verify the multi-line/schema-` +
+        `qualified append-only scan. stderr: ${stderr}`,
+      )
+    }
+    const out = (proc.stdout ?? Buffer.alloc(0)).toString().trim()
+    const changedFiles = out.length === 0 ? [] : out.split('\n')
+    // Sanity precondition, mirroring the sibling full-diff test above.
+    expect(changedFiles.length).toBeGreaterThan(0)
+
+    // Case-insensitive, optional-schema-qualifier, whitespace-tolerant
+    // (matched against ALREADY-normalized text, so `\s+` here only needs to
+    // span the single collapsed space(s) left after normalization).
+    const updateReNorm = /UPDATE\s+(\w+\.)?failure_classifications/i
+    const deleteReNorm = /DELETE\s+FROM\s+(\w+\.)?failure_classifications/i
+
+    const offenders: { file: string; matchPreview: string }[] = []
+    for (const relPath of changedFiles) {
+      let content: string
+      try {
+        content = readFileSync(join(REPO, relPath), 'utf8')
+      } catch {
+        continue // deleted / binary / unreadable file
+      }
+      const normalized = content.replace(/\s+/g, ' ')
+      const updateMatch = normalized.match(updateReNorm)
+      const deleteMatch = normalized.match(deleteReNorm)
+      if (updateMatch) offenders.push({ file: relPath, matchPreview: updateMatch[0] })
+      if (deleteMatch) offenders.push({ file: relPath, matchPreview: deleteMatch[0] })
+    }
+
+    if (offenders.length > 0) {
+      throw new Error(
+        `ATM-022 violation (Finding 3, multi-line/schema-qualified scan): found ${offenders.length} whitespace-` +
+        `normalized UPDATE/DELETE match(es) targeting failure_classifications:\n` +
+        offenders.map(o => `  ${o.file} — "${o.matchPreview}"`).join('\n'),
+      )
+    }
+    expect(offenders).toEqual([])
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1959,6 +2030,79 @@ describe('ATM-031: scope-bleed guardrail — diff vs base 5014d7f (REQ-019)', ()
     // Confirm the diff DOES contain the expected, in-scope addition (proves
     // this test is reading real diff content, not an empty/truncated one).
     expect(dbDiff).toMatch(/failure_classifications/)
+  })
+
+  test('ATM-031(2b) [Codex round-3 Finding 2 / REQ-019]: protected P4/P5 symbols scanned across the ENTIRE P6 changed source-file set, not just db.ts', () => {
+    // ATM-031(2)'s protectedSymbolHits scan above is narrowly scoped to
+    // db.ts's diff only. A P6 diff could just as easily add a reference to a
+    // protected P4/P5 symbol (e.g. `withMemoryWriteTxn`) to watchdog.ts,
+    // verification/verify.ts, or any OTHER changed file and slip past that
+    // narrow scan entirely. This test closes that hole: it walks the FULL P6
+    // changed-file set (git diff --name-only vs the base commit), restricted
+    // to non-test SOURCE files, and scans each file's ADDED diff lines (git
+    // diff `^+` lines, excluding the `+++` header) for ANY of the protected
+    // P4/P5/decision symbols/import-paths.
+    //
+    // Restricted to non-test files: tests/** legitimately DESCRIBES these
+    // forbidden symbols in its own guardrail regex literals/comments (e.g.
+    // this very file's ATM-023(a) assertions reference `memory-ordering` by
+    // name to assert its ABSENCE), which would false-positive a blind
+    // diff-added-line scan of test sources. The scope-bleed concern this
+    // finding targets is PRODUCTION code referencing protected symbols, not
+    // test code describing what it forbids — mirroring the house convention
+    // already used by the ATM-032 guardrail (tests/ exempt by design).
+    const changedFiles = gitDiffNameOnly()
+    expect(changedFiles.length).toBeGreaterThan(0)
+
+    const sourceFiles = changedFiles.filter(f => !f.startsWith('tests/'))
+    // Sanity precondition: the non-test source-file subset must be
+    // non-trivial, otherwise a filter bug (e.g. matching everything as
+    // "tests/") would make this scan vacuously pass.
+    expect(sourceFiles.length).toBeGreaterThan(0)
+
+    // Anchored to import-path/symbol usage per the fold instructions — the
+    // hyphenated file-path fragments (`memory-ordering`, `agent-messages`,
+    // `memory-integrity`) are matched as plain substrings (no word-boundary
+    // needed around a hyphen), while the identifier-shaped symbols use
+    // `\b` word boundaries so they don't false-positive on a longer
+    // identifier that merely CONTAINS one of them as a substring.
+    const PROTECTED_SYMBOL_PATTERNS: RegExp[] = [
+      /\bwithMemoryWriteTxn\b/,
+      /\bnextWriteSeq\b/,
+      /\bwrite_sequence\b/,
+      /\bwrite_seq\b/,
+      /\bagent_messages\b/,
+      /memories\.write_seq\b/,
+      /\bsanitizeMemoryContent\b/,
+      /\bsanitizeBootBriefing\b/,
+      /\bsource_type\b/,
+      /memory-ordering/,
+      /agent-messages/,
+      /memory-integrity/,
+    ]
+
+    const offenders: { file: string; line: number; text: string }[] = []
+    for (const relPath of sourceFiles) {
+      const fileDiff = gitDiffFile(relPath)
+      const diffLines = fileDiff.split('\n')
+      const addedLines = diffLines.filter(l => l.startsWith('+') && !l.startsWith('+++'))
+      addedLines.forEach((line, idx) => {
+        if (PROTECTED_SYMBOL_PATTERNS.some(re => re.test(line))) {
+          offenders.push({ file: relPath, line: idx + 1, text: line.trim() })
+        }
+      })
+    }
+
+    if (offenders.length > 0) {
+      const details = offenders.map(o => `  ${o.file} (added-line #${o.line}) — ${o.text}`).join('\n')
+      throw new Error(
+        `ATM-031 violation (Finding 2, full-diff protected-symbol scan): found ${offenders.length} added line(s) across ` +
+        `the P6 non-test changed-file set referencing a protected P4/P5/decision symbol:\n${details}\n` +
+        `Protected: withMemoryWriteTxn, nextWriteSeq, write_sequence, write_seq, agent_messages, memories.write_seq, ` +
+        `sanitizeMemoryContent, sanitizeBootBriefing, source_type, memory-ordering, agent-messages, memory-integrity.`,
+      )
+    }
+    expect(offenders).toEqual([])
   })
 
   test('ATM-031(3): verification/failure-classification.ts source contains no reward-shaped computation and no cross-family critique construction', () => {

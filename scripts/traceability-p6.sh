@@ -151,6 +151,123 @@ fi
 
 echo ""
 echo "=================================================================="
+echo "[traceability-p6] CHECK 3 — REQ-001..020 rolls up to exactly ONE EPIC-01..07"
+echo "=================================================================="
+
+# Pre-split the EPICS section into per-EPIC bodies (EPIC-01..EPIC-07), each
+# running from its own '### EPIC-0N' heading up to (but not including) the
+# next '### EPIC-0' heading — epics_section (captured for CHECK 1 above)
+# already stops at '## Done-gate', so EPIC-07's body naturally ends there.
+epic_body_1="$(awk '/^### EPIC-01/{p=1; next} /^### EPIC-0/{if(p) exit} p' <<<"$epics_section")"
+epic_body_2="$(awk '/^### EPIC-02/{p=1; next} /^### EPIC-0/{if(p) exit} p' <<<"$epics_section")"
+epic_body_3="$(awk '/^### EPIC-03/{p=1; next} /^### EPIC-0/{if(p) exit} p' <<<"$epics_section")"
+epic_body_4="$(awk '/^### EPIC-04/{p=1; next} /^### EPIC-0/{if(p) exit} p' <<<"$epics_section")"
+epic_body_5="$(awk '/^### EPIC-05/{p=1; next} /^### EPIC-0/{if(p) exit} p' <<<"$epics_section")"
+epic_body_6="$(awk '/^### EPIC-06/{p=1; next} /^### EPIC-0/{if(p) exit} p' <<<"$epics_section")"
+epic_body_7="$(awk '/^### EPIC-07/{p=1; next} /^### EPIC-0/{if(p) exit} p' <<<"$epics_section")"
+
+for e in 1 2 3 4 5 6 7; do
+  var="epic_body_$e"
+  if [ -z "${!var}" ]; then
+    echo "[traceability-p6] FATAL: could not locate body for EPIC-0$e" >&2
+    exit 1
+  fi
+done
+
+# A REQ is considered to "belong" to an EPIC only where it is DEFINED — its
+# own `- REQ-0XX [P#]` bullet under that EPIC's "Requirements (EARS):"
+# section — NOT wherever its id is merely mentioned in prose. This matters
+# because EPIC-03's Goal paragraph cross-references REQ-010 and REQ-016 by id
+# ("the flag gate lives in the persist layer (REQ-010) and the flag-OFF
+# parity requirement (REQ-016)") as forward-looking prose, while those
+# requirements are actually DEFINED in EPIC-04 and EPIC-06 respectively. A
+# naive substring-count over the whole EPIC body would double-count those
+# ids and wrongly flag them as ">1 EPIC", even though the spec is correct.
+# Anchoring on the defining bullet's exact format avoids that false positive.
+req_orphans=0
+printf "%-9s %-6s %s\n" "REQ-ID" "COUNT" "MATCHED-EPICS"
+printf "%-9s %-6s %s\n" "------" "-----" "-------------"
+for i in $(seq -w 1 20); do
+  rid="REQ-0$i"
+  count=0
+  matched=""
+  for e in 1 2 3 4 5 6 7; do
+    var="epic_body_$e"
+    if grep -qE -- "^- ${rid} \[P" <<<"${!var}"; then
+      count=$((count + 1))
+      matched="$matched EPIC-0$e"
+    fi
+  done
+  printf "%-9s %-6s %s\n" "$rid" "$count" "${matched:- (none)}"
+  if [ "$count" -ne 1 ]; then
+    req_orphans=$((req_orphans + 1))
+  fi
+done
+
+echo ""
+if [ "$req_orphans" -gt 0 ]; then
+  echo "[traceability-p6] CHECK 3 FAILED — $req_orphans REQ id(s) roll up to zero or more-than-one EPIC"
+  overall_exit=1
+else
+  echo "[traceability-p6] CHECK 3 OK — all REQ-001..020 roll up to exactly one EPIC-01..07, zero orphans"
+fi
+
+echo ""
+echo "=================================================================="
+echo "[traceability-p6] CHECK 4 — ATM-001..032 each carry a valid trailing M-### cell"
+echo "=================================================================="
+
+# Every ATM table row is a pipe-delimited markdown row whose LAST populated
+# column (before the trailing empty field created by the row's closing '|')
+# is the M-### traceability cell (verified structurally: every ATM row in
+# this spec splits into exactly 8 '|'-delimited fields). A row may carry
+# MULTIPLE M ids in that cell (e.g. "M-002, M-003, M-004") — any one valid
+# id satisfies "carries a trailing M-### cell", per the fold instructions.
+atm_bad=0
+printf "%-9s %-30s %-9s\n" "ATM" "M-CELL" "STATUS"
+printf "%-9s %-30s %-9s\n" "---" "------" "------"
+for i in $(seq 1 32); do
+  n="$(printf '%03d' "$i")"
+  atm="ATM-$n"
+  row="$(grep -E -- "^\| ${atm} \|" "$SPEC" || true)"
+  if [ -z "$row" ]; then
+    printf "%-9s %-30s %-9s\n" "$atm" "(no row)" "MISSING"
+    atm_bad=$((atm_bad + 1))
+    continue
+  fi
+  m_cell="$(awk -F'|' '{ gsub(/^[ \t]+|[ \t]+$/, "", $(NF-1)); print $(NF-1) }' <<<"$row")"
+  m_ids="$(grep -oE 'M-0[0-9]{2}' <<<"$m_cell" || true)"
+  if [ -z "$m_ids" ]; then
+    printf "%-9s %-30s %-9s\n" "$atm" "$m_cell" "NO-M-ID"
+    atm_bad=$((atm_bad + 1))
+    continue
+  fi
+  row_bad=0
+  for mid in $m_ids; do
+    num="${mid#M-}"
+    num=$((10#$num))
+    if [ "$num" -lt 1 ] || [ "$num" -gt 17 ]; then
+      row_bad=1
+    fi
+  done
+  if [ "$row_bad" -eq 1 ]; then
+    printf "%-9s %-30s %-9s\n" "$atm" "$m_cell" "INVALID"
+    atm_bad=$((atm_bad + 1))
+  else
+    printf "%-9s %-30s %-9s\n" "$atm" "$m_cell" "OK"
+  fi
+done
+
+echo ""
+if [ "$atm_bad" -gt 0 ]; then
+  echo "[traceability-p6] CHECK 4 FAILED — $atm_bad ATM row(s) missing a valid trailing M-### cell"
+  overall_exit=1
+else
+  echo "[traceability-p6] CHECK 4 OK — every ATM-001..032 carries a valid trailing M-### cell (M-001..M-017)"
+fi
+
+echo ""
+echo "=================================================================="
 if [ "$overall_exit" -eq 0 ]; then
   echo "[traceability-p6] ALL CHECKS PASSED — exit 0"
 else

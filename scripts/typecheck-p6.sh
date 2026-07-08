@@ -18,6 +18,19 @@
 # keeping watchdog.ts fully in the typecheck program so P6's additive call-site
 # edits ARE covered.
 #
+# BASELINE-SWAP GUARD (Codex round-3 fold, Finding 5 / P3): the count==8 +
+# zero-non-baseline checks below are, on their own, "swappable" — a P6 edit
+# that DELETES one pristine baseline error line (e.g. by touching a
+# pre-existing non-P6 line the count check never inspects individually) while
+# ADDING a new non-baseline-signature error elsewhere would still read
+# BASELINE_ERR=8 and NONBASELINE_CNT could still land at 0 if the new error
+# happens to share the exact baseline regex signature — count and signature
+# alone can't tell "the same 8 pristine lines, untouched" apart from "a
+# different 8 lines that happen to match the same regex". Pinning the
+# watchdog.ts diff vs pristine 5014d7f to be PURELY ADDITIVE (zero deleted
+# lines) closes that gap structurally: no pristine line can be modified or
+# removed, so the 8 baseline errors are provably the SAME 8, not a swap.
+#
 # Self-provisioning: node_modules here is a symlink to the live repo and does
 # NOT materialize bun-types/@types/node as real dirs, so tsc needs an explicit
 # typeRoots (./.typeroots). Those symlinks are machine-specific (git-excluded)
@@ -45,6 +58,49 @@ provision_typeroots
 
 # Frozen pristine baseline: exactly this many watchdog.ts TS2345 string|null errors.
 EXPECT_BASELINE=8
+BASELINE_COMMIT="5014d7f"
+
+# Returns via echo: "<insertions> <deletions>" from `git diff --numstat` for
+# watchdog.ts vs $BASELINE_COMMIT, or a sentinel "GIT_UNAVAILABLE" on any git
+# failure (missing binary, not a repo, bad ref, etc.) so the caller can
+# distinguish "confirmed zero deletions" from "could not confirm".
+watchdog_diff_numstat() {
+  local out
+  if ! out="$(git -C "$REPO_DIR" diff --numstat "$BASELINE_COMMIT" -- watchdog.ts 2>/dev/null)"; then
+    echo "GIT_UNAVAILABLE"
+    return
+  fi
+  if [ -z "$out" ]; then
+    # No diff at all vs base for this path — trivially additive (0/0).
+    echo "0 0"
+    return
+  fi
+  # numstat format: "<ins>\t<del>\t<path>" — take the first matching line.
+  awk '{print $1, $2; exit}' <<<"$out"
+}
+
+echo "[typecheck-p6] watchdog.ts baseline-swap guard: additive-diff check vs $BASELINE_COMMIT"
+WATCHDOG_ADDITIVE_FAIL=0
+WATCHDOG_NUMSTAT="$(watchdog_diff_numstat)"
+if [ "$WATCHDOG_NUMSTAT" = "GIT_UNAVAILABLE" ]; then
+  # Per the fold instructions: if git is unavailable, warn but do not
+  # silently pass the additive check — this is printed loudly as a WARN
+  # (not folded into a quiet "OK"), and is NOT counted as a hard gate
+  # failure on its own (an environment without git is an infra issue this
+  # P3 guard should not be solely responsible for blocking on), mirroring
+  # the existing provision_typeroots WARN-without-fail convention above.
+  echo "[typecheck-p6] WARN: git unavailable — cannot verify watchdog.ts is additive-only vs $BASELINE_COMMIT; NOT counted as a pass." >&2
+else
+  WD_INS="$(awk '{print $1}' <<<"$WATCHDOG_NUMSTAT")"
+  WD_DEL="$(awk '{print $2}' <<<"$WATCHDOG_NUMSTAT")"
+  echo "[typecheck-p6] watchdog.ts diff vs $BASELINE_COMMIT: +$WD_INS -$WD_DEL"
+  if [ "$WD_DEL" != "0" ]; then
+    echo "[typecheck-p6] FAIL: watchdog.ts diff vs $BASELINE_COMMIT contains $WD_DEL deleted line(s) — a non-additive" >&2
+    echo "[typecheck-p6]   edit invalidates the pinned 8-error baseline (a pristine baseline error line could have been" >&2
+    echo "[typecheck-p6]   swapped for a different same-signature error elsewhere while the count stayed at 8)." >&2
+    WATCHDOG_ADDITIVE_FAIL=1
+  fi
+fi
 # Regex matching ONLY the pre-existing watchdog baseline signature (any line/col).
 BASELINE_RE="^watchdog\.ts\([0-9]+,[0-9]+\): error TS2345: Argument of type 'string \| null' is not assignable to parameter of type 'string'\.\$"
 
@@ -61,6 +117,9 @@ NONBASELINE_CNT=$(printf '%s\n' "$NONBASELINE" | grep -cE "error TS" || true)
 echo "[typecheck-p6] total error-lines=$TOTAL_ERR  allowed-baseline=$BASELINE_ERR/$EXPECT_BASELINE  non-baseline=$NONBASELINE_CNT"
 
 FAIL=0
+if [ "$WATCHDOG_ADDITIVE_FAIL" -ne 0 ]; then
+  FAIL=1
+fi
 if [ "$BASELINE_ERR" -ne "$EXPECT_BASELINE" ]; then
   echo "[typecheck-p6] FAIL: watchdog.ts baseline error count = $BASELINE_ERR, expected $EXPECT_BASELINE." >&2
   echo "[typecheck-p6]   A change to watchdog.ts added or removed a 'string|null' error vs pristine 5014d7f." >&2
