@@ -239,4 +239,62 @@ describe('ATM-026: critique_position wiring hook — flag OFF (REQ-017)', () => 
       checkDb.close()
     }
   })
+
+  // -------------------------------------------------------------------------
+  // STAGE 7 (P7 build): the same flag-OFF call site, but pinned to the EXACT
+  // byte-identical response template (REQ-017) rather than a regex, PLUS an
+  // explicit assertion that the base decision_critiques row is written
+  // completely normally — i.e. flag-OFF is a true no-op on everything
+  // EXCEPT the additive cross_family_critiques write, not merely "0 rows
+  // happens to also hold". Even omits producer_model_id/critic_model_id
+  // (the fully-default caller shape) to prove parity holds independent of
+  // which optional args are supplied.
+  // -------------------------------------------------------------------------
+  test('ATM-026 (Stage 7): flag OFF -> response text byte-identical to the exact template, decision_critiques row written normally, 0 cross_family_critiques rows', async () => {
+    const tmpHome = mkTmpHome()
+    const { dbPath, decisionId } = seedFixture(tmpHome, { flagOn: false })
+    const client = await connectServer(tmpHome, 'boss')
+
+    const result: any = await client.callTool({
+      name: 'critique_position',
+      arguments: {
+        decision_id: decisionId,
+        critique: 'stage-7 flag-off parity critique',
+        severity: 'concern',
+      },
+    })
+
+    expect(result.isError).toBeFalsy()
+    const text = String(result.content?.[0]?.text ?? '')
+
+    const checkDb = openCheckDb(dbPath)
+    try {
+      // (c) decision_critiques row still written normally (base critique
+      // unaffected by the flag) — fetched FIRST so its real id anchors the
+      // byte-identical template assertion below.
+      const critiqueRow = checkDb.run(db =>
+        db.prepare('SELECT id, decision_id, agent, critique, severity FROM decision_critiques WHERE decision_id = ?').get(decisionId),
+      ) as { id: number; decision_id: number; agent: string; critique: string; severity: string } | null
+      expect(critiqueRow).toBeTruthy()
+      expect(critiqueRow!.decision_id).toBe(decisionId)
+      expect(critiqueRow!.agent).toBe('boss')
+      expect(critiqueRow!.critique).toBe('stage-7 flag-off parity critique')
+      expect(critiqueRow!.severity).toBe('concern')
+
+      // (b) response text byte-identical to the exact template
+      // `Critique #<id> submitted on decision #<id> (severity: <sev>).`
+      const expectedText = `Critique #${critiqueRow!.id} submitted on decision #${decisionId} (severity: concern).`
+      expect(text).toBe(expectedText)
+
+      // (a) ZERO cross_family_critiques rows written.
+      const rows = checkDb.run(db =>
+        db.prepare('SELECT * FROM cross_family_critiques WHERE decision_id = ?').all(decisionId),
+      ) as any[]
+      expect(rows.length).toBe(0)
+      const totalRows = checkDb.run(db => db.prepare('SELECT COUNT(*) as c FROM cross_family_critiques').get()) as { c: number }
+      expect(totalRows.c).toBe(0)
+    } finally {
+      checkDb.close()
+    }
+  })
 })

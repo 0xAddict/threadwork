@@ -23,7 +23,16 @@
 // taxonomy_version). The critique_position wiring hook (REQ-013) remains a
 // LATER stage — not tested here.
 //
-// This file grows across later P7 build stages (EPIC-06..EPIC-07) — do NOT
+// STAGE 7 (this addition, below): EPIC-06 (Feature Flag, Flag-OFF Parity &
+// No-Backfill) — the DB-level half only: ATM-025 (REQ-016, flag defaults to
+// 0 on a fresh migrate()) and ATM-027 (REQ-018, no auto-backfill of
+// cross_family_critiques when migrate() runs over a pre-populated DB
+// simulating an existing production instance). ATM-026 (REQ-017,
+// critique_position wiring-hook flag-OFF parity) lives in
+// tests/cross-family-critique-critique-position-integration.test.ts,
+// alongside the Stage-6 harness it reuses — not duplicated here.
+//
+// This file grows across later P7 build stages (EPIC-07) — do NOT
 // add critique_position-wiring tests here yet (later stages).
 
 import { describe, test, expect, spyOn, afterEach, beforeEach } from 'bun:test'
@@ -1801,5 +1810,129 @@ describe('ATM-024: forward-compat read pass-through — unknown verdict/family +
     expect(results[0]!.id).toBe(id)
     expect(results[0]!.verdict).toBe('future_verdict_v2')
     expect(results[0]!.taxonomy_version).toBe(999)
+  })
+})
+
+// ===========================================================================
+// STAGE 7 (EPIC-06: Feature Flag, Flag-OFF Parity & No-Backfill) additions
+// below — ATM-025 (REQ-016) and ATM-027 (REQ-018). ATM-026 (REQ-017) is a
+// critique_position wiring-path integration concern and lives in
+// tests/cross-family-critique-critique-position-integration.test.ts, per
+// this file's own STAGE-6 header note ("do NOT add critique_position-wiring
+// tests here yet").
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// ATM-025 / REQ-016 [P1] — cross_family_critique_enabled seeded default-OFF
+// ---------------------------------------------------------------------------
+describe('ATM-025: cross_family_critique_enabled seeded default-OFF (REQ-016)', () => {
+  const TEST_DB = '/tmp/p7-cfc-atm025.db'
+
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-025: a fresh TaskDB (auto-migrate on construction) reads cross_family_critique_enabled === 0 via isFeatureEnabled()', () => {
+    wipeDbFile(TEST_DB)
+    const taskDb = new TaskDB(TEST_DB)
+    try {
+      expect(taskDb.isFeatureEnabled('cross_family_critique_enabled')).toBe(false)
+
+      // Corroborate at the raw-row level too: the flag row exists (was
+      // actually seeded, not merely "absent -> falsy default") and its
+      // enabled column is literally 0 — mirrors the delegation_briefs_enabled
+      // seeding idiom this flag was modeled on (db.ts ~595/621).
+      const row = taskDb.run(db =>
+        db.prepare('SELECT enabled FROM feature_flags WHERE flag_name = ?').get('cross_family_critique_enabled'),
+      ) as { enabled: number } | null
+      expect(row).toBeTruthy()
+      expect(row!.enabled).toBe(0)
+    } finally {
+      taskDb.close()
+    }
+  })
+
+  test('ATM-025: re-opening an already-migrated DB does not flip the flag ON (INSERT OR IGNORE idempotency)', () => {
+    wipeDbFile(TEST_DB)
+    const first = new TaskDB(TEST_DB)
+    first.close()
+
+    const second = new TaskDB(TEST_DB)
+    try {
+      expect(second.isFeatureEnabled('cross_family_critique_enabled')).toBe(false)
+    } finally {
+      second.close()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-027 / REQ-018 [P3] — no retroactive backfill of cross_family_critiques
+// ---------------------------------------------------------------------------
+describe('ATM-027: no auto-backfill of cross_family_critiques on migrate() (REQ-018)', () => {
+  const TEST_DB = '/tmp/p7-cfc-atm027.db'
+
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-027: migrate() over a DB pre-populated with historical decisions/decision_critiques rows leaves cross_family_critiques EMPTY', () => {
+    wipeDbFile(TEST_DB)
+
+    // Step 1: bring up a fresh schema (this itself runs migrate() once) and
+    // seed HISTORICAL decisions + decision_critiques rows directly, exactly
+    // as if this were an existing pre-P7 production DB that had been
+    // accumulating decision/critique traffic long before cross_family_critique
+    // ever shipped. Multiple decisions, multiple critiques per decision,
+    // mixed severities — a non-trivial "existing production DB" shape.
+    const seedDb = new TaskDB(TEST_DB)
+    try {
+      seedDb.run(db => {
+        for (let i = 0; i < 3; i++) {
+          const decisionId = insertDecision(db, { title: `historical decision ${i}`, openedBy: 'steve' })
+          db.prepare(`
+            INSERT INTO decision_critiques (decision_id, position_id, agent, critique, severity)
+            VALUES (?, NULL, ?, ?, ?)
+          `).run(decisionId, 'boss', `historical critique ${i}`, i === 0 ? 'blocker' : 'observation')
+          db.prepare(`
+            INSERT INTO decision_critiques (decision_id, position_id, agent, critique, severity)
+            VALUES (?, NULL, ?, ?, ?)
+          `).run(decisionId, 'kiera', `historical critique ${i}-b`, 'concern')
+        }
+      })
+
+      // Sanity: the historical rows are really there before we proceed.
+      const preCount = seedDb.run(db => db.prepare('SELECT COUNT(*) as c FROM decision_critiques').get()) as { c: number }
+      expect(preCount.c).toBe(6)
+    } finally {
+      seedDb.close()
+    }
+
+    // Step 2: re-construct a TaskDB against the SAME db file — this is the
+    // "migrate() runs over pre-loaded data" moment (TaskDB's constructor
+    // calls migrate() unconditionally; CREATE TABLE IF NOT EXISTS /
+    // INSERT OR IGNORE are idempotent over the already-migrated schema).
+    // If a backfill job existed as part of migration, THIS is where it
+    // would fire and derive cross_family_critiques rows from the 6
+    // pre-existing decision_critiques rows above.
+    const reopenedDb = new TaskDB(TEST_DB)
+    try {
+      const row = reopenedDb.run(db => db.prepare('SELECT COUNT(*) as c FROM cross_family_critiques').get()) as { c: number }
+      expect(row.c).toBe(0)
+
+      // The historical rows migrate() ran over are still intact (proves this
+      // is genuinely a no-op read, not e.g. an accidental wipe).
+      const critiqueCount = reopenedDb.run(db => db.prepare('SELECT COUNT(*) as c FROM decision_critiques').get()) as { c: number }
+      expect(critiqueCount.c).toBe(6)
+    } finally {
+      reopenedDb.close()
+    }
+  })
+
+  test('ATM-027: cross_family_critiques is empty immediately after the VERY FIRST migrate() too (baseline — nothing to backfill from on a brand-new DB)', () => {
+    wipeDbFile(TEST_DB)
+    const taskDb = new TaskDB(TEST_DB)
+    try {
+      const row = taskDb.run(db => db.prepare('SELECT COUNT(*) as c FROM cross_family_critiques').get()) as { c: number }
+      expect(row.c).toBe(0)
+    } finally {
+      taskDb.close()
+    }
   })
 })
