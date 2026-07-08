@@ -232,6 +232,102 @@ describe('ATM-021(b): fault-injection on the cross-family persist path (REQ-013(
 })
 
 // ---------------------------------------------------------------------------
+// ATM-021(d) — fault-injection: the feature-gate READ ITSELF throws (Codex
+// R1 HIGH / REQ-013(a)). db.isFeatureEnabled('cross_family_critique_enabled')
+// must be swallowed by the SAME try/catch as the rest of the P7 hook body —
+// not left exposed to the handler's OUTER catch (which would turn the
+// response into "Critique failed: ..." and set isError, violating
+// REQ-013(a)'s guarantee that the pre-existing critique_position
+// response/behavior is COMPLETELY unaffected by anything in the P7 addition).
+// ---------------------------------------------------------------------------
+describe('ATM-021(d): fault-injection on the feature-gate read itself (Codex R1 HIGH / REQ-013(a))', () => {
+  /**
+   * Drops the feature_flags table via a FRESH, short-lived connection AFTER
+   * the server subprocess has already booted (i.e. after its own TaskDB
+   * constructor's migrate() — which itself reads feature_flags, for the 3
+   * `requiredFlags` — has already run and already succeeded once). This is
+   * deliberately sequenced post-boot: renaming/dropping the table BEFORE
+   * spawning the server would make the SERVER'S OWN STARTUP migrate() throw
+   * (crashing the whole subprocess), which would not isolate the fault to
+   * just the P7 gate call.
+   *
+   * `db.isFeatureEnabled('cross_family_critique_enabled')` at server.ts:1672
+   * is confirmed to be the SOLE isFeatureEnabled() call anywhere on the
+   * critique_position code path — dec.addCritique() (decision.ts:111-141),
+   * postToGroup()/postToGroupThreaded() (notify.ts), and audit.log()
+   * (audit.ts) make no such call (grepped: zero hits). So poisoning
+   * feature_flags after boot isolates the throw to exactly this one read.
+   *
+   * DROP (vs. renaming the `enabled` column) is deliberate: a rename would
+   * ALSO break any LATER `new TaskDB(...)` this test opens for verification
+   * — TaskDB's own migrate() unconditionally INSERTs against the `enabled`
+   * column on every construction. A drop is harmless for those instead —
+   * `CREATE TABLE IF NOT EXISTS` simply recreates the table fresh — while
+   * still producing a clean, unrecoverable "no such table: feature_flags"
+   * throw for the server subprocess's own ALREADY-OPEN connection the next
+   * time it issues `SELECT enabled FROM feature_flags WHERE flag_name = ?`.
+   * WAL mode + busy_timeout=5000 (set in TaskDB's constructor) make the
+   * brief write lock this needs safe to take against a live, otherwise-idle
+   * server (no setInterval/setTimeout/periodic job in server.ts touches the
+   * db between requests, so there is no other writer to contend with).
+   */
+  function poisonFeatureFlagsAfterBoot(dbPath: string): void {
+    const poisonDb = new TaskDB(dbPath)
+    poisonDb.run(db => db.exec('DROP TABLE feature_flags'))
+    poisonDb.close()
+  }
+
+  test(
+    'poisoned feature_flags table (flag-gate read throws) leaves the response as the normal template — NOT "Critique failed: ..." — and the decision_critiques row is still written',
+    async () => {
+      const tmpHome = mkTmpHome()
+      const { dbPath, decisionId } = seedFixture(tmpHome, { flagOn: true })
+      const client = await connectServer(tmpHome, 'boss')
+
+      // Poison AFTER the server has booted (its own migrate() already ran
+      // clean against the intact table) and BEFORE invoking
+      // critique_position, so only the live P7 gate read is affected.
+      poisonFeatureFlagsAfterBoot(dbPath)
+
+      const result: any = await client.callTool({
+        name: 'critique_position',
+        arguments: {
+          decision_id: decisionId,
+          critique: 'feature-gate-read fault-injection critique',
+          severity: 'blocker',
+        },
+      })
+
+      // The response must be the NORMAL success template — not routed to
+      // the handler's outer catch (which would produce
+      // "Critique failed: no such table: feature_flags" + isError: true).
+      expect(result.isError).toBeFalsy()
+      const text = String(result.content?.[0]?.text ?? '')
+      const m = text.match(/^Critique #(\d+) submitted on decision #(\d+) \(severity: blocker\)\.$/)
+      expect(m).toBeTruthy()
+      const critiqueId = Number(m![1])
+      expect(Number(m![2])).toBe(decisionId)
+
+      // decision_critiques: the base critique IS recorded, untouched — the
+      // pre-existing dec.addCritique()/postToGroup/audit.log calls already
+      // ran and fully succeeded BEFORE the poisoned gate read was reached.
+      const checkDb = new TaskDB(dbPath)
+      try {
+        const critiqueRows = checkDb.run(db =>
+          db.prepare('SELECT * FROM decision_critiques WHERE decision_id = ?').all(decisionId),
+        ) as any[]
+        expect(critiqueRows.length).toBe(1)
+        expect(critiqueRows[0].id).toBe(critiqueId)
+        expect(critiqueRows[0].severity).toBe('blocker')
+        expect(critiqueRows[0].agent).toBe('boss')
+      } finally {
+        checkDb.close()
+      }
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
 // ATM-021(c) — omitted optional fields pass MCP schema validation identically
 // ---------------------------------------------------------------------------
 describe('ATM-021(c): critique_position schema parity for omitted optional fields', () => {

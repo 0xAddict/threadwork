@@ -1669,8 +1669,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           // decision_critiques row already written by dec.addCritique(),
           // and the postToGroup/audit.log calls above are completely
           // unaffected by anything that happens in this block.
-          if (db.isFeatureEnabled('cross_family_critique_enabled')) {
-            try {
+          try {
+            if (db.isFeatureEnabled('cross_family_critique_enabled')) {
               const rawDb = db.getHandle()
               // REQ-013(b)/Codex iter-2 LOW: a supplied producer_model_id/
               // critic_model_id that is present but NOT a well-formed
@@ -1730,9 +1730,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 verdict: evaluation.verdict,
                 linked_failure_class: linkedFailureClass,
               })
-            } catch {
-              // REQ-013(a): swallow — see the block comment above.
             }
+          } catch {
+            // REQ-013(a): swallow — see the block comment above.
           }
           return { content: [{ type: 'text', text: `Critique #${crit.id} submitted on decision #${decisionId} (severity: ${crit.severity}).` }] }
         } catch (err: any) {
