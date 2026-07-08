@@ -436,3 +436,54 @@ describe('ATM-021(b): fault-injection on the ternary persist path (REQ-013(a))',
     }
   })
 })
+
+// ===========================================================================
+// STAGE 7 of build-p8/PLAN.md: EPIC-06 (Flag-OFF parity across the wired
+// call site) — ATM-026 / REQ-017. Verified here since it exercises the
+// identical finalize_decision handler path as ATM-020 above.
+// ===========================================================================
+describe('ATM-026: finalize_decision ternary-reward hook — flag OFF parity (REQ-017)', () => {
+  test('flag OFF → 0 ternary_rewards rows written AND the finalize response text is byte-identical to the flag-ON success template', async () => {
+    const tmpHome = mkTmpHome()
+    // Same rich fixture as ATM-020(A) (block + high) EXCEPT the ternary flag is OFF.
+    const { dbPath, decisionId } = seedFixture(tmpHome, {
+      ternaryFlagOn: false,
+      taskId: 8001,
+      crossFamilyVerdict: 'block',
+      failureSeverity: 'high',
+    })
+    const client = await connectServer(tmpHome, 'boss')
+
+    const result: any = await finalize(client, decisionId)
+    expect(result.isError).toBeFalsy()
+    // Byte-identical success template — the flag-OFF path returns exactly the
+    // pre-P8 response.
+    expect(String(result.content?.[0]?.text ?? '')).toMatch(FINALIZE_RE)
+
+    const checkDb = openCheckDb(dbPath)
+    try {
+      // Zero ternary_rewards rows — the hook's flag gate short-circuits.
+      const trCount = checkDb.run(
+        (db) => (db.prepare('SELECT count(*) AS n FROM ternary_rewards').get() as { n: number }).n,
+      )
+      expect(trCount).toBe(0)
+
+      // The decision still finalized normally, and NO 'ternary_reward_assigned'
+      // audit row was written (only the pre-existing 'decision_finalized').
+      const decRow = checkDb.run((db) =>
+        db.prepare('SELECT status FROM decisions WHERE id = ?').get(decisionId),
+      ) as { status: string } | null
+      expect(decRow!.status).toBe('finalized')
+
+      const trAudit = checkDb.run(
+        (db) =>
+          (db.prepare("SELECT count(*) AS n FROM audit_log WHERE action = 'ternary_reward_assigned'").get() as {
+            n: number
+          }).n,
+      )
+      expect(trAudit).toBe(0)
+    } finally {
+      checkDb.close()
+    }
+  })
+})

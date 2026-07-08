@@ -1681,3 +1681,87 @@ describe('ATM-024: forward-compat read pass-through (REQ-015(a))', () => {
     expect(rows.length).toBe(1)
   })
 })
+
+// ===========================================================================
+// STAGE 7 of build-p8/PLAN.md: EPIC-06 DB-level half — ATM-025 (flag default
+// 0) and ATM-027 (no retroactive backfill). ATM-026 (flag-OFF parity through
+// the wired finalize site) lives in tests/ternary-reward-finalize-integration.test.ts.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// ATM-025 / REQ-016 [P1] — ternary_reward_enabled defaults to 0 (OFF)
+// ---------------------------------------------------------------------------
+describe('ATM-025: ternary_reward_enabled default-OFF (REQ-016)', () => {
+  const TEST_DB = '/tmp/p8-tr-atm025.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-025: fresh migrate() → isFeatureEnabled(ternary_reward_enabled) === false', () => {
+    expect(taskDb.isFeatureEnabled('ternary_reward_enabled')).toBe(false)
+  })
+
+  test('ATM-025: the seeded flag row exists with enabled=0 (present, not merely absent)', () => {
+    const row = taskDb.run(
+      (db) => db.prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'ternary_reward_enabled'").get(),
+    ) as { enabled: number } | null
+    expect(row).not.toBeNull()
+    expect(row!.enabled).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-027 / REQ-018 [P3] — no retroactive backfill
+// ---------------------------------------------------------------------------
+describe('ATM-027: no retroactive backfill (REQ-018)', () => {
+  const TEST_DB = '/tmp/p8-tr-atm027.db'
+
+  beforeEach(() => wipeDbFile(TEST_DB))
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-027: migrate() over a DB pre-loaded with historical finalized decisions leaves ternary_rewards EMPTY', () => {
+    // First TaskDB: seed several historical FINALIZED decisions (simulating an
+    // existing production DB that predates the ternary_reward feature).
+    const first = new TaskDB(TEST_DB)
+    first.run((db) => {
+      for (let i = 0; i < 5; i++) {
+        db.prepare(`
+          INSERT INTO decisions (title, context, opened_by, status, outcome, task_id)
+          VALUES (?, ?, ?, 'finalized', 'accepted', ?)
+        `).run(`historical decision ${i}`, null, 'boss', 900 + i)
+      }
+    })
+    const historicalCount = first.run(
+      (db) => (db.prepare("SELECT count(*) AS n FROM decisions WHERE status = 'finalized'").get() as { n: number }).n,
+    )
+    expect(historicalCount).toBe(5)
+    // ternary_rewards is empty right after the first migrate too.
+    expect(
+      first.run((db) => (db.prepare('SELECT count(*) AS n FROM ternary_rewards').get() as { n: number }).n),
+    ).toBe(0)
+    first.close()
+
+    // Re-open (re-runs migrate() over the SAME on-disk DB with the historical
+    // finalized decisions present) — no backfill job runs as part of migrate().
+    const second = new TaskDB(TEST_DB)
+    try {
+      const trCount = second.run(
+        (db) => (db.prepare('SELECT count(*) AS n FROM ternary_rewards').get() as { n: number }).n,
+      )
+      expect(trCount).toBe(0)
+      // The historical decisions are still there (migrate didn't drop them either).
+      expect(
+        second.run(
+          (db) =>
+            (db.prepare("SELECT count(*) AS n FROM decisions WHERE status = 'finalized'").get() as { n: number }).n,
+        ),
+      ).toBe(5)
+    } finally {
+      second.close()
+    }
+  })
+})
