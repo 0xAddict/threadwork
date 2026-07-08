@@ -66,6 +66,14 @@ function seedFixture(tmpHome: string, opts: { flagOn: boolean }): { dbPath: stri
   const mem = new MemoryDB(taskDb)
   const dec = new DecisionDB(taskDb, mem)
   const decision = dec.openDecision('P7 ATM-020/021 fixture decision', null, 'steve')
+  // Force a WAL checkpoint+truncate BEFORE closing so no on-disk WAL file is
+  // left lingering when the server subprocess opens this db fresh. Under
+  // full-suite CPU/IO contention, a lingering WAL widens the window in which
+  // the server's own `PRAGMA journal_mode=WAL` (which runs BEFORE
+  // busy_timeout is configured — db.ts:154) can hit SQLITE_BUSY at startup
+  // and crash the subprocess. This is a test-fixture-only mitigation of that
+  // pre-existing db.ts fragility, not a fix to db.ts itself.
+  taskDb.run(db => db.exec('PRAGMA wal_checkpoint(TRUNCATE)'))
   taskDb.close()
 
   return { dbPath, decisionId: decision.id }
@@ -78,24 +86,54 @@ function seedFixture(tmpHome: string, opts: { flagOn: boolean }): { dbPath: stri
  * POST_DISABLED test-mode guard so no real Telegram network call is ever
  * attempted. Registered in the module-level `clients` array so the shared
  * afterEach() below always closes it, even on assertion failure.
+ *
+ * BOUNDED STARTUP RETRY: under full-suite load (173 files, many spawning
+ * subprocesses), the spawned server's own TaskDB constructor can hit
+ * SQLITE_BUSY on `PRAGMA journal_mode=WAL` (db.ts:154, which runs BEFORE
+ * busy_timeout is configured) and crash during init, before it ever reaches
+ * the MCP transport handshake — the client then sees "Connection closed".
+ * This retry is scoped STRICTLY to that transient server-STARTUP/connect
+ * failure: it retries the connect() + a lightweight readiness probe
+ * (listTools()) that proves the server finished init. It NEVER retries or
+ * masks a real assertion/tool-result mismatch — once a client is ready, all
+ * actual test logic (the critique_position call + its assertions) runs
+ * exactly once against it, outside this function.
  */
 async function connectServer(tmpHome: string, agentLabel: string): Promise<Client> {
-  const transport = new StdioClientTransport({
-    command: 'bun',
-    args: [SERVER_TS_PATH],
-    cwd: WORKTREE_DIR,
-    env: {
-      ...process.env,
-      HOME: tmpHome,
-      AGENT_LABEL: agentLabel,
-      NODE_ENV: 'test',
-      THREADWORK_NUDGE_DISABLE: '1',
-    } as Record<string, string>,
-  })
-  const client = new Client({ name: 'p7-critique-position-test-client', version: '0.0.1' })
-  await client.connect(transport)
-  clients.push(client)
-  return client
+  const MAX_ATTEMPTS = 4
+  let lastErr: unknown
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const transport = new StdioClientTransport({
+      command: 'bun',
+      args: [SERVER_TS_PATH],
+      cwd: WORKTREE_DIR,
+      env: {
+        ...process.env,
+        HOME: tmpHome,
+        AGENT_LABEL: agentLabel,
+        NODE_ENV: 'test',
+        THREADWORK_NUDGE_DISABLE: '1',
+      } as Record<string, string>,
+    })
+    const client = new Client({ name: 'p7-critique-position-test-client', version: '0.0.1' })
+    try {
+      await client.connect(transport)
+      // Readiness probe: proves the server finished init (past the
+      // SQLITE_BUSY-vulnerable constructor window) and is actually serving
+      // MCP requests, not just that the stdio pipe connected.
+      await client.listTools()
+      clients.push(client)
+      return client
+    } catch (err) {
+      lastErr = err
+      try { await client.close() } catch { /* already dead */ }
+      if (attempt < MAX_ATTEMPTS) {
+        await new Promise(resolve => setTimeout(resolve, 100 + attempt * 50))
+        continue
+      }
+    }
+  }
+  throw lastErr
 }
 
 function openCheckDb(dbPath: string): TaskDB {
