@@ -1765,3 +1765,62 @@ describe('ATM-027: no retroactive backfill (REQ-018)', () => {
     }
   })
 })
+
+// ===========================================================================
+// STAGE 9 FOLD (codex R1 P3 — bar-hardening): TERNARY_REWARD_DECISION_TABLE
+// deep-immutability lock-in. The shipped table was ALREADY hand-deep-frozen;
+// this test structurally LOCKS that guarantee so a future 6th row cannot
+// silently ship a mutable nested array/object.
+// ===========================================================================
+describe('Stage 9 fold: TERNARY_REWARD_DECISION_TABLE is DEEP-frozen (codex R1 P3)', () => {
+  test('the exported table array itself is frozen', () => {
+    expect(Object.isFrozen(TERNARY_REWARD_DECISION_TABLE)).toBe(true)
+  })
+
+  test('every row object, its match object, and every present nested match array are frozen', () => {
+    for (const row of TERNARY_REWARD_DECISION_TABLE) {
+      expect(Object.isFrozen(row)).toBe(true)
+      expect(Object.isFrozen(row.match)).toBe(true)
+      const m = row.match
+      if (m.cross_family_verdict !== undefined) {
+        expect(Object.isFrozen(m.cross_family_verdict)).toBe(true)
+      }
+      if (m.failure_severity !== undefined) {
+        expect(Object.isFrozen(m.failure_severity)).toBe(true)
+      }
+      if (m.failure_signal_available !== undefined) {
+        expect(Object.isFrozen(m.failure_signal_available)).toBe(true)
+      }
+    }
+  })
+
+  test('a runtime mutation attempt on a nested match array is inert (value unchanged)', () => {
+    // Row 1's match.cross_family_verdict === ['block']. A push must be a no-op
+    // or throw (frozen array) — either way the array must remain ['block'].
+    const arr = TERNARY_REWARD_DECISION_TABLE[0]!.match.cross_family_verdict!
+    const before = [...arr]
+    let threw = false
+    try {
+      // @ts-expect-error intentional mutation attempt on a frozen readonly array
+      arr.push('mutated')
+    } catch {
+      threw = true
+    }
+    expect([...TERNARY_REWARD_DECISION_TABLE[0]!.match.cross_family_verdict!]).toEqual(before)
+    expect(before).toEqual(['block'])
+    expect(typeof threw).toBe('boolean')
+  })
+
+  test('a runtime reassignment attempt on a frozen row field is inert', () => {
+    const row = TERNARY_REWARD_DECISION_TABLE[4]! // row 5, reward 0
+    let threw = false
+    try {
+      // @ts-expect-error intentional mutation attempt on a frozen readonly object
+      row.reward = 1
+    } catch {
+      threw = true
+    }
+    expect(TERNARY_REWARD_DECISION_TABLE[4]!.reward).toBe(0)
+    expect(typeof threw).toBe('boolean')
+  })
+})

@@ -83,36 +83,33 @@ export interface TernaryRewardDecisionRow {
   }
 }
 
-export const TERNARY_REWARD_DECISION_TABLE: readonly TernaryRewardDecisionRow[] = Object.freeze([
-  Object.freeze({
-    row: 1,
-    reward: -1 as TernaryReward,
-    match: Object.freeze({ cross_family_verdict: Object.freeze(['block']) }),
-  }),
-  Object.freeze({
-    row: 2,
-    reward: -1 as TernaryReward,
-    match: Object.freeze({ failure_severity: Object.freeze(['critical', 'high']) }),
-  }),
-  Object.freeze({
+/**
+ * Recursively `Object.freeze`s an object graph (arrays + nested objects),
+ * returning the same reference. Applied ONCE to TERNARY_REWARD_DECISION_TABLE
+ * below so the deep-immutability guarantee is STRUCTURAL — a future 6th row
+ * (or a new nested match array) is deep-frozen automatically and cannot ship
+ * a mutable nested value (codex R1 P3 lock-in). This changes NO enumerable
+ * value, so the serialized table is byte-identical (the ATM-003 snapshot
+ * guardrail passes unchanged); it only sets the `[[frozen]]` bit end-to-end.
+ */
+function deepFreeze<T>(o: T): T {
+  if (o && typeof o === 'object') {
+    for (const v of Object.values(o as Record<string, unknown>)) deepFreeze(v)
+    return Object.freeze(o) as T
+  }
+  return o
+}
+
+export const TERNARY_REWARD_DECISION_TABLE: readonly TernaryRewardDecisionRow[] = deepFreeze([
+  { row: 1, reward: -1 as TernaryReward, match: { cross_family_verdict: ['block'] } },
+  { row: 2, reward: -1 as TernaryReward, match: { failure_severity: ['critical', 'high'] } },
+  {
     row: 3,
     reward: 1 as TernaryReward,
-    match: Object.freeze({
-      cross_family_verdict: Object.freeze(['concur']),
-      failure_signal_available: Object.freeze([true]),
-      failure_severity: Object.freeze([null, 'low']),
-    }),
-  }),
-  Object.freeze({
-    row: 4,
-    reward: 0 as TernaryReward,
-    match: Object.freeze({ cross_family_verdict: Object.freeze(['dissent']) }),
-  }),
-  Object.freeze({
-    row: 5,
-    reward: 0 as TernaryReward,
-    match: Object.freeze({}),
-  }),
+    match: { cross_family_verdict: ['concur'], failure_signal_available: [true], failure_severity: [null, 'low'] },
+  },
+  { row: 4, reward: 0 as TernaryReward, match: { cross_family_verdict: ['dissent'] } },
+  { row: 5, reward: 0 as TernaryReward, match: {} },
 ])
 
 // ---------------------------------------------------------------------------
