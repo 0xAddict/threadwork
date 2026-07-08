@@ -17,12 +17,22 @@
 // idempotency + source-level no-clock/no-random check), and ATM-010
 // (40-case never-throw malformed fuzz guard).
 //
-// This file grows in later P8 build stages (EPIC-03 onward) — do NOT
-// add read-adapter/persistence/wiring tests here yet (later stages).
+// STAGE 3 (this addition, below): EPIC-03 (Consume P6+P7 read-contracts,
+// read-only) — ATM-011 (aggregateCrossFamilyVerdict monotone precedence +
+// is_cross_family anti-monoculture gate + defensive never-throw), ATM-012
+// (worstMandatoryFailureSeverity precedence + never-throw), ATM-014
+// (resolveTernaryRewardSignal runtime read-fault swallow), and ATM-015
+// (import-scope guardrail: only the two read accessors + type-only reads,
+// zero write symbols). ATM-013 (P6+P7 fixture-DB integration) lives in
+// tests/ternary-reward-p6p7-integration.test.ts.
+//
+// This file grows in later P8 build stages (EPIC-04 onward) — do NOT
+// add persistence/wiring tests here yet (later stages).
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import type { Database } from 'bun:sqlite'
 import taxonomySnapshot from './fixtures/ternary-reward-taxonomy.snapshot.json'
 import {
   TernaryReward,
@@ -35,9 +45,14 @@ import {
   assignTernaryReward,
   type TernaryRewardSignal,
   type TernaryRewardAssessment,
+  aggregateCrossFamilyVerdict,
+  worstMandatoryFailureSeverity,
+  resolveTernaryRewardSignal,
 } from '../verification/ternary-reward'
 import { ALL_FAILURE_CLASSES, ALL_FAILURE_SEVERITIES } from '../verification/failure-classification'
 import { ALL_CROSS_FAMILY_VERDICTS } from '../verification/cross-family-critique'
+import type { PersistedCrossFamilyCritique } from '../verification/cross-family-critique'
+import type { PersistedFailureClassification } from '../verification/failure-classification'
 
 const MODULE_SOURCE = readFileSync(join(import.meta.dir, '..', 'verification', 'ternary-reward.ts'), 'utf8')
 
@@ -639,4 +654,392 @@ describe('ATM-010: never-throw fuzz guard (40 malformed inputs)', () => {
       expect(result).toEqual({ reward: 0, policy_version: 1 })
     })
   }
+})
+
+// ===========================================================================
+// STAGE 3 of build-p8/PLAN.md: EPIC-03 (Consume P6+P7 read-contracts,
+// read-only) — ATM-011, ATM-012, ATM-014, ATM-015. ATM-013 (fixture-DB
+// integration) lives in tests/ternary-reward-p6p7-integration.test.ts.
+// ===========================================================================
+
+/** Builds a PersistedCrossFamilyCritique row with sane defaults, override-able per test. */
+function makeCritiqueRow(overrides: Partial<PersistedCrossFamilyCritique> = {}): PersistedCrossFamilyCritique {
+  return {
+    id: 1,
+    decision_id: 10,
+    critique_id: null,
+    position_id: null,
+    producer_agent: 'boss',
+    producer_family: 'openai',
+    critic_agent: 'steve',
+    critic_family: 'anthropic',
+    is_cross_family: true,
+    verdict: 'concur',
+    linked_failure_class: null,
+    taxonomy_version: 1,
+    created_at: '2026-07-08T00:00:00Z',
+    ...overrides,
+  }
+}
+
+/** Builds a PersistedFailureClassification row with sane defaults, override-able per test. */
+function makeClassificationRow(
+  overrides: Partial<PersistedFailureClassification> = {},
+): PersistedFailureClassification {
+  return {
+    id: 1,
+    taxonomy_version: 1,
+    failure_class: 'verification_failure',
+    severity: 'medium',
+    transience: 'transient',
+    domain: 'agent',
+    signal_source: 'verify_check',
+    source_ref: null,
+    task_id: 55,
+    agent: 'boss',
+    summary: 'a test classification',
+    raw_signal: null,
+    created_at: '2026-07-08T00:00:00Z',
+    ...overrides,
+  } as PersistedFailureClassification
+}
+
+// ---------------------------------------------------------------------------
+// ATM-011 / REQ-007 [P1] — aggregateCrossFamilyVerdict()
+// ---------------------------------------------------------------------------
+describe('ATM-011: aggregateCrossFamilyVerdict()', () => {
+  test('ATM-011: block precedence branch', () => {
+    const rows = [
+      makeCritiqueRow({ is_cross_family: true, verdict: 'concur' }),
+      makeCritiqueRow({ is_cross_family: true, verdict: 'block' }),
+      makeCritiqueRow({ is_cross_family: true, verdict: 'dissent' }),
+    ]
+    expect(aggregateCrossFamilyVerdict(rows)).toBe('block')
+  })
+
+  test('ATM-011: dissent precedence branch (no block present)', () => {
+    const rows = [
+      makeCritiqueRow({ is_cross_family: true, verdict: 'concur' }),
+      makeCritiqueRow({ is_cross_family: true, verdict: 'dissent' }),
+      makeCritiqueRow({ is_cross_family: true, verdict: 'insufficient_same_family' }),
+    ]
+    expect(aggregateCrossFamilyVerdict(rows)).toBe('dissent')
+  })
+
+  test('ATM-011: concur precedence branch (no block/dissent present)', () => {
+    const rows = [
+      makeCritiqueRow({ is_cross_family: true, verdict: 'concur' }),
+      makeCritiqueRow({ is_cross_family: true, verdict: 'insufficient_same_family' }),
+      makeCritiqueRow({ is_cross_family: true, verdict: 'unknown' }),
+    ]
+    expect(aggregateCrossFamilyVerdict(rows)).toBe('concur')
+  })
+
+  test('ATM-011: insufficient_same_family precedence branch', () => {
+    const rows = [
+      makeCritiqueRow({ is_cross_family: true, verdict: 'insufficient_same_family' }),
+      makeCritiqueRow({ is_cross_family: true, verdict: 'unknown' }),
+    ]
+    expect(aggregateCrossFamilyVerdict(rows)).toBe('insufficient_same_family')
+  })
+
+  test('ATM-011: unknown-only cross-family input → unknown', () => {
+    const rows = [
+      makeCritiqueRow({ is_cross_family: true, verdict: 'unknown' }),
+      makeCritiqueRow({ is_cross_family: true, verdict: 'unknown' }),
+    ]
+    expect(aggregateCrossFamilyVerdict(rows)).toBe('unknown')
+  })
+
+  test('ATM-011: anti-monoculture — same-family-only block row → null (never block)', () => {
+    const rows = [
+      makeCritiqueRow({ is_cross_family: false, verdict: 'block' }),
+      makeCritiqueRow({ is_cross_family: false, verdict: 'dissent' }),
+    ]
+    expect(aggregateCrossFamilyVerdict(rows)).toBeNull()
+  })
+
+  test('ATM-011: MIXED same-family block + cross-family concur → concur (same-family block ignored)', () => {
+    const rows = [
+      makeCritiqueRow({ is_cross_family: false, verdict: 'block' }),
+      makeCritiqueRow({ is_cross_family: true, verdict: 'concur' }),
+    ]
+    expect(aggregateCrossFamilyVerdict(rows)).toBe('concur')
+  })
+
+  test('ATM-011: MIXED same-family block + cross-family dissent → dissent', () => {
+    const rows = [
+      makeCritiqueRow({ is_cross_family: false, verdict: 'block' }),
+      makeCritiqueRow({ is_cross_family: true, verdict: 'dissent' }),
+    ]
+    expect(aggregateCrossFamilyVerdict(rows)).toBe('dissent')
+  })
+
+  test('ATM-011: empty array → null', () => {
+    expect(aggregateCrossFamilyVerdict([])).toBeNull()
+  })
+
+  test('ATM-011: defensive fuzz — non-array inputs never throw, return null', () => {
+    const fuzz: unknown[] = [null, undefined, 42, 'block', {}, true, NaN]
+    for (const f of fuzz) {
+      let caught: unknown = null
+      let result: unknown
+      try {
+        result = aggregateCrossFamilyVerdict(f as unknown as PersistedCrossFamilyCritique[])
+      } catch (err) {
+        caught = err
+      }
+      expect(caught).toBeNull()
+      expect(result).toBeNull()
+    }
+  })
+
+  test('ATM-011: defensive fuzz — array with null/malformed/missing-field rows never throws', () => {
+    const rows = [
+      null,
+      undefined,
+      42,
+      'block',
+      {},
+      { is_cross_family: 'yes', verdict: 'block' }, // non-boolean is_cross_family → skipped
+      { verdict: 'block' }, // missing is_cross_family → skipped
+      makeCritiqueRow({ is_cross_family: true, verdict: 'concur' }), // the only genuine cross-family row
+    ] as unknown as PersistedCrossFamilyCritique[]
+    let caught: unknown = null
+    let result: unknown
+    try {
+      result = aggregateCrossFamilyVerdict(rows)
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeNull()
+    // only the one valid cross-family concur row is considered
+    expect(result).toBe('concur')
+  })
+
+  test('ATM-011: array of ONLY malformed rows → null (none considered)', () => {
+    const rows = [null, {}, { is_cross_family: false, verdict: 'block' }] as unknown as PersistedCrossFamilyCritique[]
+    expect(aggregateCrossFamilyVerdict(rows)).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-012 / REQ-008 [P1] — worstMandatoryFailureSeverity()
+// ---------------------------------------------------------------------------
+describe('ATM-012: worstMandatoryFailureSeverity()', () => {
+  test('ATM-012: mixed low/medium/high → high', () => {
+    const rows = [
+      makeClassificationRow({ severity: 'low' }),
+      makeClassificationRow({ severity: 'medium' }),
+      makeClassificationRow({ severity: 'high' }),
+    ]
+    expect(worstMandatoryFailureSeverity(rows)).toBe('high')
+  })
+
+  test('ATM-012: critical + anything → critical', () => {
+    const rows = [
+      makeClassificationRow({ severity: 'low' }),
+      makeClassificationRow({ severity: 'critical' }),
+      makeClassificationRow({ severity: 'high' }),
+    ]
+    expect(worstMandatoryFailureSeverity(rows)).toBe('critical')
+  })
+
+  test('ATM-012: single low → low', () => {
+    expect(worstMandatoryFailureSeverity([makeClassificationRow({ severity: 'low' })])).toBe('low')
+  })
+
+  test('ATM-012: empty array → null', () => {
+    expect(worstMandatoryFailureSeverity([])).toBeNull()
+  })
+
+  test('ATM-012: only unrecognized severity strings → null', () => {
+    const rows = [
+      makeClassificationRow({ severity: 'sev_future_v2' as unknown as PersistedFailureClassification['severity'] }),
+      makeClassificationRow({ severity: 'bogus' as unknown as PersistedFailureClassification['severity'] }),
+    ]
+    expect(worstMandatoryFailureSeverity(rows)).toBeNull()
+  })
+
+  test('ATM-012: recognized severity survives alongside unrecognized ones', () => {
+    const rows = [
+      makeClassificationRow({ severity: 'bogus' as unknown as PersistedFailureClassification['severity'] }),
+      makeClassificationRow({ severity: 'medium' }),
+    ]
+    expect(worstMandatoryFailureSeverity(rows)).toBe('medium')
+  })
+
+  test('ATM-012: defensive fuzz — non-array inputs never throw, return null', () => {
+    const fuzz: unknown[] = [null, undefined, 42, 'high', {}, true]
+    for (const f of fuzz) {
+      let caught: unknown = null
+      let result: unknown
+      try {
+        result = worstMandatoryFailureSeverity(f as unknown as PersistedFailureClassification[])
+      } catch (err) {
+        caught = err
+      }
+      expect(caught).toBeNull()
+      expect(result).toBeNull()
+    }
+  })
+
+  test('ATM-012: defensive fuzz — array with null/malformed rows never throws', () => {
+    const rows = [
+      null,
+      undefined,
+      42,
+      {},
+      { severity: 123 },
+      makeClassificationRow({ severity: 'high' }),
+    ] as unknown as PersistedFailureClassification[]
+    let caught: unknown = null
+    let result: unknown
+    try {
+      result = worstMandatoryFailureSeverity(rows)
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeNull()
+    expect(result).toBe('high')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-014 / REQ-009(a) [P1] — resolveTernaryRewardSignal() runtime read-fault
+// swallow. A fake db whose `.prepare()` throws for a targeted table makes the
+// REAL accessor (getCrossFamilyCritiques / getFailureClassifications) throw at
+// CALL time (exactly REQ-009(a)'s "missing table / query error"); the resolver
+// must swallow it and treat the failed source as absent — no propagation.
+// ---------------------------------------------------------------------------
+describe('ATM-014: resolveTernaryRewardSignal() runtime read-fault swallow', () => {
+  function fakeDb(opts: {
+    throwOnCritiques?: boolean
+    throwOnClassifications?: boolean
+    critiqueRows?: unknown[]
+    classificationRows?: unknown[]
+  }): Database {
+    return {
+      prepare(sql: string) {
+        const isCritiques = sql.includes('cross_family_critiques')
+        const isClassifications = sql.includes('failure_classifications')
+        if (isCritiques && opts.throwOnCritiques) throw new Error('boom: cross_family_critiques read')
+        if (isClassifications && opts.throwOnClassifications) throw new Error('boom: failure_classifications read')
+        return {
+          all: (..._p: unknown[]) =>
+            isCritiques ? (opts.critiqueRows ?? []) : isClassifications ? (opts.classificationRows ?? []) : [],
+          get: (..._p: unknown[]) => null,
+          run: (..._p: unknown[]) => ({}),
+        }
+      },
+    } as unknown as Database
+  }
+
+  test('ATM-014: cross-family read throws → verdict null, no propagation; assignTernaryReward still runs', () => {
+    const db = fakeDb({ throwOnCritiques: true, classificationRows: [] })
+    let signal: TernaryRewardSignal | undefined
+    let caught: unknown = null
+    try {
+      signal = resolveTernaryRewardSignal(db, 10, 55)
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeNull()
+    expect(signal!.cross_family_verdict).toBeNull()
+    // P6 read succeeded (zero rows) → available true, severity null.
+    expect(signal!.failure_signal_available).toBe(true)
+    expect(signal!.failure_severity).toBeNull()
+    // evaluator still runs to completion on the resolved signal.
+    expect(assignTernaryReward(signal!)).toEqual({ reward: 0, policy_version: 1 })
+  })
+
+  test('ATM-014: P6 read throws → failure_signal_available=false, severity null, no propagation', () => {
+    const db = fakeDb({ throwOnClassifications: true, critiqueRows: [] })
+    let signal: TernaryRewardSignal | undefined
+    let caught: unknown = null
+    try {
+      signal = resolveTernaryRewardSignal(db, 10, 55)
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeNull()
+    expect(signal!.failure_signal_available).toBe(false)
+    expect(signal!.failure_severity).toBeNull()
+    expect(assignTernaryReward(signal!)).toEqual({ reward: 0, policy_version: 1 })
+  })
+
+  test('ATM-014: BOTH reads throw → both sources absent, no propagation', () => {
+    const db = fakeDb({ throwOnCritiques: true, throwOnClassifications: true })
+    let signal: TernaryRewardSignal | undefined
+    let caught: unknown = null
+    try {
+      signal = resolveTernaryRewardSignal(db, 10, 55)
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeNull()
+    expect(signal).toEqual({
+      cross_family_verdict: null,
+      failure_severity: null,
+      failure_signal_available: false,
+    })
+  })
+
+  test('ATM-014: null taskId → P6 not read, failure_signal_available=false (UNKNOWN, never clean)', () => {
+    const db = fakeDb({ critiqueRows: [] })
+    const signal = resolveTernaryRewardSignal(db, 10, null)
+    expect(signal.failure_signal_available).toBe(false)
+    expect(signal.failure_severity).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-015 / REQ-009(b) [P1] — import-scope guardrail
+// ---------------------------------------------------------------------------
+describe('ATM-015: import-scope guardrail (only the two read accessors + type-only reads)', () => {
+  const importLines = MODULE_SOURCE.split('\n').filter((l) => /^\s*import\b/.test(l))
+
+  test('ATM-015: value-imports getCrossFamilyCritiques from cross-family-critique.ts', () => {
+    expect(MODULE_SOURCE).toMatch(
+      /import\s*\{\s*getCrossFamilyCritiques\s*\}\s*from\s*['"]\.\/cross-family-critique['"]/,
+    )
+  })
+
+  test('ATM-015: value-imports getFailureClassifications from failure-classification.ts', () => {
+    expect(MODULE_SOURCE).toMatch(
+      /import\s*\{\s*getFailureClassifications\s*\}\s*from\s*['"]\.\/failure-classification['"]/,
+    )
+  })
+
+  test('ATM-015: NO P6/P7 write symbol is imported anywhere', () => {
+    const WRITE_SYMBOLS = [
+      'persistCrossFamilyCritique',
+      'evaluateCrossFamily',
+      'resolveModelFamily',
+      'resolveAgentDefaultFamily',
+      'classifyFailure',
+      'persistFailureClassification',
+    ]
+    for (const line of importLines) {
+      for (const sym of WRITE_SYMBOLS) {
+        expect(line).not.toContain(sym)
+      }
+    }
+  })
+
+  test('ATM-015: the ONLY value symbols imported from the two upstream modules are the two accessors', () => {
+    // Any import line referencing an upstream module must either be an
+    // `import type` (type-only) line OR value-import exactly one accessor.
+    const upstreamValueImports = importLines.filter(
+      (l) =>
+        (l.includes('./cross-family-critique') || l.includes('./failure-classification')) &&
+        !/^\s*import\s+type\b/.test(l),
+    )
+    for (const line of upstreamValueImports) {
+      const ok =
+        /import\s*\{\s*getCrossFamilyCritiques\s*\}/.test(line) ||
+        /import\s*\{\s*getFailureClassifications\s*\}/.test(line)
+      expect(ok).toBe(true)
+    }
+  })
 })

@@ -7,12 +7,19 @@
 // P8 does NOT touch decision.ts, failure-classification.ts, or
 // cross-family-critique.ts — see PLAN.md Overlap boundaries.
 //
-// EPIC-02 (below) imports CrossFamilyVerdict/FailureSeverity as TYPE-ONLY
-// (ATM-007) — these are TYPED INPUT FIELDS only (read/passed through, never
-// redefined/aliased/re-exported). This module never imports a P6/P7 VALUE
-// symbol at this stage (EPIC-03's read accessors are a later stage).
-import type { CrossFamilyVerdict } from './cross-family-critique'
-import type { FailureSeverity } from './failure-classification'
+// EPIC-02 imports CrossFamilyVerdict/FailureSeverity as TYPE-ONLY (ATM-007)
+// — these are TYPED INPUT FIELDS only (read/passed through, never
+// redefined/aliased/re-exported). EPIC-03 additionally reads back the two
+// upstream PERSISTED row types (also type-only) and VALUE-imports EXACTLY the
+// two read accessors `getCrossFamilyCritiques`/`getFailureClassifications`
+// (and NO write symbol — ATM-015/ATM-030). The type-only imports are kept in
+// dedicated `import type` statements so ATM-007's type-only guardrail holds,
+// while the two accessors come in via separate value imports.
+import type { Database } from 'bun:sqlite'
+import type { CrossFamilyVerdict, PersistedCrossFamilyCritique } from './cross-family-critique'
+import { getCrossFamilyCritiques } from './cross-family-critique'
+import type { FailureSeverity, PersistedFailureClassification } from './failure-classification'
+import { getFailureClassifications } from './failure-classification'
 
 // ---------------------------------------------------------------------------
 // EPIC-01 / REQ-001, REQ-002, REQ-003 (ATM-001..005) — TernaryReward
@@ -197,4 +204,126 @@ export function assignTernaryReward(signal: TernaryRewardSignal): TernaryRewardA
   } catch {
     return { reward: 0, policy_version: TERNARY_REWARD_TAXONOMY_VERSION }
   }
+}
+
+// ---------------------------------------------------------------------------
+// EPIC-03 / REQ-007, REQ-008, REQ-009 (ATM-011..015) — Read-only adapters
+// that fold P7's raw per-critique rows and P6's raw per-classification rows
+// into the single TernaryRewardSignal shape assignTernaryReward() consumes.
+//
+// The two folds (aggregateCrossFamilyVerdict / worstMandatoryFailureSeverity)
+// are PURE — they take the ALREADY-READ arrays and never touch a db handle.
+// The db threads ONLY through resolveTernaryRewardSignal() (the resolver the
+// EPIC-04 finalize hook reuses), which calls the two accessors and swallows a
+// RUNTIME call-throw per REQ-009(a). This module touches ZERO lines of
+// cross-family-critique.ts / failure-classification.ts (ATM-015/ATM-030).
+// ---------------------------------------------------------------------------
+
+/**
+ * ATM-011 / REQ-007 — Fold P7's per-critique rows into ONE cross-family
+ * verdict by monotone precedence, CONSIDERING ONLY rows with
+ * `is_cross_family === true` (the anti-monoculture gate: a same-family row
+ * NEVER by itself drives a block/dissent/concur result). Precedence:
+ * block > dissent > concur > insufficient_same_family > else 'unknown'.
+ * Returns `null` IF the input is empty OR contains no cross-family row.
+ * Defensively treats a non-array input as empty and SKIPS each
+ * malformed/`null` row — NEVER throws (REQ-007(b)).
+ */
+export function aggregateCrossFamilyVerdict(
+  critiques: PersistedCrossFamilyCritique[],
+): CrossFamilyVerdict | null {
+  try {
+    if (!Array.isArray(critiques)) return null
+    const considered = critiques.filter(
+      (c) => !!c && typeof c === 'object' && (c as { is_cross_family?: unknown }).is_cross_family === true,
+    )
+    if (considered.length === 0) return null
+    const verdicts = considered.map((c) => (c as { verdict?: unknown }).verdict)
+    if (verdicts.includes('block')) return 'block'
+    if (verdicts.includes('dissent')) return 'dissent'
+    if (verdicts.includes('concur')) return 'concur'
+    if (verdicts.includes('insufficient_same_family')) return 'insufficient_same_family'
+    return 'unknown'
+  } catch {
+    return null
+  }
+}
+
+/** Monotone severity ranking for worstMandatoryFailureSeverity(). Higher = worse. */
+const _FAILURE_SEVERITY_RANK: Readonly<Record<string, number>> = Object.freeze({
+  critical: 4,
+  high: 3,
+  medium: 2,
+  low: 1,
+})
+
+/**
+ * ATM-012 / REQ-008 — Return the WORST `severity` present among P6's
+ * per-classification rows by the precedence `critical > high > medium > low`.
+ * Returns `null` IF the input is empty or contains no recognized severity.
+ * Defensively treats a non-array input as empty and SKIPS each
+ * malformed/`null` row — NEVER throws (REQ-008(a)).
+ */
+export function worstMandatoryFailureSeverity(
+  classifications: PersistedFailureClassification[],
+): FailureSeverity | null {
+  try {
+    if (!Array.isArray(classifications)) return null
+    let worst: FailureSeverity | null = null
+    let worstRank = 0
+    for (const c of classifications) {
+      if (!c || typeof c !== 'object') continue
+      const sev = (c as { severity?: unknown }).severity
+      const rank = typeof sev === 'string' ? _FAILURE_SEVERITY_RANK[sev] : undefined
+      if (rank !== undefined && rank > worstRank) {
+        worstRank = rank
+        worst = sev as FailureSeverity
+      }
+    }
+    return worst
+  } catch {
+    return null
+  }
+}
+
+/**
+ * ATM-014 / REQ-009(a) — Resolve the aggregate TernaryRewardSignal for a
+ * finalized decision by reading P7's cross-family critiques (keyed on
+ * `decisionId`) and, IFF `taskId` is non-null, P6's failure classifications
+ * (keyed on `taskId`). This is the small resolver the EPIC-04 finalize hook
+ * (Stage 6) reuses.
+ *
+ * A RUNTIME throw from either accessor is CAUGHT and the failed source is
+ * treated as ABSENT (REQ-009(a)): a cross-family read-throw → verdict `null`;
+ * a P6 read-throw OR a null `taskId` → `failure_signal_available = false`,
+ * `failure_severity = null` (severity UNKNOWN, NEVER treated as clean, so the
+ * downstream evaluator can never award a spurious `+1`). A SUCCESSFUL P6 read
+ * (INCLUDING zero rows) sets `failure_signal_available = true`. Never throws.
+ */
+export function resolveTernaryRewardSignal(
+  db: Database,
+  decisionId: number,
+  taskId: number | null,
+): TernaryRewardSignal {
+  let cross_family_verdict: CrossFamilyVerdict | string | null = null
+  try {
+    cross_family_verdict = aggregateCrossFamilyVerdict(getCrossFamilyCritiques(db, { decisionId }))
+  } catch {
+    cross_family_verdict = null
+  }
+
+  let failure_signal_available = false
+  let failure_severity: FailureSeverity | string | null = null
+  if (taskId !== null && taskId !== undefined) {
+    try {
+      const classifications = getFailureClassifications(db, { taskId })
+      failure_signal_available = true
+      failure_severity = worstMandatoryFailureSeverity(classifications)
+    } catch {
+      failure_signal_available = false
+      failure_severity = null
+    }
+  }
+
+  return { cross_family_verdict, failure_severity, failure_signal_available }
 }
