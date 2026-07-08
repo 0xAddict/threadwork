@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "esnext",
+    "lib": ["esnext", "dom"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "typeRoots": ["./.typeroots"],
+    "types": ["bun-types", "node"]
+  },
+  "include": [
+    "types/bun-sqlite-widen.d.ts",
+    "verification/failure-classification.ts",
+    "verification/verify.ts",
+    "watchdog.ts",
+    "src/escalation-bridge/index.ts",
+    "db.ts",
+    "decision.ts",
+    "tests/failure-classification.test.ts",
+    "tests/failure-classification-verify-integration.test.ts",
+    "tests/failure-classification-watchdog-integration.test.ts",
+    "tests/failure-classification-escalation-integration.test.ts",
+    "tests/guardrails/escalation-bridge-onfailureclassified-wired.test.ts"
+  ]
+}
