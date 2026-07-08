@@ -534,3 +534,42 @@ export function getTernaryRewards(
     }),
   )
 }
+
+// ---------------------------------------------------------------------------
+// EPIC-04 wiring orchestrator (REQ-013 / ATM-020) — the single exported entry
+// point the finalize_decision hook calls, keeping server.ts's additive
+// footprint to one import + one flag-gated inner-try/catch call site.
+// ---------------------------------------------------------------------------
+
+/**
+ * assessAndPersistTernaryRewardForDecision() — resolve the aggregate signal
+ * for a just-finalized decision (P7 cross-family verdict + P6 worst failure
+ * severity, with the availability guard), assign the reward, and persist it.
+ * Reuses resolveTernaryRewardSignal() (which swallows RUNTIME read-throws per
+ * REQ-009(a)), assignTernaryReward() (never-throws), and persistTernaryReward()
+ * (flag-gated + locally atomic).
+ *
+ * This function is NOT self-swallowing: a persistence-layer throw propagates to
+ * the CALLER, which is the finalize_decision handler's OWN inner try/catch
+ * (server.ts). That inner catch — with the ternary_reward_enabled flag-read
+ * ALSO inside it — is what guarantees a throw here NEVER reaches the handler's
+ * pre-existing OUTER catch and NEVER flips the finalize success response
+ * (OQ-3 / REQ-013(a)). Callers MUST invoke this only from inside that swallow.
+ */
+export function assessAndPersistTernaryRewardForDecision(
+  rawDb: Database,
+  decision: { id: number; task_id: number | null },
+): number | null {
+  const signal = resolveTernaryRewardSignal(rawDb, decision.id, decision.task_id)
+  const assessment = assignTernaryReward(signal)
+  return persistTernaryReward(rawDb, {
+    policy_version: assessment.policy_version,
+    decision_id: decision.id,
+    task_id: decision.task_id,
+    subject_kind: 'decision',
+    cross_family_verdict: signal.cross_family_verdict,
+    failure_severity: signal.failure_severity,
+    failure_signal_available: signal.failure_signal_available,
+    reward: assessment.reward,
+  })
+}
