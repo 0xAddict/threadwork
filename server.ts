@@ -40,6 +40,16 @@ import { AuditLog } from './audit'
 import { MemoryConsolidator } from './consolidator'
 import { handleSendDirectedMessageTool, handlePollDirectedMessagesTool, handleAckDirectedMessageTool } from './agent-messages'
 import { MSG_TYPES } from './agent-message-types'
+// P7 Stage 6 (EPIC-04 wiring, REQ-013/ATM-020/021) — additive import, read
+// access to the P7 module only. See the critique_position hook below.
+import {
+  resolveModelFamily,
+  resolveAgentDefaultFamily,
+  evaluateCrossFamily,
+  persistCrossFamilyCritique,
+  getMandatoryCrossFamilyReviewClassifications,
+  annotateWithFailureClass,
+} from './verification/cross-family-critique'
 
 const db = new TaskDB(DB_PATH)
 const mem = new MemoryDB(db)
@@ -538,6 +548,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           critique: { type: 'string', description: 'Your critique' },
           position_id: { type: 'number', description: 'Optional: which position you are critiquing' },
           severity: { type: 'string', enum: ['observation', 'concern', 'blocker'], description: 'Severity level (default: observation)' },
+          producer_model_id: { type: 'string', description: 'Optional (P7): model ID of the position/decision producer being critiqued (e.g. "gpt-5.5"), used for cross-family attribution when cross_family_critique_enabled is ON. Omit to fall back to agent-based resolution.' },
+          critic_model_id: { type: 'string', description: 'Optional (P7): model ID of the critiquing agent (e.g. "claude-opus-4-6"), used for cross-family attribution when cross_family_critique_enabled is ON. Omit to fall back to agent-based resolution.' },
         },
         required: ['decision_id', 'critique'],
       },
@@ -1636,6 +1648,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const critique = args.critique as string
         const positionId = args.position_id as number | undefined
         const severity = args.severity as string | undefined
+        // P7 Stage 6 (REQ-013/ATM-020/021) — additive, optional, raw extraction only.
+        const producerModelIdRaw = args.producer_model_id as unknown
+        const criticModelIdRaw = args.critic_model_id as unknown
 
         try {
           const crit = dec.addCritique(decisionId, SELF_LABEL, critique, {
@@ -1645,6 +1660,80 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           const target = positionId ? `position #${positionId}` : 'decision overall'
           await postToGroup(formatCritiqueSubmitted(decisionId, SELF_LABEL, target, critique))
           audit.log(SELF_LABEL, 'decision_critique_submitted', { decision_id: decisionId, critique_id: crit.id, severity: crit.severity })
+          // P7 Stage 6 (EPIC-04 wiring, REQ-013/ATM-020/021) — additive,
+          // flag-gated, try/catch-swallowed cross-family critique recording.
+          // Runs AFTER the existing dec.addCritique()/postToGroup/audit.log
+          // calls above have already fully succeeded. REQ-013(a): ANY
+          // failure resolving attribution or persisting below is caught and
+          // swallowed here — the response returned below, the
+          // decision_critiques row already written by dec.addCritique(),
+          // and the postToGroup/audit.log calls above are completely
+          // unaffected by anything that happens in this block.
+          try {
+            if (db.isFeatureEnabled('cross_family_critique_enabled')) {
+              const rawDb = db.getHandle()
+              // REQ-013(b)/Codex iter-2 LOW: a supplied producer_model_id/
+              // critic_model_id that is present but NOT a well-formed
+              // non-empty string is treated as ABSENT (falls through to the
+              // agent-based resolution branch below), not a hard rejection.
+              const isNonEmptyModelId = (v: unknown): v is string => typeof v === 'string' && v.length > 0
+              const producerModelId = isNonEmptyModelId(producerModelIdRaw) ? producerModelIdRaw : undefined
+              const criticModelId = isNonEmptyModelId(criticModelIdRaw) ? criticModelIdRaw : undefined
+
+              const decisionRow = rawDb
+                .prepare('SELECT opened_by, task_id FROM decisions WHERE id = ?')
+                .get(decisionId) as { opened_by: string; task_id: number | null } | null
+
+              // producer_agent (REQ-013): the target position's agent when
+              // position_id is present, ELSE the decision's own opened_by —
+              // independent of whether producer_model_id was supplied.
+              let producerAgent = decisionRow ? decisionRow.opened_by : SELF_LABEL
+              if (positionId !== undefined) {
+                const positionRow = rawDb
+                  .prepare('SELECT agent FROM decision_positions WHERE id = ?')
+                  .get(positionId) as { agent: string } | null
+                if (positionRow) producerAgent = positionRow.agent
+              }
+
+              const producerFamily = producerModelId
+                ? resolveModelFamily(producerModelId)
+                : resolveAgentDefaultFamily(producerAgent)
+              const criticFamily = criticModelId
+                ? resolveModelFamily(criticModelId)
+                : resolveAgentDefaultFamily(SELF_LABEL)
+
+              const evaluation = evaluateCrossFamily({
+                producer_family: producerFamily,
+                critic_family: criticFamily,
+                critic_severity: crit.severity,
+              })
+
+              // linked_failure_class (REQ-009, best-effort): only when the
+              // decision carries a non-null task_id to key P6's mandatory-
+              // review adapter on; null otherwise.
+              const taskId = decisionRow ? decisionRow.task_id : null
+              const linkedFailureClass = taskId !== null
+                ? annotateWithFailureClass(getMandatoryCrossFamilyReviewClassifications(rawDb, { taskId }))
+                : null
+
+              // Codex #5: critique_id is ALWAYS the id of the DecisionCritique
+              // dec.addCritique() just returned above — never null on this path.
+              persistCrossFamilyCritique(rawDb, {
+                decision_id: decisionId,
+                critique_id: crit.id,
+                position_id: positionId ?? null,
+                producer_agent: producerAgent,
+                producer_family: producerFamily,
+                critic_agent: SELF_LABEL,
+                critic_family: criticFamily,
+                is_cross_family: evaluation.is_cross_family,
+                verdict: evaluation.verdict,
+                linked_failure_class: linkedFailureClass,
+              })
+            }
+          } catch {
+            // REQ-013(a): swallow — see the block comment above.
+          }
           return { content: [{ type: 'text', text: `Critique #${crit.id} submitted on decision #${decisionId} (severity: ${crit.severity}).` }] }
         } catch (err: any) {
           return { content: [{ type: 'text', text: `Critique failed: ${err.message}`, isError: true }] }

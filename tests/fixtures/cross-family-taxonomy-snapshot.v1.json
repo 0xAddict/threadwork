@@ -1,0 +1,13 @@
+{
+  "taxonomy_version": 1,
+  "families": [
+    "anthropic",
+    "openai",
+    "google",
+    "meta",
+    "xai",
+    "deepseek",
+    "mistral",
+    "unknown"
+  ]
+}
