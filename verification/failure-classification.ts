@@ -349,10 +349,16 @@ export function classifyFailure(signal: RawFailureSignal): FailureClassification
 
   switch (source) {
     case 'verify_check': {
-      // Row 1 — unconditional. The SG-13 exclusion is the Stage-5 adapter's
-      // job (it simply never emits a verify_check signal for an excluded
-      // check); classifyFailure maps every verify_check it receives.
-      quad = { failure_class: 'verification_failure', severity: 'medium', transience: 'transient', domain: 'agent' }
+      // Row 1, else row 16. The SG-13 exclusion is the Stage-5 adapter's job
+      // (it simply never emits a verify_check signal for an excluded check);
+      // classifyFailure maps every well-formed verify_check it receives.
+      // checkResultId is the REQUIRED discriminating field — missing/
+      // wrong-type falls to the unknown fallback (Codex round-2 fold).
+      if (typeof s?.checkResultId !== 'string') {
+        quad = { ..._UNKNOWN_QUAD }
+      } else {
+        quad = { failure_class: 'verification_failure', severity: 'medium', transience: 'transient', domain: 'agent' }
+      }
       break
     }
     case 'test_run': {
@@ -383,9 +389,10 @@ export function classifyFailure(signal: RawFailureSignal): FailureClassification
       break
     }
     case 'watchdog_blocked': {
-      // Rows 6-10 — every blocked_on value (including null/legacy/
-      // unrecognized) resolves to blocked_dependency; only the domain and
-      // severity vary.
+      // Rows 6-10, else row 16 (Codex round-2 fold). blocked_on===null is
+      // the ONLY value that maps to row 10 (legacy/unknown-domain blocked
+      // dependency) — any other malformed/missing/wrong-type/unrecognized
+      // blocked_on value falls to the top-level unknown fallback, NOT row 10.
       const blockedOn = s?.blocked_on
       switch (blockedOn) {
         case 'human':
@@ -400,9 +407,14 @@ export function classifyFailure(signal: RawFailureSignal): FailureClassification
         case 'agent':
           quad = { failure_class: 'blocked_dependency', severity: 'low', transience: 'transient', domain: 'agent' }
           break
-        default:
-          // Row 10 — null / legacy / any unrecognized blocked_on value.
+        case null:
+          // Row 10 — explicit null / legacy blocked_on.
           quad = { failure_class: 'blocked_dependency', severity: 'low', transience: 'transient', domain: 'unknown' }
+          break
+        default:
+          // Malformed / missing / wrong-type / unrecognized-string
+          // blocked_on -> REQ-004(b) top-level unknown fallback (row 16).
+          quad = { ..._UNKNOWN_QUAD }
           break
       }
       break
@@ -418,15 +430,26 @@ export function classifyFailure(signal: RawFailureSignal): FailureClassification
       break
     }
     case 'adversarial_finding': {
-      // Rows 13-15.
+      // Rows 13-15, else row 16 (Codex round-2 fold). Both `category` and
+      // `severityHint` are REQUIRED strings — if either is missing or the
+      // wrong type, fall to the full top-level unknown fallback rather than
+      // partially mapping (hint-mapped severity/permanent/system) via row 15.
       const category = s?.category
-      const severity = _mapSeverityHint(s?.severityHint)
-      if (category === 'correctness') {
-        quad = { failure_class: 'correctness_adversarial_finding', severity, transience: 'permanent', domain: 'system' }
-      } else if (typeof category === 'string' && _CONTRACT_SCOPE_CATEGORIES.has(category)) {
-        quad = { failure_class: 'contract_scope_conformance', severity, transience: 'permanent', domain: 'system' }
+      const severityHint = s?.severityHint
+      if (typeof category !== 'string' || typeof severityHint !== 'string') {
+        quad = { ..._UNKNOWN_QUAD }
       } else {
-        quad = { failure_class: 'unknown', severity, transience: 'permanent', domain: 'system' }
+        const severity = _mapSeverityHint(severityHint)
+        if (category === 'correctness') {
+          quad = { failure_class: 'correctness_adversarial_finding', severity, transience: 'permanent', domain: 'system' }
+        } else if (_CONTRACT_SCOPE_CATEGORIES.has(category)) {
+          quad = { failure_class: 'contract_scope_conformance', severity, transience: 'permanent', domain: 'system' }
+        } else {
+          // Row 15 — a valid-but-unrecognized STRING category: unknown
+          // class, but hint-mapped severity / permanent / system (NOT the
+          // full fallback quad).
+          quad = { failure_class: 'unknown', severity, transience: 'permanent', domain: 'system' }
+        }
       }
       break
     }

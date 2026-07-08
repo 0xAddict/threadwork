@@ -183,11 +183,22 @@ describe('ATM-032 / REQ-020: EscalationBridge onFailureClassified wiring guardra
     expect(enumeratedSites.sort()).toEqual([...ESC_BRIDGE_CLASSIFY_EXCLUSIONS].sort())
   })
 
-  test('no non-test, non-defining-module file re-exports or aliases the EscalationBridge class', () => {
-    // Failure mode (c): the class gets re-exported/aliased out of its
-    // defining module, which would let a caller construct it under a
-    // different name that the `new EscalationBridge(` scan above would miss
-    // entirely — silently defeating check (1).
+  test('no file — INCLUDING the defining module — re-exports or aliases the EscalationBridge class outside a real construction', () => {
+    // Failure mode (c): the class gets re-exported/aliased (possibly even
+    // from WITHIN its own defining module — Codex round-2 fold), which would
+    // let a caller construct it under a different name that the
+    // `new EscalationBridge(` scan above would miss entirely — silently
+    // defeating check (1). The previous version of this guardrail SKIPPED
+    // the defining module entirely, so `export const Bridge =
+    // EscalationBridge` added there evaded both scans. It is now scanned
+    // like every other file; the patterns below are shaped so the module's
+    // own legitimate declarations (`export class EscalationBridge {` and
+    // `export interface EscalationBridgeOptions`) do not false-positive:
+    //  - `\bEscalationBridge\b` word-boundaries exclude EscalationBridgeOptions
+    //    and fromEscalationBridgeAllPathsFailed (the substring is embedded
+    //    mid-identifier with no boundary on at least one side).
+    //  - `export class EscalationBridge {` has no `=`, `as`, `default`, or
+    //    `{` directly after `export`, so none of the patterns below match it.
     const DEFINING_MODULE = 'src/escalation-bridge/index.ts'
 
     const reExportPatterns = [
@@ -197,13 +208,21 @@ describe('ATM-032 / REQ-020: EscalationBridge onFailureClassified wiring guardra
       /export\s*\{[^}]*\bEscalationBridge\b[^}]*\}/,
       // import { EscalationBridge as X } / export { EscalationBridge as X } — any aliasing
       /\bEscalationBridge\s+as\s+\w+/,
+      // export const/let/var X = EscalationBridge  (assignment alias export)
+      /export\s+(const|let|var)\s+\w+\s*=\s*EscalationBridge\b/,
+      // const/let/var X = EscalationBridge  (local alias binding — `=\s*EscalationBridge`
+      // requires the assigned value to be the bare class reference, so it
+      // naturally does NOT match `= new EscalationBridge(...)`: "new" is not
+      // whitespace, so \s* cannot skip over it)
+      /(^|[^.\w])(const|let|var)\s+\w+\s*=\s*EscalationBridge\b/,
+      // export default EscalationBridge
+      /export\s+default\s+EscalationBridge\b/,
     ]
 
     const offenders: Array<{ file: string; line: number; text: string }> = []
 
     for (const file of allFiles) {
       const relPath = relative(REPO, file)
-      if (relPath === DEFINING_MODULE) continue
 
       let content: string
       try {
@@ -227,8 +246,8 @@ describe('ATM-032 / REQ-020: EscalationBridge onFailureClassified wiring guardra
     if (offenders.length > 0) {
       const details = offenders.map(o => `  ${o.file}:${o.line} — ${o.text}`).join('\n')
       throw new Error(
-        `ATM-032 violation: EscalationBridge appears to be re-exported or aliased outside its defining module ` +
-        `(${DEFINING_MODULE}):\n${details}\n` +
+        `ATM-032 violation: EscalationBridge appears to be re-exported or aliased (including possibly from ` +
+        `within its own defining module, ${DEFINING_MODULE}):\n${details}\n` +
         `This would let a caller obtain the constructor under a different name that the ` +
         `\`new EscalationBridge(\` construction-site scan above cannot see, silently defeating the wiring guardrail.`
       )

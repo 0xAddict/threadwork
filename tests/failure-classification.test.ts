@@ -490,6 +490,45 @@ describe('ATM-007: unknown fallback — no throw on unrecognized/malformed input
     expect(result.transience).toBe('unknown')
     expect(result.domain).toBe('unknown')
   })
+
+  // Codex round-2 fold (Finding 1 / REQ-004(b)): recognized sources with
+  // malformed/missing/wrong-type REQUIRED fields must ALSO fall to the full
+  // row-16 unknown quadruple — not partially map via some other branch.
+  test('ATM-007(c): classifyFailure({ source: "verify_check" } as any) (missing checkResultId) -> full unknown quadruple, no throw', () => {
+    expect(() => classifyFailure({ source: 'verify_check' } as any)).not.toThrow()
+    const result = classifyFailure({ source: 'verify_check' } as any)
+    expect(result.failure_class).toBe('unknown')
+    expect(result.severity).toBe('medium')
+    expect(result.transience).toBe('unknown')
+    expect(result.domain).toBe('unknown')
+  })
+
+  test('ATM-007(d): classifyFailure({ source: "watchdog_blocked" } as any) (missing blocked_on) -> full unknown quadruple, no throw', () => {
+    expect(() => classifyFailure({ source: 'watchdog_blocked' } as any)).not.toThrow()
+    const result = classifyFailure({ source: 'watchdog_blocked' } as any)
+    expect(result.failure_class).toBe('unknown')
+    expect(result.severity).toBe('medium')
+    expect(result.transience).toBe('unknown')
+    expect(result.domain).toBe('unknown')
+  })
+
+  test("ATM-007(e): classifyFailure({ source: 'watchdog_blocked', blocked_on: 'bogus' } as any) -> full unknown quadruple, no throw (only blocked_on===null maps to row 10)", () => {
+    expect(() => classifyFailure({ source: 'watchdog_blocked', blocked_on: 'bogus' } as any)).not.toThrow()
+    const result = classifyFailure({ source: 'watchdog_blocked', blocked_on: 'bogus' } as any)
+    expect(result.failure_class).toBe('unknown')
+    expect(result.severity).toBe('medium')
+    expect(result.transience).toBe('unknown')
+    expect(result.domain).toBe('unknown')
+  })
+
+  test('ATM-007(f): classifyFailure({ source: "adversarial_finding" } as any) (missing category) -> full unknown quadruple, no throw', () => {
+    expect(() => classifyFailure({ source: 'adversarial_finding' } as any)).not.toThrow()
+    const result = classifyFailure({ source: 'adversarial_finding' } as any)
+    expect(result.failure_class).toBe('unknown')
+    expect(result.severity).toBe('medium')
+    expect(result.transience).toBe('unknown')
+    expect(result.domain).toBe('unknown')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -551,68 +590,147 @@ describe('ATM-008: purity + idempotency', () => {
 // ATM-009 / REQ-004(b) [P2] — never-throw fuzz over 50 malformed inputs
 // ---------------------------------------------------------------------------
 
+/** Bare quadruple shape used to pin an exact expected classification per ATM-009 case. */
+type Atm009Quad = { failure_class: string; severity: string; transience: string; domain: string }
+
+/** Row 16 — the full unknown fallback quadruple. */
+const ATM009_UNKNOWN_QUAD: Atm009Quad = { failure_class: 'unknown', severity: 'medium', transience: 'unknown', domain: 'unknown' }
+
+/** One ATM-009 fuzz case: an input plus the exact quadruple classifyFailure(input) must produce. */
+type Atm009Case = { input: unknown; expected: Atm009Quad }
+
 /**
- * Builds exactly 50 programmatically-generated malformed inputs: missing
- * fields, wrong types, null/undefined, nested-object garbage, and objects
- * with a circular reference (one AS the signal itself, one embedded as a
- * `raw_signal`-named field on the malformed input, one nested inside).
+ * Builds exactly 50 programmatically-generated cases covering EVERY
+ * recognized RawFailureSignal source (Codex round-2 fold, Finding 1):
+ * missing/wrong-type REQUIRED fields (verify_check.checkResultId,
+ * watchdog_fault.faultType, verify_idle_count.idle_count,
+ * watchdog_blocked.blocked_on, adversarial_finding.category/severityHint),
+ * null/undefined/primitive/array top-level signals, nested-object garbage,
+ * and objects with a circular reference (one AS the signal itself, one
+ * embedded as a `raw_signal`-named field, one nested inside).
  *
- * Every entry is deliberately constructed to land on the row-16 (or row-15,
- * still failure_class==='unknown') fallback: recognized sources that map
- * unconditionally elsewhere (verify_check, test_run, watchdog_dead_session,
- * escalation_bridge_all_paths_failed) and watchdog_blocked (which always
- * resolves to blocked_dependency, even for legacy/null blocked_on) are
- * deliberately excluded so the "each produces unknown" invariant holds.
+ * Each case pins the EXACT expected quadruple:
+ *  - Cases with a malformed/missing REQUIRED discriminating field (or an
+ *    unrecognized `source` altogether) expect the FULL row-16 unknown
+ *    quadruple {unknown, medium, unknown, unknown} — this is
+ *    ATM009_UNKNOWN_QUAD.
+ *  - Sources with NO required discriminating field (test_run,
+ *    watchdog_dead_session, escalation_bridge_all_paths_failed) always map
+ *    to their REAL class regardless of which optional context fields are
+ *    present/malformed — these cases expect that real quadruple, never the
+ *    fallback.
+ *  - A valid-but-unrecognized-STRING adversarial_finding category (both
+ *    category and severityHint correctly typed as strings) is row 15:
+ *    failure_class 'unknown' but with hint-mapped severity / permanent /
+ *    system — NOT the full fallback quadruple. This is the one case where
+ *    failure_class alone would be misleading, which is exactly why this
+ *    fuzz asserts the full quadruple per case, not just failure_class.
  */
-function buildAtm009MalformedInputs(): unknown[] {
-  const inputs: unknown[] = []
+function buildAtm009Cases(): Atm009Case[] {
+  const cases: Atm009Case[] = []
+  const full = (input: unknown): void => { cases.push({ input, expected: ATM009_UNKNOWN_QUAD }) }
+  const real = (input: unknown, expected: Atm009Quad): void => { cases.push({ input, expected }) }
 
-  // Top-level non-object / nullish / primitive signals (9).
-  inputs.push(null)
-  inputs.push(undefined)
-  inputs.push(42)
-  inputs.push('just a string')
-  inputs.push(true)
-  inputs.push(false)
-  inputs.push([])
-  inputs.push([1, 2, 3])
-  inputs.push({})
+  // Top-level non-object / nullish / primitive signals (9) — no recognizable
+  // `source` at all -> full unknown quadruple.
+  full(null)
+  full(undefined)
+  full(42)
+  full('just a string')
+  full(true)
+  full(false)
+  full([])
+  full([1, 2, 3])
+  full({})
 
-  // Missing / wrong-type `source` (6).
-  inputs.push({ source: undefined })
-  inputs.push({ source: null })
-  inputs.push({ source: 123 })
-  inputs.push({ source: {} })
-  inputs.push({ source: [] })
-  inputs.push({ source: true })
+  // Missing / wrong-type `source` (6) -> full unknown quadruple.
+  full({ source: undefined })
+  full({ source: null })
+  full({ source: 123 })
+  full({ source: {} })
+  full({ source: [] })
+  full({ source: true })
 
-  // watchdog_fault with malformed/unrecognized faultType (4).
-  inputs.push({ source: 'watchdog_fault' })
-  inputs.push({ source: 'watchdog_fault', faultType: 123 })
-  inputs.push({ source: 'watchdog_fault', faultType: null })
-  inputs.push({ source: 'watchdog_fault', faultType: 'segfault' })
+  // verify_check with malformed/missing checkResultId (3) — REQUIRED field
+  // malformed -> full unknown quadruple (Finding 1 fix: previously this
+  // source mapped unconditionally, ignoring checkResultId entirely).
+  full({ source: 'verify_check' })
+  full({ source: 'verify_check', checkResultId: 123 })
+  full({ source: 'verify_check', checkResultId: null })
 
-  // verify_idle_count with malformed/below-threshold idle_count (5).
-  inputs.push({ source: 'verify_idle_count' })
-  inputs.push({ source: 'verify_idle_count', idle_count: 'three' })
-  inputs.push({ source: 'verify_idle_count', idle_count: -1 })
-  inputs.push({ source: 'verify_idle_count', idle_count: Number.NaN })
-  inputs.push({ source: 'verify_idle_count', idle_count: null })
+  // test_run (2) — NO required discriminating field beyond `source` itself;
+  // always maps to its real class (row 2) regardless of malformed optional
+  // context fields.
+  real({ source: 'test_run' }, { failure_class: 'test_failure', severity: 'high', transience: 'transient', domain: 'agent' })
+  real({ source: 'test_run', task_id: 'not-a-number', agent: 42, summary: null },
+    { failure_class: 'test_failure', severity: 'high', transience: 'transient', domain: 'agent' })
 
-  // adversarial_finding with malformed/unrecognized category (4).
-  inputs.push({ source: 'adversarial_finding' })
-  inputs.push({ source: 'adversarial_finding', category: 123 })
-  inputs.push({ source: 'adversarial_finding', category: 'made_up_category' })
-  inputs.push({ source: 'adversarial_finding', category: null, severityHint: 999 })
+  // watchdog_fault with malformed/unrecognized faultType (4) -> full unknown
+  // quadruple (pre-existing, unchanged else-branch behavior — KEPT).
+  full({ source: 'watchdog_fault' })
+  full({ source: 'watchdog_fault', faultType: 123 })
+  full({ source: 'watchdog_fault', faultType: null })
+  full({ source: 'watchdog_fault', faultType: 'segfault' })
 
-  // manual with malformed fields — always unknown regardless of shape (3).
-  inputs.push({ source: 'manual' })
-  inputs.push({ source: 'manual', task_id: 'nope', agent: 42, summary: {} })
-  inputs.push({ source: 'manual', task_id: null, agent: null, summary: null })
+  // verify_idle_count with malformed/below-threshold idle_count (5) -> full
+  // unknown quadruple (pre-existing, unchanged else-branch behavior — KEPT).
+  full({ source: 'verify_idle_count' })
+  full({ source: 'verify_idle_count', idle_count: 'three' })
+  full({ source: 'verify_idle_count', idle_count: -1 })
+  full({ source: 'verify_idle_count', idle_count: Number.NaN })
+  full({ source: 'verify_idle_count', idle_count: null })
 
-  // Nested-object garbage with unrecognized sources (16).
-  for (let i = 0; i < 16; i++) {
-    inputs.push({
+  // watchdog_blocked with missing/wrong-type/unrecognized-string blocked_on
+  // (3) — REQUIRED field malformed -> full unknown quadruple (Finding 1
+  // fix). blocked_on: null is deliberately NOT included here — it is the
+  // explicit row-10 legacy value, not malformed (see ATM-006 row 10 /
+  // ATM-013 blockedCases, which cover it as a real-mapping case elsewhere).
+  full({ source: 'watchdog_blocked' })
+  full({ source: 'watchdog_blocked', blocked_on: 'bogus' })
+  full({ source: 'watchdog_blocked', blocked_on: 123 })
+
+  // watchdog_dead_session (2) — NO required discriminating field; always
+  // maps to its real class (row 11) regardless of malformed optional context
+  // fields.
+  real({ source: 'watchdog_dead_session' }, { failure_class: 'liveness_timeout', severity: 'critical', transience: 'permanent', domain: 'agent' })
+  real({ source: 'watchdog_dead_session', task_id: 'nope', agent: {}, summary: 42 },
+    { failure_class: 'liveness_timeout', severity: 'critical', transience: 'permanent', domain: 'agent' })
+
+  // escalation_bridge_all_paths_failed (2) — NO required discriminating
+  // field; always maps to its real class (row 12) regardless of malformed
+  // optional context fields.
+  real({ source: 'escalation_bridge_all_paths_failed' },
+    { failure_class: 'infrastructure_transient', severity: 'critical', transience: 'transient', domain: 'infrastructure' })
+  real({ source: 'escalation_bridge_all_paths_failed', agent: 42, summary: null, source_ref: {} },
+    { failure_class: 'infrastructure_transient', severity: 'critical', transience: 'transient', domain: 'infrastructure' })
+
+  // adversarial_finding with malformed/missing category OR severityHint (4)
+  // — BOTH are required strings -> full unknown quadruple (Finding 1 fix:
+  // previously a missing/wrong-type category still produced a partial
+  // hint-mapped-severity/permanent/system quad instead of the full
+  // fallback).
+  full({ source: 'adversarial_finding' })
+  full({ source: 'adversarial_finding', category: 123 })
+  full({ source: 'adversarial_finding', category: 'made_up_category' }) // severityHint missing
+  full({ source: 'adversarial_finding', category: null, severityHint: 999 })
+
+  // adversarial_finding with a valid-but-unrecognized STRING category (both
+  // required fields correctly typed) — row 15: unknown CLASS but NOT the
+  // full fallback quad (severity is hint-mapped, transience/domain are
+  // permanent/system, not medium/unknown/unknown).
+  real({ source: 'adversarial_finding', category: 'totally_unrecognized', severityHint: 'HIGH' },
+    { failure_class: 'unknown', severity: 'high', transience: 'permanent', domain: 'system' })
+
+  // manual with malformed fields — this IS the fallback rule itself, so
+  // always full unknown quadruple regardless of shape (3).
+  full({ source: 'manual' })
+  full({ source: 'manual', task_id: 'nope', agent: 42, summary: {} })
+  full({ source: 'manual', task_id: null, agent: null, summary: null })
+
+  // Nested-object garbage with unrecognized sources (3) -> full unknown
+  // quadruple.
+  for (let i = 0; i < 3; i++) {
+    full({
       source: `garbage_source_${i}`,
       nested: { a: { b: { c: [i, 'x', null, undefined] } } },
       task_id: i % 2 === 0 ? `id-${i}` : i,
@@ -623,40 +741,52 @@ function buildAtm009MalformedInputs(): unknown[] {
   }
 
   // Circular references (3): AS the signal itself, embedded as a
-  // `raw_signal`-named field, and nested one level deep.
+  // `raw_signal`-named field, and nested one level deep. All unrecognized
+  // sources -> full unknown quadruple.
   const circAsSignal: Record<string, unknown> = { source: 'circular_as_signal_source' }
   circAsSignal.self = circAsSignal
-  inputs.push(circAsSignal)
+  full(circAsSignal)
 
   const circViaField: Record<string, unknown> = { source: 'circular_via_field_source' }
   circViaField.raw_signal = circViaField
-  inputs.push(circViaField)
+  full(circViaField)
 
   const circNested: Record<string, unknown> = { source: 'manual' }
   circNested.nested = { parent: circNested }
-  inputs.push(circNested)
+  full(circNested)
 
-  return inputs
+  return cases
 }
 
-describe('ATM-009: never-throw fuzz — 50 malformed inputs incl. circular refs', () => {
-  test('ATM-009: exactly 50 malformed inputs are generated', () => {
-    expect(buildAtm009MalformedInputs().length).toBe(50)
+describe('ATM-009: never-throw fuzz — 50 cases (malformed-required-field + no-required-field sanity), incl. circular refs', () => {
+  test('ATM-009: exactly 50 cases are generated', () => {
+    expect(buildAtm009Cases().length).toBe(50)
   })
 
-  test('ATM-009: all 50 malformed inputs classify to a valid unknown-class FailureClassification with zero exceptions', () => {
-    const inputs = buildAtm009MalformedInputs()
+  test('ATM-009: all 50 cases classify to their exact expected quadruple (full unknown fallback for malformed-required-field inputs, real class for no-required-field sources) with zero exceptions', () => {
+    const cases = buildAtm009Cases()
     let thrown = 0
     const thrownDetails: string[] = []
-    const nonUnknown: { index: number; failure_class: string }[] = []
+    const mismatches: { index: number; expected: Atm009Quad; actual: Atm009Quad }[] = []
 
-    inputs.forEach((input, index) => {
+    cases.forEach(({ input, expected }, index) => {
       try {
         const result = classifyFailure(input as any)
         expect(typeof result).toBe('object')
         expect(result).not.toBeNull()
-        if (result.failure_class !== 'unknown') {
-          nonUnknown.push({ index, failure_class: result.failure_class })
+        const actual: Atm009Quad = {
+          failure_class: result.failure_class,
+          severity: result.severity,
+          transience: result.transience,
+          domain: result.domain,
+        }
+        if (
+          actual.failure_class !== expected.failure_class
+          || actual.severity !== expected.severity
+          || actual.transience !== expected.transience
+          || actual.domain !== expected.domain
+        ) {
+          mismatches.push({ index, expected, actual })
         }
       } catch (err) {
         thrown++
@@ -666,7 +796,7 @@ describe('ATM-009: never-throw fuzz — 50 malformed inputs incl. circular refs'
 
     expect(thrownDetails).toEqual([])
     expect(thrown).toBe(0)
-    expect(nonUnknown).toEqual([])
+    expect(mismatches).toEqual([])
   })
 })
 
@@ -930,6 +1060,66 @@ describe('ATM-022: append-only — no UPDATE/DELETE against failure_classificati
     expect(deleteRe.test(fcSource)).toBe(false)
     expect(updateRe.test(dbSource)).toBe(false)
     expect(deleteRe.test(dbSource)).toBe(false)
+  })
+
+  // Codex round-2 fold (Finding 4 / REQ-011): the scan above only covers
+  // verification/failure-classification.ts + db.ts. A mutation could just as
+  // easily be added to watchdog.ts, verify.ts, or any other P6-touched file
+  // and slip past that narrow scan. ATM-022's REQ-011 text requires scanning
+  // the entire changed diff / import graph — this test does that: it walks
+  // EVERY file in the P6 changed-file set (git diff --name-only vs the base
+  // commit), not just the two known-safe files.
+  test('ATM-022: neither UPDATE nor DELETE targeting failure_classifications appears anywhere in the full P6 changed-file set', () => {
+    const REPO = join(import.meta.dir, '..')
+    const BASE_COMMIT = '5014d7f'
+
+    let proc: ReturnType<typeof Bun.spawnSync>
+    try {
+      proc = Bun.spawnSync(['git', '-C', REPO, 'diff', '--name-only', BASE_COMMIT], { cwd: REPO })
+    } catch (err) {
+      throw new Error(`ATM-022: git is unavailable — cannot verify the full-diff append-only scan: ${err}`)
+    }
+    if (proc.exitCode !== 0) {
+      const stderr = proc.stderr?.toString() ?? '(no stderr)'
+      throw new Error(
+        `ATM-022: 'git diff --name-only ${BASE_COMMIT}' exited ${proc.exitCode} — cannot verify the full-diff ` +
+        `append-only scan. stderr: ${stderr}`,
+      )
+    }
+    const out = (proc.stdout ?? Buffer.alloc(0)).toString().trim()
+    const changedFiles = out.length === 0 ? [] : out.split('\n')
+
+    // Sanity precondition: the diff must be non-trivial, otherwise a git
+    // misconfig returning [] would make this test pass for the wrong reason.
+    expect(changedFiles.length).toBeGreaterThan(0)
+
+    const updateRe = /UPDATE\s+failure_classifications/i
+    const deleteRe = /DELETE\s+FROM\s+failure_classifications/i
+
+    const offenders: { file: string; line: number; text: string }[] = []
+    for (const relPath of changedFiles) {
+      let content: string
+      try {
+        content = readFileSync(join(REPO, relPath), 'utf8')
+      } catch {
+        continue // deleted / binary / unreadable file — filter to existing readable source files
+      }
+      const lines = content.split('\n')
+      lines.forEach((line, idx) => {
+        if (updateRe.test(line) || deleteRe.test(line)) {
+          offenders.push({ file: relPath, line: idx + 1, text: line.trim() })
+        }
+      })
+    }
+
+    if (offenders.length > 0) {
+      throw new Error(
+        `ATM-022 violation: found an UPDATE/DELETE statement targeting failure_classifications outside the ` +
+        `verification/failure-classification.ts + db.ts scan above:\n` +
+        offenders.map(o => `  ${o.file}:${o.line} — ${o.text}`).join('\n'),
+      )
+    }
+    expect(offenders).toEqual([])
   })
 })
 
@@ -1733,6 +1923,38 @@ describe('ATM-031: scope-bleed guardrail — diff vs base 5014d7f (REQ-019)', ()
       )
     }
     expect(findingsOrArtifactsHits).toEqual([])
+
+    // Codex round-2 fold (Finding 3 / REQ-019): the findings/artifacts scan
+    // above is necessary but not sufficient — a P6 db.ts diff could also
+    // bleed into the P4/P5 write-sequencing / memory-integrity surface
+    // (write_sequence, agent_messages, memories.write_seq, withMemoryWriteTxn,
+    // nextWriteSeq, sanitizeMemoryContent, source_type) without ever
+    // mentioning "findings" or "artifacts". Assert no added/removed db.ts
+    // line touches any of those protected P4/P5 symbols either.
+    const PROTECTED_DB_SYMBOL_PATTERNS: RegExp[] = [
+      /\bwrite_sequence\b/,
+      /\bagent_messages\b/,
+      /memories\.write_seq\b/,
+      /\bwrite_seq\b/,
+      /\bwithMemoryWriteTxn\b/,
+      /\bnextWriteSeq\b/,
+      /\bsanitizeMemoryContent\b/,
+      /\bsource_type\b/,
+    ]
+    const protectedSymbolHits = addedOrRemoved.filter(l =>
+      PROTECTED_DB_SYMBOL_PATTERNS.some(re => re.test(l)),
+    )
+    if (protectedSymbolHits.length > 0) {
+      throw new Error(
+        `ATM-031 violation: db.ts diff vs ${BASE_COMMIT} contains added/removed line(s) touching a protected ` +
+        `P4/P5 symbol (write_sequence / agent_messages / memories.write_seq / write_seq / withMemoryWriteTxn / ` +
+        `nextWriteSeq / sanitizeMemoryContent / source_type):\n` +
+        protectedSymbolHits.map(l => `  ${l}`).join('\n') +
+        `\nThe only db.ts additions in P6 should be the failure_classifications table + its indexes ` +
+        `(ATM-019) and the failure_classification_enabled flag seed (ATM-027).`,
+      )
+    }
+    expect(protectedSymbolHits).toEqual([])
 
     // Confirm the diff DOES contain the expected, in-scope addition (proves
     // this test is reading real diff content, not an empty/truncated one).
