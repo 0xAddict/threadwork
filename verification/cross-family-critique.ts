@@ -11,15 +11,30 @@
 // types, the closed 5-member CrossFamilyVerdict union (REQ-004), and the
 // pure, deterministic, table-driven evaluateCrossFamily() (REQ-005/REQ-006).
 //
-// Later stages add the P6 read-only adapter (EPIC-03), persistence
-// (EPIC-04), and the getCrossFamilyCritiques() P8 read contract (EPIC-05) —
-// none of that is implemented here. See specs/P7-spec.md.
+// STAGE 3 (this addition, below): EPIC-03 (Consume P6 Failure
+// Classifications, read-only) — isCrossFamilyReviewMandatory() (REQ-007),
+// getMandatoryCrossFamilyReviewClassifications() (REQ-008), and
+// annotateWithFailureClass() (REQ-009).
+//
+// Later stages add persistence (EPIC-04) and the getCrossFamilyCritiques()
+// P8 read contract (EPIC-05) — none of that is implemented here. See
+// specs/P7-spec.md.
 
 // decision.ts's CritiqueSeverity is imported as a TYPE ONLY (erased at
 // compile time — zero runtime dependency) — REQ-004(a): referenced here
 // exclusively as a typed INPUT FIELD on CrossFamilyCritique, never
 // redefined, aliased, or re-exported.
 import type { CritiqueSeverity } from '../decision'
+
+// EPIC-03 (Stage 3, this addition): READ-ONLY consumption of P6's
+// getFailureClassifications() accessor. `getFailureClassifications` is the
+// ONLY value symbol imported from failure-classification.ts (ATM-015
+// scope-guard) — FailureClass/FailureSeverity/PersistedFailureClassification
+// are imported as TYPES ONLY. Zero lines of failure-classification.ts are
+// edited by this module.
+import { getFailureClassifications } from './failure-classification'
+import type { FailureClass, FailureSeverity, PersistedFailureClassification } from './failure-classification'
+import type { Database } from 'bun:sqlite'
 
 // ---------------------------------------------------------------------------
 // ATM-001 / REQ-001 [P1] — Canonical versioned ModelFamily
@@ -327,4 +342,87 @@ export function evaluateCrossFamily(input: CrossFamilyCritique): CrossFamilyEval
     // propagating (REQ-006(a)).
     return _UNKNOWN_FALLBACK
   }
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 3 of build-p7/PLAN.md: EPIC-03 (Consume P6 Failure Classifications,
+// read-only) — REQ-007/REQ-008/REQ-009, ATM-011..ATM-015.
+//
+// A read-only adapter over P6's getFailureClassifications() that determines
+// which decisions carry a MANDATORY cross-family review obligation and
+// annotates a cross-family critique record with its linked failure_class.
+// Flag-gated by the CALLER (P7's own EPIC-04, later stage) — this EPIC does
+// no flag-checking of its own; it is a pure/best-effort read layered
+// directly over P6's stable read boundary.
+//
+// BUILD DEVIATION (OQ-2 ruling, PLAN §2/D1): the spec text cites
+// `getFailureClassifications(filter?)`, but P6 SHIPPED
+// `getFailureClassifications(db: Database, filter?)` with a `db` FIRST
+// parameter (verification/failure-classification.ts:588). This adapter
+// therefore also takes a `db: Database` handle and forwards it as the first
+// argument to getFailureClassifications() — the approved, non-scope-changing
+// adaptation to the as-shipped P6 signature.
+// ---------------------------------------------------------------------------
+
+/**
+ * ATM-011 / REQ-007 [P1] (M-007) — Pure predicate: does this P6 failure
+ * classification carry a MANDATORY cross-family review obligation?
+ *
+ * Returns `true` IFF `classification.failure_class ===
+ * 'correctness_adversarial_finding'` OR `classification.severity` is
+ * `'high'` or `'critical'` — `false` for every other case. NO I/O, NEVER
+ * throws for any well-formed PersistedFailureClassification input.
+ */
+export function isCrossFamilyReviewMandatory(classification: PersistedFailureClassification): boolean {
+  return (
+    classification.failure_class === 'correctness_adversarial_finding' ||
+    classification.severity === 'high' ||
+    classification.severity === 'critical'
+  )
+}
+
+/**
+ * ATM-012/ATM-013/ATM-015 / REQ-008 [P1] (M-008) — Read-only, error-swallowing
+ * adapter over P6's getFailureClassifications(). Calls
+ * `getFailureClassifications(db, filter)` EXCLUSIVELY (no other P6 symbol is
+ * imported or referenced — see the ATM-015 scope-guard test) and returns the
+ * subset of its result for which isCrossFamilyReviewMandatory() (REQ-007) is
+ * `true`, preserving the accessor's `id ASC` ordering.
+ *
+ * REQ-008(a): IF the underlying getFailureClassifications() call throws for
+ * ANY reason (e.g. P6's module or its failure_classifications table is
+ * unavailable at build time), THEN this function catches the error and
+ * returns an empty array — a best-effort, swallowed-error read, never a hard
+ * dependency of any caller.
+ *
+ * `db` is the shipped-P6 first positional parameter (see the BUILD DEVIATION
+ * note above) — a raw bun:sqlite Database handle, mirroring the same
+ * `db: Database` first-argument shape used by other P6 write/read functions
+ * in failure-classification.ts.
+ */
+export function getMandatoryCrossFamilyReviewClassifications(
+  db: Database,
+  filter?: { taskId?: number; agent?: string; since?: string },
+): PersistedFailureClassification[] {
+  try {
+    const classifications = getFailureClassifications(db, filter)
+    return classifications.filter(isCrossFamilyReviewMandatory)
+  } catch {
+    // REQ-008(a): swallow any error from the underlying P6 accessor and
+    // return an empty array — never propagate, never a hard dependency.
+    return []
+  }
+}
+
+/**
+ * ATM-014 / REQ-009 [P2] (M-009) — Links a cross-family critique record to
+ * its P6 linked_failure_class: returns the FIRST classification's
+ * `failure_class` value VERBATIM — including an unrecognized/forward-compat
+ * `failure_class` string per P6's own pass-through contract (P6 REQ-014) —
+ * NEVER coercing it to 'unknown' or dropping it. Returns `null` when the
+ * input array is empty.
+ */
+export function annotateWithFailureClass(classifications: PersistedFailureClassification[]): string | null {
+  if (classifications.length === 0) return null
+  return classifications[0]!.failure_class
 }

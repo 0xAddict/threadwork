@@ -11,9 +11,10 @@
 // it holds ONLY EPIC-01 tests. Do NOT add evaluateCrossFamily / P6 adapter /
 // persistence / getCrossFamilyCritiques tests here yet (later stages).
 
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, spyOn, afterEach } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import type { Database } from 'bun:sqlite'
 import taxonomySnapshot from './fixtures/cross-family-taxonomy-snapshot.v1.json'
 import {
   type ModelFamily,
@@ -27,8 +28,22 @@ import {
   type CrossFamilyVerdict,
   ALL_CROSS_FAMILY_VERDICTS,
   evaluateCrossFamily,
+  isCrossFamilyReviewMandatory,
+  getMandatoryCrossFamilyReviewClassifications,
+  annotateWithFailureClass,
 } from '../verification/cross-family-critique'
-import { ALL_FAILURE_CLASSES, ALL_FAILURE_SEVERITIES } from '../verification/failure-classification'
+import {
+  ALL_FAILURE_CLASSES,
+  ALL_FAILURE_SEVERITIES,
+  type PersistedFailureClassification,
+} from '../verification/failure-classification'
+// Namespace import used ONLY so ATM-013 can spyOn() the live ESM binding of
+// getFailureClassifications (the exact pattern proven in
+// tests/memory-ordering.test.ts's "namespace + spyOn" mechanism note) — the
+// module under test (cross-family-critique.ts) imports getFailureClassifications
+// by name, and Bun's spyOn on this namespace object patches that same live
+// binding, so the throw is observed through the real call site.
+import * as failureClassificationModule from '../verification/failure-classification'
 
 // ---------------------------------------------------------------------------
 // ATM-001 / REQ-001 [P1] — Canonical versioned ModelFamily
@@ -640,5 +655,196 @@ describe('ATM-010: never-throw fuzz guard — malformed/missing/unexpected-type 
     for (const input of malformedInputs) {
       expect(() => evaluateCrossFamily(input as unknown as CrossFamilyCritique)).not.toThrow()
     }
+  })
+})
+
+// ===========================================================================
+// STAGE 3 of build-p7/PLAN.md: EPIC-03 (Consume P6 Failure Classifications,
+// read-only) — ATM-011..ATM-015. Do NOT add EPIC-04+ tests here yet (later
+// stages). See tests/cross-family-critique-p6-integration.test.ts for
+// ATM-012's fixture-DB integration test.
+// ===========================================================================
+
+/** Builds a well-formed synthetic PersistedFailureClassification, override-able per test. */
+function makePersistedClassification(
+  overrides: Partial<PersistedFailureClassification> = {},
+): PersistedFailureClassification {
+  return {
+    id: 1,
+    taxonomy_version: 1,
+    failure_class: 'verification_failure',
+    severity: 'medium',
+    transience: 'transient',
+    domain: 'agent',
+    signal_source: 'verify_check',
+    source_ref: 'chk-1',
+    task_id: 1,
+    agent: 'boss',
+    summary: 'a synthetic classification',
+    raw_signal: { source: 'verify_check', checkResultId: 'chk-1' },
+    created_at: '2026-01-01 00:00:00',
+    ...overrides,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ATM-011 / REQ-007 [P1] — isCrossFamilyReviewMandatory()
+// ---------------------------------------------------------------------------
+describe('ATM-011: isCrossFamilyReviewMandatory() (REQ-007)', () => {
+  test("failure_class='correctness_adversarial_finding' -> true", () => {
+    const c = makePersistedClassification({ failure_class: 'correctness_adversarial_finding', severity: 'low' })
+    expect(isCrossFamilyReviewMandatory(c)).toBe(true)
+  })
+
+  test("severity='high' -> true", () => {
+    const c = makePersistedClassification({ failure_class: 'test_failure', severity: 'high' })
+    expect(isCrossFamilyReviewMandatory(c)).toBe(true)
+  })
+
+  test("severity='critical' -> true", () => {
+    const c = makePersistedClassification({ failure_class: 'test_failure', severity: 'critical' })
+    expect(isCrossFamilyReviewMandatory(c)).toBe(true)
+  })
+
+  test("severity='medium' + failure_class='verification_failure' -> false", () => {
+    const c = makePersistedClassification({ failure_class: 'verification_failure', severity: 'medium' })
+    expect(isCrossFamilyReviewMandatory(c)).toBe(false)
+  })
+
+  test("severity='low' (non-adversarial failure_class) -> false", () => {
+    const c = makePersistedClassification({ failure_class: 'blocked_dependency', severity: 'low' })
+    expect(isCrossFamilyReviewMandatory(c)).toBe(false)
+  })
+
+  test('never throws for a well-formed input', () => {
+    expect(() => isCrossFamilyReviewMandatory(makePersistedClassification())).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-013 / REQ-008(a) [P1] — Error-swallow fault injection
+// ---------------------------------------------------------------------------
+describe('ATM-013: getMandatoryCrossFamilyReviewClassifications() error-swallow (REQ-008(a))', () => {
+  let throwSpy: ReturnType<typeof spyOn> | undefined
+
+  afterEach(() => {
+    throwSpy?.mockRestore()
+    throwSpy = undefined
+  })
+
+  test('getFailureClassifications() throwing -> returns [], no exception propagates', () => {
+    throwSpy = spyOn(failureClassificationModule, 'getFailureClassifications').mockImplementation(() => {
+      throw new Error('simulated P6 read failure')
+    })
+
+    const fakeDb = {} as Database
+    let result: PersistedFailureClassification[] | undefined
+    expect(() => {
+      result = getMandatoryCrossFamilyReviewClassifications(fakeDb)
+    }).not.toThrow()
+    expect(result).toEqual([])
+    expect(throwSpy).toHaveBeenCalled()
+  })
+
+  test('getFailureClassifications() throwing (with a filter argument) -> still returns [], no exception propagates', () => {
+    throwSpy = spyOn(failureClassificationModule, 'getFailureClassifications').mockImplementation(() => {
+      throw new Error('simulated P6 read failure')
+    })
+
+    const fakeDb = {} as Database
+    const result = getMandatoryCrossFamilyReviewClassifications(fakeDb, { taskId: 42 })
+    expect(result).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-014 / REQ-009 [P2] — annotateWithFailureClass()
+// ---------------------------------------------------------------------------
+describe('ATM-014: annotateWithFailureClass() (REQ-009)', () => {
+  test('(a) 2-element input, first row failure_class=correctness_adversarial_finding -> returns that exact string', () => {
+    const classifications = [
+      makePersistedClassification({ id: 1, failure_class: 'correctness_adversarial_finding' }),
+      makePersistedClassification({ id: 2, failure_class: 'test_failure' }),
+    ]
+    expect(annotateWithFailureClass(classifications)).toBe('correctness_adversarial_finding')
+  })
+
+  test('(b) first row has an UNRECOGNIZED failure_class -> returns it UNCHANGED, not coerced to unknown', () => {
+    const classifications = [
+      makePersistedClassification({ id: 1, failure_class: 'future_class_v2' }),
+      makePersistedClassification({ id: 2, failure_class: 'test_failure' }),
+    ]
+    expect(annotateWithFailureClass(classifications)).toBe('future_class_v2')
+  })
+
+  test('(c) empty array input -> returns null', () => {
+    expect(annotateWithFailureClass([])).toBeNull()
+  })
+
+  test('never throws', () => {
+    expect(() => annotateWithFailureClass([])).not.toThrow()
+    expect(() => annotateWithFailureClass([makePersistedClassification()])).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-015 / REQ-008 [P1] — Scope-guard: EPIC-03 imports ONLY
+// getFailureClassifications (+ read types) from P6; zero lines of
+// failure-classification.ts are edited by P7.
+// ---------------------------------------------------------------------------
+describe('ATM-015: EPIC-03 scope-guard (source-grep based)', () => {
+  test('the ONLY value imported from ./failure-classification in cross-family-critique.ts is getFailureClassifications', () => {
+    // Matches every `import { ... } from './failure-classification'` (value
+    // import) statement and every `import type { ... } from
+    // './failure-classification'` (type-only import) statement separately,
+    // so a value import accidentally smuggling in a second symbol is caught.
+    const valueImportMatches = [
+      ...MODULE_SOURCE.matchAll(/^import\s*\{([^}]*)\}\s*from\s*'\.\/failure-classification'/gm),
+    ]
+    expect(valueImportMatches.length).toBe(1)
+    const importedValueNames = valueImportMatches[0]![1]!
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+    expect(importedValueNames).toEqual(['getFailureClassifications'])
+  })
+
+  test('the type-only import from ./failure-classification carries exactly FailureClass, FailureSeverity, PersistedFailureClassification', () => {
+    const typeImportMatches = [
+      ...MODULE_SOURCE.matchAll(/^import\s+type\s*\{([^}]*)\}\s*from\s*'\.\/failure-classification'/gm),
+    ]
+    expect(typeImportMatches.length).toBe(1)
+    const importedTypeNames = typeImportMatches[0]![1]!
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+      .sort()
+    expect(importedTypeNames).toEqual(['FailureClass', 'FailureSeverity', 'PersistedFailureClassification'].sort())
+  })
+
+  test('cross-family-critique.ts does NOT define or re-export classifyFailure or persistFailureClassification (P6 write-path symbols)', () => {
+    expect(MODULE_SOURCE).not.toMatch(/\bclassifyFailure\b/)
+    expect(MODULE_SOURCE).not.toMatch(/\bpersistFailureClassification\b/)
+  })
+
+  test('cross-family-critique.ts imports no other value symbol from failure-classification.ts beyond getFailureClassifications', () => {
+    // Every import line whose source is './failure-classification' must
+    // either be a `import type { ... }` line, or a bare `import {
+    // getFailureClassifications } from './failure-classification'` value
+    // line — nothing else.
+    const allImportLines = MODULE_SOURCE
+      .split('\n')
+      .filter((line) => line.includes("from './failure-classification'"))
+    expect(allImportLines.length).toBe(2)
+    const valueLines = allImportLines.filter((line) => !line.trim().startsWith('import type'))
+    expect(valueLines.length).toBe(1)
+    expect(valueLines[0]).toMatch(/^import\s*\{\s*getFailureClassifications\s*\}\s*from/)
+  })
+
+  test('failure-classification.ts itself has zero P7 touch: no CrossFamily* symbol appears in it (diff-scan proxy)', () => {
+    expect(FAILURE_CLASSIFICATION_SOURCE).not.toMatch(/CrossFamily/)
+    expect(FAILURE_CLASSIFICATION_SOURCE).not.toMatch(/isCrossFamilyReviewMandatory/)
+    expect(FAILURE_CLASSIFICATION_SOURCE).not.toMatch(/getMandatoryCrossFamilyReviewClassifications/)
+    expect(FAILURE_CLASSIFICATION_SOURCE).not.toMatch(/annotateWithFailureClass/)
   })
 })
