@@ -613,6 +613,12 @@ export class TaskDB {
     // (verification/failure-classification.ts) is not yet wired into any
     // production call site in this stage (adapter/live-wiring lands later).
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('failure_classification_enabled', 0)")
+    // P7 EPIC-04/EPIC-06 (REQ-016/ATM-025): durable cross-family critique
+    // persistence. DEFAULT OFF — persistCrossFamilyCritique()
+    // (verification/cross-family-critique.ts) is not yet wired into any
+    // production call site in this stage (server.ts wiring lands in a later
+    // stage).
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('cross_family_critique_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
@@ -1108,6 +1114,35 @@ export class TaskDB {
       CREATE INDEX IF NOT EXISTS idx_failure_classifications_task ON failure_classifications(task_id);
       CREATE INDEX IF NOT EXISTS idx_failure_classifications_class ON failure_classifications(failure_class);
       CREATE INDEX IF NOT EXISTS idx_failure_classifications_created ON failure_classifications(created_at);
+    `)
+
+    // P7 EPIC-04 (REQ-010/ATM-016): durable cross-family critique persistence.
+    // Mirrors the failure_classifications idiom above (CREATE TABLE IF NOT
+    // EXISTS + supporting indexes) — a NEW companion table layered over
+    // decision.ts's existing open/positions/critique state machine, editing
+    // zero lines of decisions/decision_positions/decision_critiques
+    // (db.ts:740-777). Written by persistCrossFamilyCritique() in
+    // verification/cross-family-critique.ts.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS cross_family_critiques (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        taxonomy_version INTEGER NOT NULL,
+        decision_id INTEGER NOT NULL REFERENCES decisions(id),
+        critique_id INTEGER REFERENCES decision_critiques(id),
+        position_id INTEGER REFERENCES decision_positions(id),
+        producer_agent TEXT NOT NULL,
+        producer_family TEXT NOT NULL,
+        critic_agent TEXT NOT NULL,
+        critic_family TEXT NOT NULL,
+        is_cross_family INTEGER NOT NULL,
+        verdict TEXT NOT NULL,
+        linked_failure_class TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_cross_family_critiques_decision ON cross_family_critiques(decision_id);
+      CREATE INDEX IF NOT EXISTS idx_cross_family_critiques_verdict ON cross_family_critiques(verdict);
+      CREATE INDEX IF NOT EXISTS idx_cross_family_critiques_created ON cross_family_critiques(created_at);
     `)
   }
 

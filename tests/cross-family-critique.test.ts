@@ -7,14 +7,23 @@
 // ATM-004 (unknown-fallback + never-throw fuzz guard), and ATM-005
 // (resolveAgentDefaultFamily() with the empty-default-registry contract).
 //
-// This file grows across later P7 build stages (EPIC-02..EPIC-07) — for now
-// it holds ONLY EPIC-01 tests. Do NOT add evaluateCrossFamily / P6 adapter /
-// persistence / getCrossFamilyCritiques tests here yet (later stages).
+// STAGE 4 (this addition, below): EPIC-04 persistence half — ATM-016
+// (cross_family_critiques table + indexes), ATM-017/ATM-018
+// (persistCrossFamilyCritique(), incl. the flag gate), ATM-019
+// (hasCrossFamilyCritique() / requiresCrossFamilyReview() read predicates),
+// and ATM-028 (audit atomicity, two-direction fault injection). The
+// critique_position wiring hook (REQ-013) is a LATER stage — not tested
+// here.
+//
+// This file grows across later P7 build stages (EPIC-05..EPIC-07) — do NOT
+// add getCrossFamilyCritiques()/critique_position-wiring tests here yet
+// (later stages).
 
-import { describe, test, expect, spyOn, afterEach } from 'bun:test'
-import { readFileSync } from 'node:fs'
+import { describe, test, expect, spyOn, afterEach, beforeEach } from 'bun:test'
+import { readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Database } from 'bun:sqlite'
+import { TaskDB } from '../db'
 import taxonomySnapshot from './fixtures/cross-family-taxonomy-snapshot.v1.json'
 import {
   type ModelFamily,
@@ -31,10 +40,16 @@ import {
   isCrossFamilyReviewMandatory,
   getMandatoryCrossFamilyReviewClassifications,
   annotateWithFailureClass,
+  type CrossFamilyCritiqueRecord,
+  persistCrossFamilyCritique,
+  hasCrossFamilyCritique,
+  requiresCrossFamilyReview,
 } from '../verification/cross-family-critique'
 import {
   ALL_FAILURE_CLASSES,
   ALL_FAILURE_SEVERITIES,
+  persistFailureClassification,
+  type FailureClassification,
   type PersistedFailureClassification,
 } from '../verification/failure-classification'
 // Namespace import used ONLY so ATM-013 can spyOn() the live ESM binding of
@@ -846,5 +861,553 @@ describe('ATM-015: EPIC-03 scope-guard (source-grep based)', () => {
     expect(FAILURE_CLASSIFICATION_SOURCE).not.toMatch(/isCrossFamilyReviewMandatory/)
     expect(FAILURE_CLASSIFICATION_SOURCE).not.toMatch(/getMandatoryCrossFamilyReviewClassifications/)
     expect(FAILURE_CLASSIFICATION_SOURCE).not.toMatch(/annotateWithFailureClass/)
+  })
+})
+
+// ===========================================================================
+// STAGE 4 of build-p7/PLAN.md: EPIC-04 (Critique State-Machine Integration,
+// persistence half) — ATM-016 (table+indexes), ATM-017/ATM-018
+// (persistCrossFamilyCritique(), incl. flag gate), ATM-019
+// (hasCrossFamilyCritique() / requiresCrossFamilyReview() read predicates),
+// and ATM-028 (audit atomicity, two-direction fault injection). The
+// critique_position wiring hook (REQ-013) is a LATER stage — not tested
+// here.
+// ===========================================================================
+
+/** Removes a sqlite db file plus its -shm/-wal sidecars, tolerating "doesn't exist". */
+function wipeDbFile(path: string): void {
+  for (const suffix of ['', '-shm', '-wal']) {
+    try { unlinkSync(path + suffix) } catch { /* doesn't exist yet */ }
+  }
+}
+
+/**
+ * Inserts a decisions row DIRECTLY (bypassing DecisionDB, which requires a
+ * MemoryDB collaborator this test file has no reason to construct) so the
+ * cross_family_critiques FK + task_id lookups this stage's persist/read
+ * functions depend on have something real to resolve against. Mirrors the
+ * house pattern (tests/cross-family-critique-p6-integration.test.ts inserts
+ * failure_classifications rows via P6's own persist function; here we insert
+ * the decisions row directly since DecisionDB isn't in scope for this stage).
+ */
+function insertDecision(db: Database, opts: { taskId?: number | null; openedBy?: string; title?: string } = {}): number {
+  const row = db
+    .prepare(`
+      INSERT INTO decisions (title, context, opened_by, task_id)
+      VALUES (?, ?, ?, ?)
+      RETURNING id
+    `)
+    .get(
+      opts.title ?? 'test decision',
+      null,
+      opts.openedBy ?? 'boss',
+      opts.taskId === undefined ? null : opts.taskId,
+    ) as { id: number }
+  return row.id
+}
+
+/** Builds a CrossFamilyCritiqueRecord literal with sane defaults, override-able per test. */
+function makeCrossFamilyCritiqueRecord(overrides: Partial<CrossFamilyCritiqueRecord> = {}): CrossFamilyCritiqueRecord {
+  return {
+    decision_id: 1,
+    critique_id: null,
+    position_id: null,
+    producer_agent: 'boss',
+    producer_family: 'openai',
+    critic_agent: 'steve',
+    critic_family: 'anthropic',
+    is_cross_family: true,
+    verdict: 'block',
+    linked_failure_class: null,
+    ...overrides,
+  }
+}
+
+/** Builds a FailureClassification literal with sane defaults. Mirrors
+ * tests/failure-classification.test.ts's own makeFailureClassification()
+ * helper — duplicated locally so this file has no test-time coupling to
+ * that file. */
+function makeFailureClassification(overrides: Partial<FailureClassification> = {}): FailureClassification {
+  return {
+    failure_class: 'verification_failure',
+    severity: 'medium',
+    transience: 'transient',
+    domain: 'agent',
+    taxonomy_version: 1,
+    signal_source: 'verify_check',
+    source_ref: 'chk-1',
+    task_id: null,
+    agent: 'boss',
+    summary: 'a test classification',
+    raw_signal: { source: 'verify_check', checkResultId: 'chk-1' },
+    ...overrides,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ATM-016 / REQ-010 [P1] — cross_family_critiques table + 3 indexes
+// ---------------------------------------------------------------------------
+describe('ATM-016: cross_family_critiques table + indexes (REQ-010)', () => {
+  const TEST_DB = '/tmp/p7-cfc-atm016.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-016: cross_family_critiques has exactly the documented columns', () => {
+    const columns = taskDb.run(db => db.prepare("PRAGMA table_info('cross_family_critiques')").all()) as { name: string }[]
+    const columnNames = columns.map(c => c.name).sort()
+    expect(columnNames).toEqual(
+      [
+        'id',
+        'taxonomy_version',
+        'decision_id',
+        'critique_id',
+        'position_id',
+        'producer_agent',
+        'producer_family',
+        'critic_agent',
+        'critic_family',
+        'is_cross_family',
+        'verdict',
+        'linked_failure_class',
+        'created_at',
+      ].sort()
+    )
+  })
+
+  test('ATM-016: 3 indexes exist covering decision_id, verdict, and created_at', () => {
+    const indexes = taskDb.run(db => db.prepare("PRAGMA index_list('cross_family_critiques')").all()) as { name: string }[]
+    expect(indexes.length).toBeGreaterThanOrEqual(3)
+
+    const coveredColumns = new Set<string>()
+    for (const idx of indexes) {
+      const infoRows = taskDb.run(db => db.prepare(`PRAGMA index_info('${idx.name}')`).all()) as { name: string }[]
+      for (const row of infoRows) coveredColumns.add(row.name)
+    }
+    expect(coveredColumns.has('decision_id')).toBe(true)
+    expect(coveredColumns.has('verdict')).toBe(true)
+    expect(coveredColumns.has('created_at')).toBe(true)
+  })
+
+  test('ATM-016: decisions/decision_positions/decision_critiques PRAGMA table_info are unchanged by this edit', () => {
+    const decisionsCols = (
+      taskDb.run(db => db.prepare("PRAGMA table_info('decisions')").all()) as { name: string }[]
+    ).map(c => c.name)
+    expect(decisionsCols).toEqual([
+      'id',
+      'title',
+      'context',
+      'opened_by',
+      'status',
+      'finalized_by',
+      'outcome',
+      'outcome_rationale',
+      'expires_at',
+      'memory_id',
+      'task_id',
+      'created_at',
+      'updated_at',
+      'finalized_at',
+    ])
+
+    const positionsCols = (
+      taskDb.run(db => db.prepare("PRAGMA table_info('decision_positions')").all()) as { name: string }[]
+    ).map(c => c.name)
+    expect(positionsCols).toEqual(['id', 'decision_id', 'agent', 'position', 'rationale', 'evidence', 'created_at'])
+
+    const critiquesCols = (
+      taskDb.run(db => db.prepare("PRAGMA table_info('decision_critiques')").all()) as { name: string }[]
+    ).map(c => c.name)
+    expect(critiquesCols).toEqual(['id', 'decision_id', 'position_id', 'agent', 'critique', 'severity', 'created_at'])
+  })
+
+  test('ATM-016: re-running migrate() (fresh TaskDB against the same file) is idempotent — no error, same schema', () => {
+    expect(() => new TaskDB(TEST_DB)).not.toThrow()
+    const columns = taskDb.run(db => db.prepare("PRAGMA table_info('cross_family_critiques')").all()) as { name: string }[]
+    expect(columns.length).toBe(13)
+  })
+
+  test('ATM-016 (flag-seed precondition): cross_family_critique_enabled defaults to 0 (OFF) on fresh migrate()', () => {
+    expect(taskDb.isFeatureEnabled('cross_family_critique_enabled')).toBe(false)
+    const row = taskDb.run(db => db.prepare(
+      "SELECT enabled FROM feature_flags WHERE flag_name = 'cross_family_critique_enabled'"
+    ).get()) as { enabled: number } | null
+    expect(row).not.toBeNull()
+    expect(row!.enabled).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-017 / REQ-011 [P1] — persistCrossFamilyCritique()
+// ---------------------------------------------------------------------------
+describe('ATM-017: persistCrossFamilyCritique() (REQ-011)', () => {
+  const TEST_DB = '/tmp/p7-cfc-atm017.db'
+  let taskDb: TaskDB
+  let decisionId: number
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    taskDb.setFeatureFlag('cross_family_critique_enabled', true)
+    decisionId = taskDb.run(db => insertDecision(db, { taskId: 501 }))
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-017: 3 sequential inserts (flag ON) -> 3 rows, strictly increasing ids, created_at populated, every field round-trips', () => {
+    const records: CrossFamilyCritiqueRecord[] = [
+      makeCrossFamilyCritiqueRecord({
+        decision_id: decisionId,
+        critique_id: 10,
+        producer_agent: 'a1',
+        producer_family: 'openai',
+        critic_agent: 'c1',
+        critic_family: 'anthropic',
+        is_cross_family: true,
+        verdict: 'block',
+        linked_failure_class: 'correctness_adversarial_finding',
+      }),
+      makeCrossFamilyCritiqueRecord({
+        decision_id: decisionId,
+        critique_id: 11,
+        position_id: 5,
+        producer_agent: 'a2',
+        producer_family: 'anthropic',
+        critic_agent: 'c2',
+        critic_family: 'anthropic',
+        is_cross_family: false,
+        verdict: 'insufficient_same_family',
+        linked_failure_class: null,
+      }),
+      makeCrossFamilyCritiqueRecord({
+        decision_id: decisionId,
+        critique_id: null,
+        producer_agent: 'a3',
+        producer_family: 'unknown',
+        critic_agent: 'c3',
+        critic_family: 'unknown',
+        is_cross_family: false,
+        verdict: 'unknown',
+        linked_failure_class: null,
+      }),
+    ]
+
+    const ids: number[] = []
+    for (const record of records) {
+      const id = taskDb.run(db => persistCrossFamilyCritique(db, record))
+      expect(id).not.toBeNull()
+      ids.push(id as number)
+    }
+
+    expect(ids[1]).toBeGreaterThan(ids[0]!)
+    expect(ids[2]).toBeGreaterThan(ids[1]!)
+
+    const rows = taskDb.run(db => db.prepare('SELECT * FROM cross_family_critiques ORDER BY id ASC').all()) as any[]
+    expect(rows.length).toBe(3)
+
+    rows.forEach((row, i) => {
+      const record = records[i]!
+      expect(row.id).toBe(ids[i])
+      expect(typeof row.created_at).toBe('string')
+      expect(row.created_at.length).toBeGreaterThan(0)
+      expect(row.taxonomy_version).toBe(CROSS_FAMILY_TAXONOMY_VERSION)
+      expect(row.decision_id).toBe(record.decision_id)
+      expect(row.critique_id).toBe(record.critique_id)
+      expect(row.position_id).toBe(record.position_id)
+      expect(row.producer_agent).toBe(record.producer_agent)
+      expect(row.producer_family).toBe(record.producer_family)
+      expect(row.critic_agent).toBe(record.critic_agent)
+      expect(row.critic_family).toBe(record.critic_family)
+      expect(row.is_cross_family).toBe(record.is_cross_family ? 1 : 0)
+      expect(row.verdict).toBe(record.verdict)
+      expect(row.linked_failure_class).toBe(record.linked_failure_class)
+    })
+  })
+
+  test('ATM-017: source-level — persistCrossFamilyCritique uses a LOCAL BEGIN IMMEDIATE, and the module imports no memory-ordering.ts symbol', () => {
+    const modulePath = join(import.meta.dir, '..', 'verification', 'cross-family-critique.ts')
+    const source = readFileSync(modulePath, 'utf8')
+
+    const marker = 'export function persistCrossFamilyCritique'
+    const start = source.indexOf(marker)
+    expect(start).toBeGreaterThanOrEqual(0)
+
+    const braceStart = source.indexOf('{', start)
+    expect(braceStart).toBeGreaterThan(start)
+
+    let depth = 0
+    let end = -1
+    for (let i = braceStart; i < source.length; i++) {
+      const ch = source[i]
+      if (ch === '{') depth++
+      else if (ch === '}') {
+        depth--
+        if (depth === 0) {
+          end = i
+          break
+        }
+      }
+    }
+    expect(end).toBeGreaterThan(braceStart)
+
+    const body = source.slice(braceStart, end + 1)
+    expect(body).toMatch(/BEGIN IMMEDIATE/)
+    expect(body).toMatch(/COMMIT/)
+    expect(body).toMatch(/ROLLBACK/)
+
+    expect(source).not.toMatch(/from\s+['"]\.{1,2}\/memory-ordering['"]/)
+    expect(source).not.toMatch(/\bwithMemoryWriteTxn\b/)
+    expect(source).not.toMatch(/\bnextWriteSeq\b/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-018 / REQ-011(a) [P1] — flag gate
+// ---------------------------------------------------------------------------
+describe('ATM-018: flag gate (REQ-011(a))', () => {
+  const TEST_DB = '/tmp/p7-cfc-atm018.db'
+  let taskDb: TaskDB
+  let decisionId: number
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    decisionId = taskDb.run(db => insertDecision(db, { taskId: 502 }))
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-018: flag OFF (default) -> persist returns null, row count stays 0, and no BEGIN IMMEDIATE transaction is ever prepared', () => {
+    expect(taskDb.isFeatureEnabled('cross_family_critique_enabled')).toBe(false)
+
+    let sawBeginImmediate = false
+    taskDb.run(db => {
+      const spy = spyOn(db, 'prepare')
+      const id = persistCrossFamilyCritique(db, makeCrossFamilyCritiqueRecord({ decision_id: decisionId }))
+      expect(id).toBeNull()
+      sawBeginImmediate = spy.mock.calls.some(call => typeof call[0] === 'string' && call[0].includes('BEGIN IMMEDIATE'))
+      spy.mockRestore()
+    })
+    expect(sawBeginImmediate).toBe(false)
+
+    const count = taskDb.run(db => (db.prepare('SELECT count(*) AS n FROM cross_family_critiques').get() as { n: number }).n)
+    expect(count).toBe(0)
+  })
+
+  test('ATM-018: flag ON -> row inserted, non-null numeric id returned', () => {
+    taskDb.setFeatureFlag('cross_family_critique_enabled', true)
+    const id = taskDb.run(db => persistCrossFamilyCritique(db, makeCrossFamilyCritiqueRecord({ decision_id: decisionId })))
+    expect(id).not.toBeNull()
+    expect(typeof id).toBe('number')
+
+    const count = taskDb.run(db => (db.prepare('SELECT count(*) AS n FROM cross_family_critiques').get() as { n: number }).n)
+    expect(count).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-019 / REQ-012 [P1] — hasCrossFamilyCritique() / requiresCrossFamilyReview()
+// ---------------------------------------------------------------------------
+describe('ATM-019: hasCrossFamilyCritique() / requiresCrossFamilyReview() read predicates (REQ-012)', () => {
+  const TEST_DB = '/tmp/p7-cfc-atm019.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    taskDb.setFeatureFlag('cross_family_critique_enabled', true)
+    taskDb.setFeatureFlag('failure_classification_enabled', true)
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('(a) [Codex #1] hasCrossFamilyCritique: 0 rows -> false; is_cross_family=0 row -> STILL false; is_cross_family=1 row -> true', () => {
+    const decisionId = taskDb.run(db => insertDecision(db, { taskId: 900 }))
+
+    expect(taskDb.run(db => hasCrossFamilyCritique(db, decisionId))).toBe(false)
+
+    taskDb.run(db =>
+      persistCrossFamilyCritique(
+        db,
+        makeCrossFamilyCritiqueRecord({
+          decision_id: decisionId,
+          is_cross_family: false,
+          verdict: 'insufficient_same_family',
+          producer_family: 'anthropic',
+          critic_family: 'anthropic',
+        }),
+      ),
+    )
+    expect(taskDb.run(db => hasCrossFamilyCritique(db, decisionId))).toBe(false)
+
+    taskDb.run(db =>
+      persistCrossFamilyCritique(
+        db,
+        makeCrossFamilyCritiqueRecord({
+          decision_id: decisionId,
+          is_cross_family: true,
+          verdict: 'block',
+          producer_family: 'openai',
+          critic_family: 'anthropic',
+        }),
+      ),
+    )
+    expect(taskDb.run(db => hasCrossFamilyCritique(db, decisionId))).toBe(true)
+  })
+
+  test('(b) [Codex #2] requiresCrossFamilyReview: mandatory classification + 0 qualifying rows -> true; after an is_cross_family=1 persist -> false', () => {
+    const TASK_ID = 901
+    const decisionId = taskDb.run(db => insertDecision(db, { taskId: TASK_ID }))
+
+    taskDb.run(db =>
+      persistFailureClassification(
+        db,
+        makeFailureClassification({ task_id: TASK_ID, failure_class: 'correctness_adversarial_finding', severity: 'high' }),
+      ),
+    )
+
+    expect(taskDb.run(db => requiresCrossFamilyReview(db, decisionId))).toBe(true)
+
+    taskDb.run(db =>
+      persistCrossFamilyCritique(
+        db,
+        makeCrossFamilyCritiqueRecord({
+          decision_id: decisionId,
+          is_cross_family: true,
+          verdict: 'block',
+          producer_family: 'openai',
+          critic_family: 'anthropic',
+        }),
+      ),
+    )
+
+    expect(taskDb.run(db => requiresCrossFamilyReview(db, decisionId))).toBe(false)
+  })
+
+  test('(b) requiresCrossFamilyReview: persisting an is_cross_family=0 row does NOT flip it to false (still true)', () => {
+    const TASK_ID = 902
+    const decisionId = taskDb.run(db => insertDecision(db, { taskId: TASK_ID }))
+
+    taskDb.run(db =>
+      persistFailureClassification(
+        db,
+        makeFailureClassification({ task_id: TASK_ID, failure_class: 'unknown', severity: 'critical' }),
+      ),
+    )
+
+    expect(taskDb.run(db => requiresCrossFamilyReview(db, decisionId))).toBe(true)
+
+    taskDb.run(db =>
+      persistCrossFamilyCritique(
+        db,
+        makeCrossFamilyCritiqueRecord({
+          decision_id: decisionId,
+          is_cross_family: false,
+          verdict: 'insufficient_same_family',
+          producer_family: 'anthropic',
+          critic_family: 'anthropic',
+        }),
+      ),
+    )
+
+    expect(taskDb.run(db => requiresCrossFamilyReview(db, decisionId))).toBe(true)
+  })
+
+  test('(c) requiresCrossFamilyReview: decision with task_id=null -> false, no throw', () => {
+    const decisionId = taskDb.run(db => insertDecision(db, { taskId: null }))
+    expect(() => taskDb.run(db => requiresCrossFamilyReview(db, decisionId))).not.toThrow()
+    expect(taskDb.run(db => requiresCrossFamilyReview(db, decisionId))).toBe(false)
+  })
+
+  test('(d) [Codex iter-2 LOW] non-existent decisionId -> both predicates false, no throw', () => {
+    const NON_EXISTENT_ID = 999999
+    expect(() => taskDb.run(db => hasCrossFamilyCritique(db, NON_EXISTENT_ID))).not.toThrow()
+    expect(taskDb.run(db => hasCrossFamilyCritique(db, NON_EXISTENT_ID))).toBe(false)
+    expect(() => taskDb.run(db => requiresCrossFamilyReview(db, NON_EXISTENT_ID))).not.toThrow()
+    expect(taskDb.run(db => requiresCrossFamilyReview(db, NON_EXISTENT_ID))).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-028 / REQ-019 [P2] — audit atomicity, two-direction fault injection
+// ---------------------------------------------------------------------------
+describe('ATM-028: audit atomicity, two-direction fault injection (REQ-019)', () => {
+  const TEST_DB = '/tmp/p7-cfc-atm028.db'
+  let taskDb: TaskDB
+  let decisionId: number
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    taskDb.setFeatureFlag('cross_family_critique_enabled', true)
+    decisionId = taskDb.run(db => insertDecision(db, { taskId: 950 }))
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('(a) happy path: persisting a record produces exactly ONE audit_log row action=cross_family_critique_recorded, detail contains decision_id/producer_family/critic_family/verdict', () => {
+    const record = makeCrossFamilyCritiqueRecord({
+      decision_id: decisionId,
+      producer_family: 'openai',
+      critic_family: 'anthropic',
+      verdict: 'block',
+      critic_agent: 'steve',
+    })
+    const id = taskDb.run(db => persistCrossFamilyCritique(db, record))
+    expect(id).not.toBeNull()
+
+    const auditRows = taskDb.run(db =>
+      db.prepare("SELECT * FROM audit_log WHERE action = 'cross_family_critique_recorded'").all(),
+    ) as any[]
+    expect(auditRows.length).toBe(1)
+    expect(auditRows[0].agent).toBe('steve')
+    expect(auditRows[0].task_id).toBe(950)
+
+    const detail = JSON.parse(auditRows[0].detail)
+    expect(detail.decision_id).toBe(decisionId)
+    expect(detail.producer_family).toBe('openai')
+    expect(detail.critic_family).toBe('anthropic')
+    expect(detail.verdict).toBe('block')
+  })
+
+  test('(b) fault-injection (audit direction): forcing the AUDIT insert to throw (audit_log renamed away) rolls back the cross_family_critiques row too — 0 rows, persist rethrows', () => {
+    taskDb.run(db => db.exec('ALTER TABLE audit_log RENAME TO audit_log_atm028_bak'))
+    try {
+      let threw = false
+      let thrownErr: unknown = null
+      try {
+        taskDb.run(db => persistCrossFamilyCritique(db, makeCrossFamilyCritiqueRecord({ decision_id: decisionId })))
+      } catch (err) {
+        threw = true
+        thrownErr = err
+      }
+      expect(threw).toBe(true)
+      expect(thrownErr).not.toBeNull()
+
+      const count = taskDb.run(db => (db.prepare('SELECT count(*) AS n FROM cross_family_critiques').get() as { n: number }).n)
+      expect(count).toBe(0)
+    } finally {
+      taskDb.run(db => db.exec('ALTER TABLE audit_log_atm028_bak RENAME TO audit_log'))
+    }
+  })
+
+  test('(b) fault-injection (cross_family_critiques direction): forcing the INSERT to throw (cross_family_critiques renamed away) leaves NO audit_log row with action=cross_family_critique_recorded', () => {
+    taskDb.run(db => db.exec('ALTER TABLE cross_family_critiques RENAME TO cross_family_critiques_atm028_bak'))
+    try {
+      let threw = false
+      try {
+        taskDb.run(db => persistCrossFamilyCritique(db, makeCrossFamilyCritiqueRecord({ decision_id: decisionId })))
+      } catch {
+        threw = true
+      }
+      expect(threw).toBe(true)
+    } finally {
+      taskDb.run(db => db.exec('ALTER TABLE cross_family_critiques_atm028_bak RENAME TO cross_family_critiques'))
+    }
+
+    const auditRows = taskDb.run(db =>
+      db.prepare("SELECT * FROM audit_log WHERE action = 'cross_family_critique_recorded'").all(),
+    ) as any[]
+    expect(auditRows.length).toBe(0)
   })
 })

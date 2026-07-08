@@ -11,14 +11,19 @@
 // types, the closed 5-member CrossFamilyVerdict union (REQ-004), and the
 // pure, deterministic, table-driven evaluateCrossFamily() (REQ-005/REQ-006).
 //
-// STAGE 3 (this addition, below): EPIC-03 (Consume P6 Failure
-// Classifications, read-only) — isCrossFamilyReviewMandatory() (REQ-007),
+// STAGE 3: EPIC-03 (Consume P6 Failure Classifications, read-only) —
+// isCrossFamilyReviewMandatory() (REQ-007),
 // getMandatoryCrossFamilyReviewClassifications() (REQ-008), and
 // annotateWithFailureClass() (REQ-009).
 //
-// Later stages add persistence (EPIC-04) and the getCrossFamilyCritiques()
-// P8 read contract (EPIC-05) — none of that is implemented here. See
-// specs/P7-spec.md.
+// STAGE 4 (this addition, below): EPIC-04 persistence half — the
+// cross_family_critiques companion table (db.ts), persistCrossFamilyCritique()
+// (REQ-011), and the read predicates hasCrossFamilyCritique() /
+// requiresCrossFamilyReview() (REQ-012). The critique_position wiring hook
+// (REQ-013) is a LATER stage — NOT implemented here.
+//
+// Later stages add the getCrossFamilyCritiques() P8 read contract (EPIC-05)
+// — not implemented here. See specs/P7-spec.md.
 
 // decision.ts's CritiqueSeverity is imported as a TYPE ONLY (erased at
 // compile time — zero runtime dependency) — REQ-004(a): referenced here
@@ -425,4 +430,200 @@ export function getMandatoryCrossFamilyReviewClassifications(
 export function annotateWithFailureClass(classifications: PersistedFailureClassification[]): string | null {
   if (classifications.length === 0) return null
   return classifications[0]!.failure_class
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 4 of build-p7/PLAN.md: EPIC-04 (Critique State-Machine Integration,
+// persistence half) — REQ-010/REQ-011/REQ-012/REQ-019, ATM-016/017/018/019/028.
+//
+// Additively extends decision.ts's open/positions/critique state machine
+// with family attribution and cross-family recording via a NEW companion
+// table (cross_family_critiques, migrate()'d in db.ts adjacent to the
+// failure_classifications block), a locally-atomic persist function, and
+// read-only predicates layered over the state machine + the EPIC-03 P6
+// adapter. Zero edits to decision.ts, zero P5 write-ordering-module coupling.
+//
+// The critique_position wiring hook (REQ-013/ATM-020/021) is Stage 6 —
+// NOT implemented here.
+// ---------------------------------------------------------------------------
+
+/**
+ * Input record to persistCrossFamilyCritique(). `producer_family`/
+ * `critic_family`/`verdict` are widened to `... | string` (mirroring
+ * PersistedFailureClassification's own forward-compat widening in
+ * failure-classification.ts) so a caller that already resolved a value via
+ * evaluateCrossFamily()/resolveModelFamily() (always a closed-union member)
+ * or a forward-compat/legacy value can be persisted without a redundant cast.
+ */
+export interface CrossFamilyCritiqueRecord {
+  decision_id: number
+  critique_id: number | null
+  position_id: number | null
+  producer_agent: string
+  producer_family: ModelFamily | string
+  critic_agent: string
+  critic_family: ModelFamily | string
+  is_cross_family: boolean
+  verdict: CrossFamilyVerdict | string
+  linked_failure_class: string | null
+}
+
+/**
+ * ATM-016/017/018 / REQ-010/REQ-011 [P1] (M-010/M-011) — Persists a
+ * CrossFamilyCritiqueRecord as a durable row in cross_family_critiques
+ * (migrate()'d in db.ts), plus a matching audit_log row (REQ-019) — both
+ * inside ONE LOCAL 'BEGIN IMMEDIATE' transaction, so a failure on either
+ * write rolls back both (ATM-028 two-direction fault injection). Gated on
+ * the cross_family_critique_enabled feature flag (REQ-011(a)/ATM-018): when
+ * the flag row is missing or `enabled` is not exactly 1, this returns null
+ * WITHOUT opening any transaction or inserting any row.
+ *
+ * Deliberately takes a raw `db: Database` handle (not a TaskDB) — mirrors
+ * P6's own analogous persist function in failure-classification.ts EXACTLY:
+ * the same flag-gate-before-any-transaction shape, and the same LOCAL
+ * 'BEGIN IMMEDIATE'/'COMMIT'/'ROLLBACK' pattern re-implemented INLINE here
+ * (the decision.ts:156-197/234-272 finalizeDecision()/expireDecision()
+ * pattern, applied a second time by a sibling module). This module imports
+ * NO symbol from P5's write-ordering module (its write-ordering-envelope
+ * helper or its sequence-minter): build-order independence from P5 is
+ * structural, not a runtime coincidence.
+ */
+export function persistCrossFamilyCritique(
+  db: Database,
+  record: CrossFamilyCritiqueRecord,
+): number | null {
+  // REQ-011(a)/ATM-018: flag gate, checked BEFORE any transaction is opened.
+  const flagRow = db
+    .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'cross_family_critique_enabled'")
+    .get() as { enabled: number } | null
+  if (!flagRow || flagRow.enabled !== 1) {
+    return null
+  }
+
+  db.prepare('BEGIN IMMEDIATE').run()
+  try {
+    const inserted = db
+      .prepare(`
+        INSERT INTO cross_family_critiques (
+          taxonomy_version, decision_id, critique_id, position_id,
+          producer_agent, producer_family, critic_agent, critic_family,
+          is_cross_family, verdict, linked_failure_class
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING id
+      `)
+      .get(
+        CROSS_FAMILY_TAXONOMY_VERSION,
+        record.decision_id,
+        record.critique_id,
+        record.position_id,
+        record.producer_agent,
+        record.producer_family,
+        record.critic_agent,
+        record.critic_family,
+        record.is_cross_family ? 1 : 0,
+        record.verdict,
+        record.linked_failure_class,
+      ) as { id: number }
+
+    // REQ-019/ATM-028: audit row, same local transaction, all-or-nothing with
+    // the insert above. task_id is resolved from the decision's OWN task_id
+    // (null when the decision has none, or — defensively — when it does not
+    // exist at all; decision_id is not FK-enforced at the SQLite level, see
+    // db.ts:1057-1059).
+    const decisionRow = db
+      .prepare('SELECT task_id FROM decisions WHERE id = ?')
+      .get(record.decision_id) as { task_id: number | null } | null
+    const taskId = decisionRow ? decisionRow.task_id : null
+
+    const detail = {
+      decision_id: record.decision_id,
+      producer_family: record.producer_family,
+      critic_family: record.critic_family,
+      verdict: record.verdict,
+    }
+
+    db.prepare(`
+      INSERT INTO audit_log (agent, action, detail, task_id)
+      VALUES (?, ?, ?, ?)
+    `).run(record.critic_agent, 'cross_family_critique_recorded', JSON.stringify(detail), taskId)
+
+    db.prepare('COMMIT').run()
+    return inserted.id
+  } catch (err) {
+    try { db.prepare('ROLLBACK').run() } catch {}
+    throw err
+  }
+}
+
+/**
+ * ATM-019(a) / REQ-012(a) [P1] (M-012, "Codex #1 — gate integrity") —
+ * READ-ONLY predicate: does this decision have >=1 recorded cross-family
+ * critique? Returns `true` IFF a cross_family_critiques row exists for
+ * `decisionId` WITH `is_cross_family = 1` — a same-family
+ * (`is_cross_family = 0`) or unknown-attribution row does NOT satisfy this,
+ * so recording a same-family/unknown critique can never spuriously clear a
+ * mandatory cross-family-review obligation (the anti-monoculture guarantee).
+ *
+ * REQ-012(d): if the decision does not exist, returns `false`. Never throws
+ * — mutates no table, and any unexpected error (e.g. a malformed decisionId)
+ * is swallowed to `false`.
+ *
+ * BUILD ADAPTATION D4 (boss-approved): the spec's prose cites reading the
+ * decision via decision.ts's getDecision(), but getDecision() is a
+ * DecisionDB CLASS METHOD requiring a TaskDB instance, not usable from a
+ * bare `db: Database` handle (this module's shape throughout, mirroring
+ * failure-classification.ts). This realizes the same READ via an equivalent
+ * read-only SELECT directly on the db handle — decision.ts itself is
+ * imported/edited nowhere in this module (zero lines touched).
+ */
+export function hasCrossFamilyCritique(db: Database, decisionId: number): boolean {
+  try {
+    const decisionRow = db.prepare('SELECT id FROM decisions WHERE id = ?').get(decisionId) as
+      | { id: number }
+      | null
+    if (!decisionRow) return false
+
+    const row = db
+      .prepare(
+        'SELECT 1 AS present FROM cross_family_critiques WHERE decision_id = ? AND is_cross_family = 1 LIMIT 1',
+      )
+      .get(decisionId) as { present: number } | null
+    return row !== null && row !== undefined
+  } catch {
+    return false
+  }
+}
+
+/**
+ * ATM-019(b)(c) / REQ-012(b)(c) [P1] (M-012, "Codex #2 — task linkage") —
+ * READ-ONLY predicate: does this decision carry an outstanding MANDATORY
+ * cross-family review obligation? Resolves the decision's OWN `task_id` via
+ * the same read-only SELECT as hasCrossFamilyCritique() (BUILD ADAPTATION
+ * D4, see above) and calls getMandatoryCrossFamilyReviewClassifications()
+ * (REQ-008) keyed on that task_id.
+ *
+ * Returns `true` IFF the decision has a NON-NULL linked `task_id` with >=1
+ * mandatory-review classification (REQ-007) AND hasCrossFamilyCritique()
+ * (REQ-012(a)) is `false` for that decision. Persisting an `is_cross_family
+ * = 1` row flips this to `false`; persisting an `is_cross_family = 0` row
+ * does NOT (still `true`, per the anti-monoculture guarantee above).
+ *
+ * REQ-012(c): a `task_id` of `null` -> `false`, never throws. REQ-012(d): a
+ * non-existent decision -> `false`, never throws.
+ */
+export function requiresCrossFamilyReview(db: Database, decisionId: number): boolean {
+  try {
+    const decisionRow = db
+      .prepare('SELECT id, task_id FROM decisions WHERE id = ?')
+      .get(decisionId) as { id: number; task_id: number | null } | null
+    if (!decisionRow) return false
+    if (decisionRow.task_id === null || decisionRow.task_id === undefined) return false
+
+    const mandatory = getMandatoryCrossFamilyReviewClassifications(db, { taskId: decisionRow.task_id })
+    if (mandatory.length === 0) return false
+
+    return hasCrossFamilyCritique(db, decisionId) === false
+  } catch {
+    return false
+  }
 }
