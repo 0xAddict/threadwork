@@ -22,8 +22,15 @@
 // requiresCrossFamilyReview() (REQ-012). The critique_position wiring hook
 // (REQ-013) is a LATER stage — NOT implemented here.
 //
-// Later stages add the getCrossFamilyCritiques() P8 read contract (EPIC-05)
-// — not implemented here. See specs/P7-spec.md.
+// STAGE 5 (this addition, below): EPIC-05 (P8 Consumption Contract,
+// read-only) — the PersistedCrossFamilyCritique type + the stable
+// getCrossFamilyCritiques() read accessor (REQ-014), and its forward-compat
+// pass-through guarantee (REQ-015). This is the single, stable read
+// boundary P8 (ternary rewards) builds on top of. This module computes NO
+// reward (ATM-023 scope-guard).
+//
+// Later stages (EPIC-06/EPIC-07) add the feature-flag seed + the
+// critique_position wiring hook — not implemented here. See specs/P7-spec.md.
 
 // decision.ts's CritiqueSeverity is imported as a TYPE ONLY (erased at
 // compile time — zero runtime dependency) — REQ-004(a): referenced here
@@ -626,4 +633,120 @@ export function requiresCrossFamilyReview(db: Database, decisionId: number): boo
   } catch {
     return false
   }
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 5 of build-p7/PLAN.md: EPIC-05 (P8 Consumption Contract, read-only)
+// — REQ-014/REQ-015, ATM-022/023/024.
+//
+// The single, stable, READ-ONLY boundary P8 (ternary rewards) builds on top
+// of. Mirrors verification/failure-classification.ts's
+// getFailureClassifications() (~line 588) EXACTLY: a dynamic WHERE-clause
+// builder, `SELECT * ... ORDER BY id ASC`, a row-map, and forward-compat
+// pass-through. Defines the accessor and its return SHAPE only — computes NO
+// reward, and exposes no write path beyond EPIC-04's
+// persistCrossFamilyCritique().
+// ---------------------------------------------------------------------------
+
+/**
+ * A durable cross_family_critiques row, as read back by
+ * getCrossFamilyCritiques() — the STABLE contract boundary P8 shall consume
+ * (REQ-014). Widens `producer_family`/`critic_family`/`verdict` from their
+ * closed ModelFamily/CrossFamilyVerdict unions to `... | string` (mirroring
+ * PersistedFailureClassification's own forward-compat widening in
+ * failure-classification.ts) so a row written by a future taxonomy version —
+ * carrying a family/verdict value this build doesn't recognize — still
+ * deserializes without loss (REQ-015 / ATM-024). `id` and `created_at` are
+ * part of the stable contract; `is_cross_family` is surfaced as a real
+ * boolean (the underlying column is INTEGER 1/0).
+ */
+export type PersistedCrossFamilyCritique = {
+  id: number
+  decision_id: number
+  critique_id: number | null
+  position_id: number | null
+  producer_agent: string
+  producer_family: ModelFamily | string
+  critic_agent: string
+  critic_family: ModelFamily | string
+  is_cross_family: boolean
+  verdict: CrossFamilyVerdict | string
+  linked_failure_class: string | null
+  taxonomy_version: number
+  created_at: string
+}
+
+/**
+ * ATM-022/ATM-024 / REQ-014/REQ-015 [P1/P2] (M-014/M-015) — Reads durable
+ * cross_family_critiques rows back out, in ascending `id` order, optionally
+ * narrowed by `decisionId` / `verdict` / `producerFamily` / `criticFamily` /
+ * a `created_at` floor (`since`, inclusive). READ-ONLY (SELECT only — never
+ * INSERT/UPDATE/DELETE) and performs no scoring, aggregation, or reward
+ * computation of its own (ATM-023): it is a pass-through accessor over what
+ * persistCrossFamilyCritique() already wrote.
+ *
+ * `verdict` / `producer_family` / `critic_family` / `taxonomy_version` are
+ * copied through AS-IS, with no validation or coercion — REQ-015: IF a row's
+ * `verdict`/`producer_family`/`critic_family` is an unrecognized value OR its
+ * `taxonomy_version` is NEWER than this module's own
+ * CROSS_FAMILY_TAXONOMY_VERSION, THEN that row is still returned UNCHANGED
+ * (never thrown, never dropped, never coerced) — mirroring P6
+ * getFailureClassifications()'s own forward-compatibility pass-through.
+ */
+export function getCrossFamilyCritiques(
+  db: Database,
+  filter?: {
+    decisionId?: number
+    verdict?: CrossFamilyVerdict
+    producerFamily?: ModelFamily
+    criticFamily?: ModelFamily
+    since?: string
+  },
+): PersistedCrossFamilyCritique[] {
+  const clauses: string[] = []
+  const params: (string | number)[] = []
+
+  if (filter?.decisionId !== undefined) {
+    clauses.push('decision_id = ?')
+    params.push(filter.decisionId)
+  }
+  if (filter?.verdict !== undefined) {
+    clauses.push('verdict = ?')
+    params.push(filter.verdict)
+  }
+  if (filter?.producerFamily !== undefined) {
+    clauses.push('producer_family = ?')
+    params.push(filter.producerFamily)
+  }
+  if (filter?.criticFamily !== undefined) {
+    clauses.push('critic_family = ?')
+    params.push(filter.criticFamily)
+  }
+  if (filter?.since !== undefined) {
+    clauses.push('created_at >= ?')
+    params.push(filter.since)
+  }
+
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : ''
+  const rows = db
+    .prepare(`SELECT * FROM cross_family_critiques ${where} ORDER BY id ASC`)
+    .all(...params) as any[]
+
+  return rows.map(
+    (row): PersistedCrossFamilyCritique => ({
+      id: row.id,
+      decision_id: row.decision_id,
+      critique_id: row.critique_id,
+      position_id: row.position_id,
+      producer_agent: row.producer_agent,
+      producer_family: row.producer_family,
+      critic_agent: row.critic_agent,
+      critic_family: row.critic_family,
+      is_cross_family: row.is_cross_family === 1,
+      verdict: row.verdict,
+      linked_failure_class: row.linked_failure_class,
+      taxonomy_version: row.taxonomy_version,
+      created_at: row.created_at,
+    }),
+  )
 }

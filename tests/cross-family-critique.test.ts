@@ -15,9 +15,16 @@
 // critique_position wiring hook (REQ-013) is a LATER stage — not tested
 // here.
 //
-// This file grows across later P7 build stages (EPIC-05..EPIC-07) — do NOT
-// add getCrossFamilyCritiques()/critique_position-wiring tests here yet
-// (later stages).
+// STAGE 5 (this addition, below): EPIC-05 (P8 Consumption Contract,
+// read-only) — ATM-022 (getCrossFamilyCritiques() filters + ordering +
+// shape, seeded via persistCrossFamilyCritique()), ATM-023 (scope-guard:
+// no reward-shaped code in the module), and ATM-024 (forward-compat
+// pass-through for a row with an unrecognized verdict/family + a newer
+// taxonomy_version). The critique_position wiring hook (REQ-013) remains a
+// LATER stage — not tested here.
+//
+// This file grows across later P7 build stages (EPIC-06..EPIC-07) — do NOT
+// add critique_position-wiring tests here yet (later stages).
 
 import { describe, test, expect, spyOn, afterEach, beforeEach } from 'bun:test'
 import { readFileSync, unlinkSync } from 'node:fs'
@@ -44,6 +51,8 @@ import {
   persistCrossFamilyCritique,
   hasCrossFamilyCritique,
   requiresCrossFamilyReview,
+  type PersistedCrossFamilyCritique,
+  getCrossFamilyCritiques,
 } from '../verification/cross-family-critique'
 import {
   ALL_FAILURE_CLASSES,
@@ -1409,5 +1418,388 @@ describe('ATM-028: audit atomicity, two-direction fault injection (REQ-019)', ()
       db.prepare("SELECT * FROM audit_log WHERE action = 'cross_family_critique_recorded'").all(),
     ) as any[]
     expect(auditRows.length).toBe(0)
+  })
+})
+
+// ===========================================================================
+// STAGE 5 of build-p7/PLAN.md: EPIC-05 (P8 Consumption Contract, read-only)
+// — ATM-022 (getCrossFamilyCritiques() filters/ordering/shape), ATM-023
+// (scope-guard: no reward-shaped code in the module), and ATM-024
+// (forward-compat pass-through: unrecognized verdict/family + newer
+// taxonomy_version). The critique_position wiring hook (REQ-013) remains a
+// LATER stage — not tested here.
+// ===========================================================================
+
+/**
+ * Inserts a cross_family_critiques row DIRECTLY (bypassing
+ * persistCrossFamilyCritique() / the feature flag), so ATM-024's
+ * forward-compat proof can write arbitrary/unrecognized verdict, family, and
+ * taxonomy_version values that the closed evaluateCrossFamily() output would
+ * never itself produce. Mirrors tests/failure-classification.test.ts's own
+ * insertClassificationRow() direct-insert helper (ATM-026 there).
+ */
+function insertCrossFamilyCritiqueRowDirect(
+  db: Database,
+  opts: {
+    decisionId: number
+    verdict: string
+    taxonomyVersion: number
+    producerFamily: string
+    criticFamily: string
+    critiqueId?: number | null
+    positionId?: number | null
+    producerAgent?: string
+    criticAgent?: string
+    isCrossFamily?: boolean
+    linkedFailureClass?: string | null
+  },
+): number {
+  const row = db
+    .prepare(`
+      INSERT INTO cross_family_critiques (
+        taxonomy_version, decision_id, critique_id, position_id,
+        producer_agent, producer_family, critic_agent, critic_family,
+        is_cross_family, verdict, linked_failure_class
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING id
+    `)
+    .get(
+      opts.taxonomyVersion,
+      opts.decisionId,
+      opts.critiqueId ?? null,
+      opts.positionId ?? null,
+      opts.producerAgent ?? 'p-forward-compat',
+      opts.producerFamily,
+      opts.criticAgent ?? 'c-forward-compat',
+      opts.criticFamily,
+      opts.isCrossFamily === false ? 0 : 1,
+      opts.verdict,
+      opts.linkedFailureClass ?? null,
+    ) as { id: number }
+  return row.id
+}
+
+/**
+ * Seeds exactly 5 cross_family_critiques rows via the REAL
+ * persistCrossFamilyCritique() API (flag ON) — across 2 decisions, 3
+ * verdicts, and 2 (producer_family, critic_family) pairs, per ATM-022's
+ * verifier text:
+ *   R1: decisionAId  verdict=block    (openai  -> anthropic)
+ *   R2: decisionAId  verdict=dissent  (google  -> meta)
+ *   R3: decisionBId  verdict=concur   (openai  -> anthropic)
+ *   R4: decisionBId  verdict=block    (google  -> meta)
+ *   R5: decisionAId  verdict=concur   (openai  -> anthropic)
+ * Inserted in id order R1..R5 (ascending id === insertion order). Once
+ * persisted, each row's `created_at` is force-set to a distinct, caller
+ * -controlled value via a direct UPDATE (bypassing the column's 1-second
+ * DEFAULT datetime('now') resolution) so the `since` filter sub-test is
+ * deterministic — mirrors the direct-created_at pattern proven in
+ * tests/failure-classification.test.ts's own seedFiveRows()/since test,
+ * while still exercising the real persist path for the insert itself.
+ */
+function seedFiveCrossFamilyCritiques(
+  db: Database,
+  decisionAId: number,
+  decisionBId: number,
+): Record<'R1' | 'R2' | 'R3' | 'R4' | 'R5', number> {
+  const R1 = persistCrossFamilyCritique(
+    db,
+    makeCrossFamilyCritiqueRecord({
+      decision_id: decisionAId,
+      critique_id: 201,
+      producer_agent: 'p1',
+      producer_family: 'openai',
+      critic_agent: 'c1',
+      critic_family: 'anthropic',
+      is_cross_family: true,
+      verdict: 'block',
+      linked_failure_class: null,
+    }),
+  ) as number
+  const R2 = persistCrossFamilyCritique(
+    db,
+    makeCrossFamilyCritiqueRecord({
+      decision_id: decisionAId,
+      critique_id: 202,
+      producer_agent: 'p2',
+      producer_family: 'google',
+      critic_agent: 'c2',
+      critic_family: 'meta',
+      is_cross_family: true,
+      verdict: 'dissent',
+      linked_failure_class: null,
+    }),
+  ) as number
+  const R3 = persistCrossFamilyCritique(
+    db,
+    makeCrossFamilyCritiqueRecord({
+      decision_id: decisionBId,
+      critique_id: 203,
+      producer_agent: 'p3',
+      producer_family: 'openai',
+      critic_agent: 'c3',
+      critic_family: 'anthropic',
+      is_cross_family: true,
+      verdict: 'concur',
+      linked_failure_class: null,
+    }),
+  ) as number
+  const R4 = persistCrossFamilyCritique(
+    db,
+    makeCrossFamilyCritiqueRecord({
+      decision_id: decisionBId,
+      critique_id: 204,
+      producer_agent: 'p4',
+      producer_family: 'google',
+      critic_agent: 'c4',
+      critic_family: 'meta',
+      is_cross_family: true,
+      verdict: 'block',
+      linked_failure_class: null,
+    }),
+  ) as number
+  const R5 = persistCrossFamilyCritique(
+    db,
+    makeCrossFamilyCritiqueRecord({
+      decision_id: decisionAId,
+      critique_id: 205,
+      producer_agent: 'p5',
+      producer_family: 'openai',
+      critic_agent: 'c5',
+      critic_family: 'anthropic',
+      is_cross_family: true,
+      verdict: 'concur',
+      linked_failure_class: null,
+    }),
+  ) as number
+
+  const ids = { R1, R2, R3, R4, R5 } as const
+  const stamps: Record<keyof typeof ids, string> = {
+    R1: '2026-01-01 00:00:00',
+    R2: '2026-01-02 00:00:00',
+    R3: '2026-01-03 00:00:00',
+    R4: '2026-01-04 00:00:00',
+    R5: '2026-01-05 00:00:00',
+  }
+  for (const key of Object.keys(ids) as (keyof typeof ids)[]) {
+    db.prepare('UPDATE cross_family_critiques SET created_at = ? WHERE id = ?').run(stamps[key], ids[key])
+  }
+  return ids
+}
+
+// ---------------------------------------------------------------------------
+// ATM-022 / REQ-014 [P1] — getCrossFamilyCritiques() filters/ordering/shape
+// ---------------------------------------------------------------------------
+describe('ATM-022: getCrossFamilyCritiques() — filters, ordering, shape (REQ-014)', () => {
+  const TEST_DB = '/tmp/p7-cfc-atm022.db'
+  let taskDb: TaskDB
+  let decisionAId: number
+  let decisionBId: number
+  let ids: Record<'R1' | 'R2' | 'R3' | 'R4' | 'R5', number>
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    taskDb.setFeatureFlag('cross_family_critique_enabled', true)
+    decisionAId = taskDb.run(db => insertDecision(db, { taskId: 601 }))
+    decisionBId = taskDb.run(db => insertDecision(db, { taskId: 602 }))
+    ids = taskDb.run(db => seedFiveCrossFamilyCritiques(db, decisionAId, decisionBId))
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-022: no-filter call returns all 5 rows in ascending id order with the full PersistedCrossFamilyCritique shape', () => {
+    const results = taskDb.run(db => getCrossFamilyCritiques(db))
+    expect(results.length).toBe(5)
+    expect(results.map(r => r.id)).toEqual([ids.R1, ids.R2, ids.R3, ids.R4, ids.R5])
+
+    for (const r of results) {
+      expect(typeof r.id).toBe('number')
+      expect(typeof r.decision_id).toBe('number')
+      expect(typeof r.producer_agent).toBe('string')
+      expect(typeof r.producer_family).toBe('string')
+      expect(typeof r.critic_agent).toBe('string')
+      expect(typeof r.critic_family).toBe('string')
+      expect(typeof r.is_cross_family).toBe('boolean')
+      expect(typeof r.verdict).toBe('string')
+      expect(typeof r.taxonomy_version).toBe('number')
+      expect(typeof r.created_at).toBe('string')
+      expect(r.created_at.length).toBeGreaterThan(0)
+    }
+
+    const first = results[0]!
+    expect(first.id).toBe(ids.R1)
+    expect(first.decision_id).toBe(decisionAId)
+    expect(first.critique_id).toBe(201)
+    expect(first.producer_family).toBe('openai')
+    expect(first.critic_family).toBe('anthropic')
+    expect(first.is_cross_family).toBe(true)
+    expect(first.verdict).toBe('block')
+    expect(first.taxonomy_version).toBe(CROSS_FAMILY_TAXONOMY_VERSION)
+  })
+
+  test('ATM-022: filter by decisionId returns exactly the matching subset in ascending id order', () => {
+    const resultsA = taskDb.run(db => getCrossFamilyCritiques(db, { decisionId: decisionAId }))
+    expect(resultsA.map(r => r.id)).toEqual([ids.R1, ids.R2, ids.R5])
+    for (const r of resultsA) expect(r.decision_id).toBe(decisionAId)
+
+    const resultsB = taskDb.run(db => getCrossFamilyCritiques(db, { decisionId: decisionBId }))
+    expect(resultsB.map(r => r.id)).toEqual([ids.R3, ids.R4])
+    for (const r of resultsB) expect(r.decision_id).toBe(decisionBId)
+  })
+
+  test('ATM-022: filter by verdict returns exactly the matching subset in ascending id order', () => {
+    const blockResults = taskDb.run(db => getCrossFamilyCritiques(db, { verdict: 'block' }))
+    expect(blockResults.map(r => r.id)).toEqual([ids.R1, ids.R4])
+    for (const r of blockResults) expect(r.verdict).toBe('block')
+
+    const concurResults = taskDb.run(db => getCrossFamilyCritiques(db, { verdict: 'concur' }))
+    expect(concurResults.map(r => r.id)).toEqual([ids.R3, ids.R5])
+
+    const dissentResults = taskDb.run(db => getCrossFamilyCritiques(db, { verdict: 'dissent' }))
+    expect(dissentResults.map(r => r.id)).toEqual([ids.R2])
+  })
+
+  test('ATM-022: filter by producerFamily returns exactly the matching subset in ascending id order', () => {
+    const openaiResults = taskDb.run(db => getCrossFamilyCritiques(db, { producerFamily: 'openai' }))
+    expect(openaiResults.map(r => r.id)).toEqual([ids.R1, ids.R3, ids.R5])
+    for (const r of openaiResults) expect(r.producer_family).toBe('openai')
+
+    const googleResults = taskDb.run(db => getCrossFamilyCritiques(db, { producerFamily: 'google' }))
+    expect(googleResults.map(r => r.id)).toEqual([ids.R2, ids.R4])
+  })
+
+  test('ATM-022: filter by criticFamily returns exactly the matching subset in ascending id order', () => {
+    const anthropicResults = taskDb.run(db => getCrossFamilyCritiques(db, { criticFamily: 'anthropic' }))
+    expect(anthropicResults.map(r => r.id)).toEqual([ids.R1, ids.R3, ids.R5])
+    for (const r of anthropicResults) expect(r.critic_family).toBe('anthropic')
+
+    const metaResults = taskDb.run(db => getCrossFamilyCritiques(db, { criticFamily: 'meta' }))
+    expect(metaResults.map(r => r.id)).toEqual([ids.R2, ids.R4])
+  })
+
+  test('ATM-022: filter by since (inclusive) returns exactly the matching subset in ascending id order', () => {
+    const results = taskDb.run(db => getCrossFamilyCritiques(db, { since: '2026-01-03 00:00:00' }))
+    expect(results.map(r => r.id)).toEqual([ids.R3, ids.R4, ids.R5])
+    for (const r of results) expect(r.created_at >= '2026-01-03 00:00:00').toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-023 / REQ-014 [P1] — scope-guard: no reward computation
+// ---------------------------------------------------------------------------
+describe('ATM-023: scope-guard — no reward computation in cross-family-critique.ts (REQ-014)', () => {
+  test('ATM-023: no reward-shaped identifier bound to a -1/0/1 literal; every "reward" mention is comment-only prose (never a code identifier), and none sits near a return -1/0/1 statement', () => {
+    // (a) No `reward...` identifier assigned/typed to a bare -1/0/1 literal
+    // anywhere in the module (a reward-computation return/assignment shape).
+    expect(MODULE_SOURCE).not.toMatch(/reward[A-Za-z0-9_]*\s*[=:]\s*-?[01]\b/i)
+
+    // (b) Every textual "reward" mention in the module lives inside a
+    // comment line (`//...` or a `/** ... */` block-comment line — this
+    // module's own doc comments legitimately document the "computes NO
+    // reward" scope guard per REQ-014), NEVER as part of a real code
+    // identifier/expression. And (c) no `return -1|0|1` statement appears in
+    // the textual vicinity of any such mention (a reward value returned
+    // under a differently-named local/param would still show up near the
+    // comment describing it).
+    const lines = MODULE_SOURCE.split('\n')
+    const rewardRe = /reward/i
+    let rewardMentionCount = 0
+    lines.forEach((line, i) => {
+      if (!rewardRe.test(line)) return
+      rewardMentionCount++
+      const trimmed = line.trim()
+      const isCommentLine = trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/**')
+      expect(isCommentLine).toBe(true)
+
+      const windowLines = lines.slice(Math.max(0, i - 3), Math.min(lines.length, i + 4)).join('\n')
+      expect(windowLines).not.toMatch(/\breturn\s+-?[01]\b/)
+    })
+    // Non-vacuous "bite" proof: this module DOES document the reward
+    // scope-guard in its own comments, so the scan above is exercised for
+    // real (not vacuously true over zero matches).
+    expect(rewardMentionCount).toBeGreaterThan(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-024 / REQ-015 [P2] — forward-compat read pass-through
+// ---------------------------------------------------------------------------
+describe('ATM-024: forward-compat read pass-through — unknown verdict/family + newer taxonomy_version (REQ-015)', () => {
+  const TEST_DB = '/tmp/p7-cfc-atm024.db'
+  let taskDb: TaskDB
+  let decisionId: number
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    decisionId = taskDb.run(db => insertDecision(db, { taskId: 701 }))
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-024: a row with an unrecognized verdict and taxonomy_version=999 is returned unchanged, no throw', () => {
+    const id = taskDb.run(db =>
+      insertCrossFamilyCritiqueRowDirect(db, {
+        decisionId,
+        verdict: 'future_verdict_v2',
+        taxonomyVersion: 999,
+        producerFamily: 'openai',
+        criticFamily: 'anthropic',
+      }),
+    )
+
+    let results: PersistedCrossFamilyCritique[] = []
+    expect(() => {
+      results = taskDb.run(db => getCrossFamilyCritiques(db, { decisionId }))
+    }).not.toThrow()
+
+    expect(results.length).toBe(1)
+    const row = results[0]!
+    expect(row.id).toBe(id)
+    expect(row.verdict).toBe('future_verdict_v2')
+    expect(row.taxonomy_version).toBe(999)
+    expect(row.producer_family).toBe('openai')
+    expect(row.critic_family).toBe('anthropic')
+  })
+
+  test('ATM-024: unknown producer_family/critic_family strings pass through unchanged, no throw', () => {
+    const id = taskDb.run(db =>
+      insertCrossFamilyCritiqueRowDirect(db, {
+        decisionId,
+        verdict: 'block',
+        taxonomyVersion: CROSS_FAMILY_TAXONOMY_VERSION,
+        producerFamily: 'future_family_v2',
+        criticFamily: 'another_future_family_v3',
+      }),
+    )
+
+    let results: PersistedCrossFamilyCritique[] = []
+    expect(() => {
+      results = taskDb.run(db => getCrossFamilyCritiques(db, { decisionId }))
+    }).not.toThrow()
+
+    expect(results.length).toBe(1)
+    const row = results[0]!
+    expect(row.id).toBe(id)
+    expect(row.producer_family).toBe('future_family_v2')
+    expect(row.critic_family).toBe('another_future_family_v3')
+    expect(row.verdict).toBe('block')
+  })
+
+  test('ATM-024: no-filter call also returns the forward-compat row unchanged (accessor-wide guarantee, not filter-specific)', () => {
+    const id = taskDb.run(db =>
+      insertCrossFamilyCritiqueRowDirect(db, {
+        decisionId,
+        verdict: 'future_verdict_v2',
+        taxonomyVersion: 999,
+        producerFamily: 'future_family_v2',
+        criticFamily: 'future_family_v3',
+      }),
+    )
+
+    const results = taskDb.run(db => getCrossFamilyCritiques(db))
+    expect(results.length).toBe(1)
+    expect(results[0]!.id).toBe(id)
+    expect(results[0]!.verdict).toBe('future_verdict_v2')
+    expect(results[0]!.taxonomy_version).toBe(999)
   })
 })
