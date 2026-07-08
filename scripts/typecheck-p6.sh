@@ -101,6 +101,36 @@ else
     WATCHDOG_ADDITIVE_FAIL=1
   fi
 fi
+# Codex round-4 fold (Finding 4 / P3): the additive-only + count==8 +
+# zero-non-baseline checks are, on their own, still "suppression-swappable" —
+# an ADDITIVE `// @ts-ignore` / `// @ts-expect-error` / `// @ts-nocheck` line
+# could SUPPRESS a pristine baseline error while a new same-signature error is
+# added elsewhere, and the count would stay at exactly 8 (a suppressed error
+# emits zero tsc output, so hiding one baseline error while introducing one
+# new same-signature error nets to the same $EXPECT_BASELINE count and 0
+# non-baseline — invisible to those checks alone). Scanning the ADDED lines
+# of the watchdog.ts diff vs $BASELINE_COMMIT for any of the three
+# suppression directives closes this: no pristine baseline error can be
+# hidden behind an additive suppression comment.
+echo "[typecheck-p6] watchdog.ts suppression-swap guard (Codex round-4 Finding 4 / P3): no new ts-suppression directive vs $BASELINE_COMMIT"
+WATCHDOG_SUPPRESSION_FAIL=0
+if ! WATCHDOG_DIFF_RAW="$(git -C "$REPO_DIR" diff "$BASELINE_COMMIT" -- watchdog.ts 2>/dev/null)"; then
+  # Mirrors the additive-diff check's WARN-without-hard-fail convention above.
+  echo "[typecheck-p6] WARN: git unavailable — cannot verify watchdog.ts adds no ts-suppression directive vs $BASELINE_COMMIT; NOT counted as a pass." >&2
+else
+  WATCHDOG_ADDED_LINES="$(printf '%s\n' "$WATCHDOG_DIFF_RAW" | grep '^+' | grep -v '^+++' || true)"
+  SUPPRESSION_HITS="$(printf '%s\n' "$WATCHDOG_ADDED_LINES" | grep -E '@ts-ignore|@ts-expect-error|@ts-nocheck' || true)"
+  if [ -n "$SUPPRESSION_HITS" ]; then
+    echo "[typecheck-p6] FAIL: watchdog.ts diff vs $BASELINE_COMMIT adds a TypeScript suppression directive — this could" >&2
+    echo "[typecheck-p6]   hide a NEW error under the pinned baseline signature while the count stays at $EXPECT_BASELINE," >&2
+    echo "[typecheck-p6]   silently swapping a pristine baseline error for a suppressed one (Codex round-4 Finding 4 / P3)." >&2
+    printf '%s\n' "$SUPPRESSION_HITS" >&2
+    WATCHDOG_SUPPRESSION_FAIL=1
+  else
+    echo "[typecheck-p6] OK — no added ts-suppression directive found in watchdog.ts diff vs $BASELINE_COMMIT"
+  fi
+fi
+
 # Regex matching ONLY the pre-existing watchdog baseline signature (any line/col).
 BASELINE_RE="^watchdog\.ts\([0-9]+,[0-9]+\): error TS2345: Argument of type 'string \| null' is not assignable to parameter of type 'string'\.\$"
 
@@ -118,6 +148,9 @@ echo "[typecheck-p6] total error-lines=$TOTAL_ERR  allowed-baseline=$BASELINE_ER
 
 FAIL=0
 if [ "$WATCHDOG_ADDITIVE_FAIL" -ne 0 ]; then
+  FAIL=1
+fi
+if [ "$WATCHDOG_SUPPRESSION_FAIL" -ne 0 ]; then
   FAIL=1
 fi
 if [ "$BASELINE_ERR" -ne "$EXPECT_BASELINE" ]; then

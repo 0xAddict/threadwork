@@ -194,6 +194,63 @@ function importsEscalationBridgeModule(content: string): boolean {
   return IMPORT_PATTERNS.some(re => re.test(content))
 }
 
+// ---------------------------------------------------------------------------
+// Codex round-4 fold (Finding 1 / P1): a bare TEXTUAL mention of
+// `onFailureClassified` — inside a `//` line comment, a `/* ... */` block
+// comment, or a string literal (e.g. `// TODO: onFailureClassified` with no
+// real callback, or the word embedded in an unrelated string) previously
+// counted as "wired" by both the construction-site `anyWired` check and the
+// import-keyed `content.includes('onFailureClassified')` check below — a
+// silent, undetected drop at runtime (`opts.onFailureClassified` stays
+// `undefined`). The fix has two parts:
+//   (a) STRIP comments and string-literal bodies from the text BEFORE
+//       scanning for wiring, so neither can produce a false "wired" result.
+//   (b) Detect wiring as an actual OBJECT KEY — `onFailureClassified`
+//       followed by optional whitespace then `:` — not any textual
+//       occurrence. (This repo's real wiring sites always use the
+//       `onFailureClassified: <expr>` key/value form — see
+//       src/escalation-bridge/index.ts and
+//       tests/failure-classification-escalation-integration.test.ts — never
+//       ES2015 shorthand `{ onFailureClassified }`, so anchoring on `:` does
+//       not false-negative against any real site in this codebase.)
+// ---------------------------------------------------------------------------
+
+// A single combined alternation regex — rather than three sequential
+// `.replace()` passes for block comments, then line comments, then strings —
+// is required for correctness: sequential passes would mis-strip a `//` that
+// appears INSIDE a string literal (e.g. `"http://example.com"`) as if it
+// started a line comment, corrupting the string and everything after it on
+// that line. A single regex lets whichever alternative's opening token
+// (`/*`, `//`, a quote char) appears EARLIEST at each scan position win,
+// which is the correct precedence — a string's opening quote is consumed as
+// a string in its entirety (including any `//` inside it) before the scanner
+// ever considers a comment starting mid-string.
+const STRIP_COMMENTS_AND_STRINGS_RE = /\/\*[\s\S]*?\*\/|\/\/[^\n]*|`(?:\\.|[^`\\])*`|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g
+
+/**
+ * Removes line comments (`// ...` to end of line), block comments
+ * (`/* ... *​/`, non-greedy, spans newlines), and the BODIES of
+ * single/double/backtick-quoted string literals (replaced with an empty
+ * literal of the same quote type, so surrounding token structure is
+ * preserved) from `text`. A lightweight, non-tokenizing strip — adequate for
+ * this repo's real, non-adversarial source (same tradeoff already accepted
+ * by `findEscalationBridgeConstructions`'s non-string-aware paren balancing
+ * above).
+ */
+function stripCommentsAndStrings(text: string): string {
+  return text.replace(STRIP_COMMENTS_AND_STRINGS_RE, (match) => {
+    if (match.startsWith('/*') || match.startsWith('//')) return ''
+    const quote = match[0]!
+    return quote + quote // collapse to an empty same-quote literal, dropping the body
+  })
+}
+
+// A REAL wiring reference is an object-KEY occurrence — `onFailureClassified`
+// immediately followed by optional whitespace then `:` — never a bare
+// textual mention. Word-boundary-anchored on the left so it cannot match as
+// a substring of some other identifier.
+const ONFAILURECLASSIFIED_KEY_RE = /\bonFailureClassified\s*:/
+
 describe('ATM-032 / REQ-020: EscalationBridge onFailureClassified wiring guardrail', () => {
   const allFiles = walkAllFiles(REPO)
 
@@ -227,7 +284,7 @@ describe('ATM-032 / REQ-020: EscalationBridge onFailureClassified wiring guardra
       enumeratedSites.push(relPath)
 
       const isAllowlisted = ESC_BRIDGE_CLASSIFY_EXCLUSIONS.includes(relPath)
-      const anyWired = constructions.some(argsText => /onFailureClassified/.test(argsText))
+      const anyWired = constructions.some(argsText => ONFAILURECLASSIFIED_KEY_RE.test(stripCommentsAndStrings(argsText)))
 
       if (!anyWired && !isAllowlisted) {
         offenders.push({ file: relPath, argsPreview: constructions[0]!.slice(0, 200) })
@@ -292,7 +349,7 @@ describe('ATM-032 / REQ-020: EscalationBridge onFailureClassified wiring guardra
       importerSites.push(relPath)
 
       const isAllowlisted = ESC_BRIDGE_CLASSIFY_EXCLUSIONS.includes(relPath)
-      const wiresCallback = content.includes('onFailureClassified')
+      const wiresCallback = ONFAILURECLASSIFIED_KEY_RE.test(stripCommentsAndStrings(content))
 
       if (!wiresCallback && !isAllowlisted) {
         offenders.push({
@@ -349,7 +406,7 @@ describe('ATM-032 / REQ-020: EscalationBridge onFailureClassified wiring guardra
 
       const relPath = relative(REPO, file)
       const isAllowlisted = ESC_BRIDGE_CLASSIFY_EXCLUSIONS.includes(relPath)
-      const wiresCallback = content.includes('onFailureClassified')
+      const wiresCallback = ONFAILURECLASSIFIED_KEY_RE.test(stripCommentsAndStrings(content))
 
       if (!wiresCallback && !isAllowlisted) {
         offenders.push(relPath)
@@ -388,6 +445,32 @@ describe('ATM-032 / REQ-020: EscalationBridge onFailureClassified wiring guardra
     //    `{` directly after `export`, so none of the patterns below match it.
     const DEFINING_MODULE = 'src/escalation-bridge/index.ts'
 
+    // Codex round-4 fold (Finding 2 / P1): the identifier-keyed patterns
+    // below all require the literal text "EscalationBridge" to appear on the
+    // offending line. That misses a TRANSITIVE re-export via a wildcard —
+    // `export * from './escalation-bridge'` — because that line only
+    // contains the lowercase, hyphenated MODULE PATH, never the capitalized
+    // class identifier. A consumer can then obtain the class via a
+    // namespace import of the re-exporting module and a MEMBER-ACCESS alias
+    // (`const Bridge = leaked.EscalationBridge`), which the identifier-keyed
+    // patterns also miss (they match assignment-of-the-BARE-identifier —
+    // `= EscalationBridge` — not property access — `= leaked.EscalationBridge`).
+    // The two new patterns below close this structurally:
+    //   (a) forbid re-exporting the escalation-bridge MODULE at all (keyed on
+    //       the module PATH substring, not the class identifier) — this kills
+    //       the transitive-re-export enabler outright: no module can
+    //       re-export the class (wildcard OR named) for a consumer to later
+    //       alias.
+    //   (b) forbid a member-access alias of the class off ANY namespace
+    //       object (`= X.EscalationBridge`).
+    // A genuinely dynamic/computed/multi-hop-reflective construction (e.g. a
+    // path built at runtime from string concatenation, or aliasing through
+    // more than one additional re-export hop) remains an EXOTIC residual
+    // explicitly covered by REQ-020's KO-6 + the OQ-4 flag-ON-only runtime
+    // constructor guard (the spec-sanctioned belt-and-suspenders in
+    // src/escalation-bridge/index.ts's own console.warn) — this static guard
+    // closes the realistic + one-hop-re-export surface; the runtime guard
+    // backstops the rest.
     const reExportPatterns = [
       // export { EscalationBridge } from '...'  /  export { EscalationBridge as X } from '...'
       /export\s*\{[^}]*\bEscalationBridge\b[^}]*\}\s*from/,
@@ -404,6 +487,24 @@ describe('ATM-032 / REQ-020: EscalationBridge onFailureClassified wiring guardra
       /(^|[^.\w])(const|let|var)\s+\w+\s*=\s*EscalationBridge\b/,
       // export default EscalationBridge
       /export\s+default\s+EscalationBridge\b/,
+      // Codex round-4 (Finding 2a): export * from '<...escalation-bridge...>'
+      // — wildcard re-export of the whole module, keyed on the module PATH
+      // substring (not the class identifier, which never appears on this
+      // line).
+      /export\s*\*\s*from\s*['"][^'"]*escalation-bridge[^'"]*['"]/,
+      // Codex round-4 (Finding 2a): export { ... } from '<...escalation-bridge...>'
+      // — ANY named re-export FROM the module, keyed on the module PATH
+      // substring rather than requiring "EscalationBridge" literally inside
+      // the braces (closes e.g. `export { default as Foo } from
+      // './escalation-bridge'`, which the identifier-keyed pattern above
+      // would miss).
+      /export\s*\{[^}]*\}\s*from\s*['"][^'"]*escalation-bridge[^'"]*['"]/,
+      // Codex round-4 (Finding 2b): const/let/var X = Y.EscalationBridge
+      // — member-access alias off a namespace/object reference (e.g.
+      // `const Bridge = leaked.EscalationBridge`), distinct from the
+      // bare-identifier alias pattern above (`= EscalationBridge` has no
+      // `.` before it; this one requires exactly one).
+      /=\s*\w+\.EscalationBridge\b/,
     ]
 
     const offenders: Array<{ file: string; line: number; text: string }> = []
@@ -417,7 +518,12 @@ describe('ATM-032 / REQ-020: EscalationBridge onFailureClassified wiring guardra
       } catch {
         continue
       }
-      if (!content.includes('EscalationBridge')) continue
+      // Codex round-4 fold (Finding 2): scan any file mentioning EITHER the
+      // class identifier OR the module's lowercase path substring — a
+      // wildcard re-export line (`export * from './escalation-bridge'`)
+      // contains only the latter, so gating on the identifier alone (the
+      // pre-round-4 behavior) silently skipped such files entirely.
+      if (!content.includes('EscalationBridge') && !content.includes('escalation-bridge')) continue
 
       const lines = content.split('\n')
       for (let i = 0; i < lines.length; i++) {

@@ -1192,6 +1192,133 @@ describe('ATM-022: append-only — no UPDATE/DELETE against failure_classificati
     }
     expect(offenders).toEqual([])
   })
+
+  // Codex round-4 fold (Finding 3 / P2): the two scans above only cover
+  // UPDATE and DELETE. "Append-only" also excludes other destructive-rewrite
+  // verbs that would just as thoroughly violate REQ-011: DROP TABLE
+  // (destroys the table), TRUNCATE [TABLE] (wipes all rows), ALTER TABLE
+  // (schema-level mutation), INSERT OR REPLACE INTO (a REPLACE is a
+  // destructive UPSERT — it can silently overwrite/rewrite an existing row
+  // by rowid/unique-constraint conflict, exactly the kind of in-place
+  // mutation append-only is meant to forbid), and REPLACE INTO (SQLite
+  // shorthand for the same INSERT OR REPLACE semantics). This test reuses
+  // the same full-diff, whitespace-normalized, optional-schema-qualifier
+  // scan shape as the round-3 test above (same changedFiles set, same
+  // normalization) and adds five patterns for those verbs.
+  //
+  // NOTE ON THIS COMMENT BLOCK'S OWN WORDING: deliberately avoided writing
+  // any of the five verb phrases immediately adjacent to the literal table
+  // name (with nothing but whitespace between them) anywhere above — doing
+  // so would make this very file, once normalized, match its own patterns
+  // below (the sibling round-3 comment above the round-3 test dodges the
+  // identical self-match risk by referencing the verbs via their REGEX
+  // SOURCE, e.g. "UPDATE\s+failure_classifications", where the backslash
+  // right after the verb is not whitespace; this comment block instead just
+  // never states verb-and-table-name contiguously in prose).
+  //
+  // Codex round-4 fold — DESTRUCTIVE_VERB_EXCLUSIONS: exactly one legitimate,
+  // pre-existing, non-P6-round-4 exception exists in the full changed-file
+  // set today: tests/failure-classification-watchdog-integration.test.ts's
+  // brokenPersistenceDb() helper intentionally issues a DROP TABLE against
+  // failure_classifications, but ONLY on a throwaway, isolated
+  // /tmp/p6-watchdog-atm015-*.db test fixture (never the production DB), to
+  // force persistFailureClassification() to throw at every one of its 5
+  // watchdog.ts call sites — proving ATM-015(c)'s fault-injection guarantee
+  // (pre-existing mutations complete identically, no throw escapes REQ-011
+  // governs PRODUCTION persistence code paths; a test fixture deliberately
+  // corrupting its own disposable throwaway database to test error handling
+  // is not a production append-only violation. This mirrors the
+  // ESC_BRIDGE_CLASSIFY_EXCLUSIONS allowlist pattern in
+  // tests/guardrails/escalation-bridge-onfailureclassified-wired.test.ts: a
+  // named, justified, narrowly-scoped exception rather than a blanket
+  // tests/-directory skip (which would silently lose coverage for any
+  // FUTURE accidental destructive statement added to some other test file).
+  //
+  // Computed/concatenated table names (e.g. `'failure_' + 'classifications'`
+  // or a template-literal-built identifier) are an EXOTIC residual — a
+  // dynamically-assembled table name is out of static-regex reach by
+  // construction. This guard covers literal SQL forms (matching the same
+  // documented tradeoff as the round-3 multi-line/schema-qualified scan
+  // above); a computed name is intentionally not attempted here.
+  const DESTRUCTIVE_VERB_EXCLUSIONS = ['tests/failure-classification-watchdog-integration.test.ts']
+
+  // A second, narrower legitimate exception exists WITHIN this very file:
+  // the pre-existing (round-2 fold) ATM-030(b)/(c) fault-injection tests
+  // below use `ALTER TABLE failure_classifications RENAME TO
+  // failure_classifications_atm030_bak` — inside a try/finally that always
+  // renames it straight back — to make ONE persistFailureClassification()
+  // call throw, proving the audit+classification write is atomic in both
+  // directions. A RENAME is reversible and touches zero row data (unlike
+  // DROP/TRUNCATE/column-altering ALTER forms); it is a well-established,
+  // already-reviewed test technique, not a production destructive-rewrite.
+  // Rather than a file-level exclusion (which would blind this file's OWN
+  // self-scan to a genuinely new destructive statement added here later),
+  // the ALTER TABLE pattern below is narrowed with a negative lookahead so
+  // it does not match the RENAME TO idiom specifically, while still
+  // catching any other ALTER TABLE form (ADD/DROP/MODIFY COLUMN, etc.).
+
+  test('ATM-022 (Codex round-4 Finding 3): DROP TABLE / TRUNCATE / ALTER TABLE / INSERT-OR-REPLACE / REPLACE-INTO against failure_classifications are also caught', () => {
+    const REPO = join(import.meta.dir, '..')
+    const BASE_COMMIT = '5014d7f'
+
+    let proc: ReturnType<typeof Bun.spawnSync>
+    try {
+      proc = Bun.spawnSync(['git', '-C', REPO, 'diff', '--name-only', BASE_COMMIT], { cwd: REPO })
+    } catch (err) {
+      throw new Error(`ATM-022: git is unavailable — cannot verify the destructive-verb append-only scan: ${err}`)
+    }
+    if (proc.exitCode !== 0) {
+      const stderr = proc.stderr?.toString() ?? '(no stderr)'
+      throw new Error(
+        `ATM-022: 'git diff --name-only ${BASE_COMMIT}' exited ${proc.exitCode} — cannot verify the destructive-verb ` +
+        `append-only scan. stderr: ${stderr}`,
+      )
+    }
+    const out = (proc.stdout ?? Buffer.alloc(0)).toString().trim()
+    const changedFiles = out.length === 0 ? [] : out.split('\n')
+    // Sanity precondition, mirroring the sibling full-diff tests above.
+    expect(changedFiles.length).toBeGreaterThan(0)
+
+    // Case-insensitive, optional-schema-qualifier, whitespace-tolerant —
+    // matched against ALREADY-normalized text (all whitespace runs,
+    // including newlines, collapsed to a single space), so `\s+` only needs
+    // to span the single collapsed space(s) left after normalization.
+    const dropTableRe = /DROP\s+TABLE\s+(\w+\.)?failure_classifications\b/i
+    const truncateRe = /TRUNCATE\s+(TABLE\s+)?(\w+\.)?failure_classifications\b/i
+    // Negative lookahead excludes the reviewed, reversible ATM-030(b)/(c)
+    // RENAME TO fault-injection idiom (see comment above) — everything else
+    // (ADD/DROP/MODIFY COLUMN, etc.) still matches.
+    const alterTableRe = /ALTER\s+TABLE\s+(\w+\.)?failure_classifications\b(?!\s+RENAME\s+TO)/i
+    const insertOrReplaceRe = /INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+\.)?failure_classifications\b/i
+    const replaceIntoRe = /REPLACE\s+INTO\s+(\w+\.)?failure_classifications\b/i
+    const destructiveVerbPatterns = [dropTableRe, truncateRe, alterTableRe, insertOrReplaceRe, replaceIntoRe]
+
+    const offenders: { file: string; matchPreview: string }[] = []
+    for (const relPath of changedFiles) {
+      if (DESTRUCTIVE_VERB_EXCLUSIONS.includes(relPath)) continue
+      let content: string
+      try {
+        content = readFileSync(join(REPO, relPath), 'utf8')
+      } catch {
+        continue // deleted / binary / unreadable file
+      }
+      const normalized = content.replace(/\s+/g, ' ')
+      for (const re of destructiveVerbPatterns) {
+        const match = normalized.match(re)
+        if (match) offenders.push({ file: relPath, matchPreview: match[0] })
+      }
+    }
+
+    if (offenders.length > 0) {
+      throw new Error(
+        `ATM-022 violation (Finding 3, destructive-verb scan): found ${offenders.length} whitespace-normalized ` +
+        `destructive-verb match(es) targeting failure_classifications, none of which are on ` +
+        `DESTRUCTIVE_VERB_EXCLUSIONS:\n` +
+        offenders.map(o => `  ${o.file} — "${o.matchPreview}"`).join('\n'),
+      )
+    }
+    expect(offenders).toEqual([])
+  })
 })
 
 // ---------------------------------------------------------------------------
