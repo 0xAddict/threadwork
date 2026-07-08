@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "esnext",
+    "lib": ["esnext", "dom"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "typeRoots": ["./.typeroots"],
+    "types": ["bun-types", "node"]
+  },
+  "include": [
+    "types/bun-sqlite-widen.d.ts",
+    "verification/cross-family-critique.ts",
+    "verification/failure-classification.ts",
+    "decision.ts",
+    "db.ts",
+    "server.ts",
+    "tests/cross-family-critique.test.ts",
+    "tests/cross-family-critique-p6-integration.test.ts",
+    "tests/cross-family-critique-critique-position-integration.test.ts",
+    "tests/guardrails/cross-family-critique-scope-bleed.test.ts"
+  ]
+}
