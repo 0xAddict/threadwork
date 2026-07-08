@@ -1,13 +1,25 @@
 // verification/cross-family-critique.ts — P7 Cross-Family Critique module.
 //
 // STAGE 1 of build-p7/PLAN.md: EPIC-01 (Model-Family Taxonomy & Attribution)
-// ONLY — the ModelFamily union + CROSS_FAMILY_TAXONOMY_VERSION +
+// — the ModelFamily union + CROSS_FAMILY_TAXONOMY_VERSION +
 // TAXONOMY_CHANGELOG + frozen ALL_MODEL_FAMILIES array (REQ-001), the pure
 // table-driven resolveModelFamily() (REQ-002), and the pure
-// resolveAgentDefaultFamily() (REQ-003). Later stages add
-// evaluateCrossFamily() (EPIC-02), the P6 read-only adapter (EPIC-03),
-// persistence (EPIC-04), and the getCrossFamilyCritiques() P8 read contract
-// (EPIC-05) — none of that is implemented here. See specs/P7-spec.md.
+// resolveAgentDefaultFamily() (REQ-003).
+//
+// STAGE 2 (this addition, below): EPIC-02 (Cross-Family Critique Record &
+// Evaluator Core) — the CrossFamilyCritique/CrossFamilyEvaluation record
+// types, the closed 5-member CrossFamilyVerdict union (REQ-004), and the
+// pure, deterministic, table-driven evaluateCrossFamily() (REQ-005/REQ-006).
+//
+// Later stages add the P6 read-only adapter (EPIC-03), persistence
+// (EPIC-04), and the getCrossFamilyCritiques() P8 read contract (EPIC-05) —
+// none of that is implemented here. See specs/P7-spec.md.
+
+// decision.ts's CritiqueSeverity is imported as a TYPE ONLY (erased at
+// compile time — zero runtime dependency) — REQ-004(a): referenced here
+// exclusively as a typed INPUT FIELD on CrossFamilyCritique, never
+// redefined, aliased, or re-exported.
+import type { CritiqueSeverity } from '../decision'
 
 // ---------------------------------------------------------------------------
 // ATM-001 / REQ-001 [P1] — Canonical versioned ModelFamily
@@ -154,4 +166,165 @@ export function resolveAgentDefaultFamily(
     if (value !== undefined) return value
   }
   return 'unknown'
+}
+
+// ---------------------------------------------------------------------------
+// ATM-006 / REQ-004 [P1] — CrossFamilyCritique / CrossFamilyEvaluation /
+// CrossFamilyVerdict (5-member closed union)
+// ---------------------------------------------------------------------------
+
+/**
+ * Input record to evaluateCrossFamily(): an already-resolved producer/critic
+ * family pair plus the critique's existing CritiqueSeverity (decision.ts:5),
+ * referenced here as a TYPED INPUT FIELD only — read/passed through, never
+ * redefined, aliased, or re-exported (REQ-004(a)).
+ */
+export interface CrossFamilyCritique {
+  producer_family: ModelFamily
+  critic_family: ModelFamily
+  critic_severity: CritiqueSeverity | null
+}
+
+/** Output record produced by evaluateCrossFamily(). */
+export interface CrossFamilyEvaluation {
+  is_cross_family: boolean
+  verdict: CrossFamilyVerdict
+}
+
+/**
+ * The closed cross-family critique verdict union — a type DISTINCT from
+ * decision.ts's CritiqueSeverity and from P6's FailureClass/FailureSeverity
+ * (REQ-004(a)). See the ATM-007 guardrail test for the non-aliasing +
+ * non-sentinel-disjointness proof; 'unknown' is a deliberate shared fallback
+ * sentinel with FailureClass's own 'unknown' member, carved out of that
+ * disjointness check per OQ-3 (a) / PLAN §8 AMENDMENT A1 — it is NOT evidence
+ * of aliasing.
+ */
+export type CrossFamilyVerdict =
+  | 'concur'
+  | 'dissent'
+  | 'block'
+  | 'insufficient_same_family'
+  | 'unknown'
+
+// Runtime mirror of the CrossFamilyVerdict union, in the same order as
+// declared above. `satisfies readonly CrossFamilyVerdict[]` plus the
+// bidirectional exhaustiveness check below ensure this tuple and the
+// CrossFamilyVerdict union can never silently drift apart — mirrors the
+// ALL_MODEL_FAMILIES / ALL_FAILURE_CLASSES exhaustiveness-guard pattern used
+// elsewhere in this file and in verification/failure-classification.ts.
+const _crossFamilyVerdictsTuple = [
+  'concur',
+  'dissent',
+  'block',
+  'insufficient_same_family',
+  'unknown',
+] as const satisfies readonly CrossFamilyVerdict[]
+
+type _CrossFamilyVerdictTupleMember = (typeof _crossFamilyVerdictsTuple)[number]
+type _CrossFamilyVerdictExhaustive = [CrossFamilyVerdict] extends [_CrossFamilyVerdictTupleMember]
+  ? [_CrossFamilyVerdictTupleMember] extends [CrossFamilyVerdict]
+    ? true
+    : ['ALL_CROSS_FAMILY_VERDICTS has member(s) not in the CrossFamilyVerdict union']
+  : ['CrossFamilyVerdict union has member(s) missing from ALL_CROSS_FAMILY_VERDICTS']
+const _crossFamilyVerdictExhaustive: _CrossFamilyVerdictExhaustive = true
+void _crossFamilyVerdictExhaustive
+
+export const ALL_CROSS_FAMILY_VERDICTS: readonly CrossFamilyVerdict[] = Object.freeze(
+  _crossFamilyVerdictsTuple,
+)
+
+// ---------------------------------------------------------------------------
+// ATM-008/009/010 / REQ-005/REQ-006 [P1/P2] — evaluateCrossFamily()
+// ---------------------------------------------------------------------------
+
+/** The 3 valid CritiqueSeverity literal values, used for defensive runtime validation. */
+const _VALID_CRITIQUE_SEVERITIES: ReadonlySet<string> = new Set(['observation', 'concern', 'blocker'])
+
+function _isKnownModelFamily(value: unknown): value is ModelFamily {
+  return typeof value === 'string' && (ALL_MODEL_FAMILIES as readonly string[]).includes(value)
+}
+
+function _isValidCritiqueSeverity(value: unknown): value is CritiqueSeverity {
+  return typeof value === 'string' && _VALID_CRITIQUE_SEVERITIES.has(value)
+}
+
+/** The single, unconditional fallback result for any malformed/unrecognized input (REQ-006(a)). */
+const _UNKNOWN_FALLBACK: CrossFamilyEvaluation = Object.freeze({
+  is_cross_family: false,
+  verdict: 'unknown',
+})
+
+/**
+ * The single chokepoint computing whether a critique is cross-family and
+ * what its verdict is — a deterministic, PURE, table-driven mapping over the
+ * 9-row authoritative decision table (REQ-005). `is_cross_family` is `true`
+ * IFF `critic_family !== producer_family && critic_family !== 'unknown' &&
+ * producer_family !== 'unknown'`. NO I/O, NO randomness, NO wall-clock read
+ * (no Date/Date.now/performance.now/Math.random), NO side effects.
+ *
+ * IDEMPOTENT + referentially transparent (REQ-006): two calls with
+ * byte-identical input produce byte-identical output. NEVER throws
+ * (REQ-006(a)): any malformed, missing, or unexpected-type field (a
+ * producer_family/critic_family outside ModelFamily, a non-object input,
+ * null/undefined, a circular-reference object, etc.) falls back to
+ * `{is_cross_family: false, verdict: 'unknown'}`.
+ */
+export function evaluateCrossFamily(input: CrossFamilyCritique): CrossFamilyEvaluation {
+  try {
+    if (input === null || typeof input !== 'object') {
+      return _UNKNOWN_FALLBACK
+    }
+
+    const raw = input as { producer_family?: unknown; critic_family?: unknown; critic_severity?: unknown }
+    const producerFamilyRaw = raw.producer_family
+    const criticFamilyRaw = raw.critic_family
+    const criticSeverityRaw = raw.critic_severity
+
+    if (!_isKnownModelFamily(producerFamilyRaw) || !_isKnownModelFamily(criticFamilyRaw)) {
+      return _UNKNOWN_FALLBACK
+    }
+    const producerFamily: ModelFamily = producerFamilyRaw
+    const criticFamily: ModelFamily = criticFamilyRaw
+
+    const isCrossFamily =
+      criticFamily !== producerFamily && criticFamily !== 'unknown' && producerFamily !== 'unknown'
+
+    if (!isCrossFamily) {
+      // Row 1: both KNOWN and the SAME family -> 'insufficient_same_family'.
+      // Rows 2-4: either side is 'unknown' -> 'unknown'. (If neither side is
+      // 'unknown' and they're not cross-family, they must be equal — row 1.)
+      if (producerFamily !== 'unknown' && criticFamily !== 'unknown' && producerFamily === criticFamily) {
+        return { is_cross_family: false, verdict: 'insufficient_same_family' }
+      }
+      return { is_cross_family: false, verdict: 'unknown' }
+    }
+
+    // is_cross_family === true from here on (rows 5-9).
+    if (criticSeverityRaw === null || criticSeverityRaw === undefined) {
+      // Row 8: severity null/missing -> 'unknown'.
+      return { is_cross_family: true, verdict: 'unknown' }
+    }
+    if (!_isValidCritiqueSeverity(criticSeverityRaw)) {
+      // Row 9: malformed/invalid severity string (or any other bad type) -> 'unknown'.
+      return { is_cross_family: true, verdict: 'unknown' }
+    }
+    switch (criticSeverityRaw) {
+      case 'blocker':
+        return { is_cross_family: true, verdict: 'block' } // Row 5
+      case 'concern':
+        return { is_cross_family: true, verdict: 'dissent' } // Row 6
+      case 'observation':
+        return { is_cross_family: true, verdict: 'concur' } // Row 7
+    }
+    // Unreachable given _isValidCritiqueSeverity's narrowing above; kept as an
+    // explicit defensive fallback so the function always returns and TS's
+    // control-flow analysis sees a terminating statement on every path.
+    return { is_cross_family: true, verdict: 'unknown' }
+  } catch {
+    // Defensive catch-all: any unexpected throw (e.g. a hostile getter on a
+    // malformed input) falls back to the same unknown result, never
+    // propagating (REQ-006(a)).
+    return _UNKNOWN_FALLBACK
+  }
 }
