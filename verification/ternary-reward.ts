@@ -445,3 +445,92 @@ export function hasTernaryReward(db: Database, decisionId: number): boolean {
     return false
   }
 }
+
+// ---------------------------------------------------------------------------
+// EPIC-05 / REQ-014, REQ-015 (ATM-022..024) — P-downstream read accessor.
+//
+// The single, stable, READ-ONLY boundary a future consumer builds on. Mirrors
+// getCrossFamilyCritiques()/getFailureClassifications() EXACTLY: a dynamic
+// WHERE-clause builder, `SELECT * ... ORDER BY id ASC`, a row-map, and
+// forward-compat pass-through of unrecognized verdict/severity strings + a
+// newer policy_version. Defines the accessor + its return SHAPE only — computes
+// NO reward and exposes no write path beyond EPIC-04's persistTernaryReward()
+// (ATM-023). The stored failure_signal_available INTEGER (0/1) is coerced to a
+// real boolean (REQ-014).
+// ---------------------------------------------------------------------------
+
+/**
+ * A durable ternary_rewards row, as read back by getTernaryRewards() — the
+ * STABLE contract boundary a future consumer shall consume (REQ-014).
+ * `cross_family_verdict`/`failure_severity` are `string | null` (forward-compat
+ * widening — a row from a newer taxonomy carrying an unrecognized value still
+ * deserializes without loss, REQ-015). `reward` is CHECK-constrained to
+ * `{-1,0,1}` at the DB level, so it is typed as the closed `TernaryReward`.
+ * `failure_signal_available` is surfaced as a real boolean (the column is
+ * INTEGER 1/0).
+ */
+export type PersistedTernaryReward = {
+  id: number
+  policy_version: number
+  decision_id: number | null
+  task_id: number | null
+  subject_kind: string
+  cross_family_verdict: string | null
+  failure_severity: string | null
+  failure_signal_available: boolean
+  reward: TernaryReward
+  created_at: string
+}
+
+/**
+ * ATM-022/ATM-024 / REQ-014/REQ-015 — Reads durable ternary_rewards rows back
+ * out, in ascending `id` order, optionally narrowed by `decisionId` / `reward`
+ * / a `created_at` floor (`since`, inclusive). READ-ONLY (SELECT only — never
+ * INSERT/UPDATE/DELETE) and performs NO scoring/aggregation/reward computation
+ * of its own (ATM-023): a pass-through accessor over what persistTernaryReward()
+ * already wrote.
+ *
+ * `cross_family_verdict` / `failure_severity` / `policy_version` are copied
+ * through AS-IS with no validation/coercion — REQ-015: a row with an
+ * unrecognized verdict/severity OR a newer `policy_version` is still returned
+ * UNCHANGED (never thrown, never dropped, never coerced). The ONLY coercion is
+ * `failure_signal_available` INTEGER (`0`/`1`) → `boolean` (REQ-014).
+ */
+export function getTernaryRewards(
+  db: Database,
+  filter?: { decisionId?: number; reward?: TernaryReward; since?: string },
+): PersistedTernaryReward[] {
+  const clauses: string[] = []
+  const params: (string | number)[] = []
+
+  if (filter?.decisionId !== undefined) {
+    clauses.push('decision_id = ?')
+    params.push(filter.decisionId)
+  }
+  if (filter?.reward !== undefined) {
+    clauses.push('reward = ?')
+    params.push(filter.reward)
+  }
+  if (filter?.since !== undefined) {
+    clauses.push('created_at >= ?')
+    params.push(filter.since)
+  }
+
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : ''
+  const rows = db.prepare(`SELECT * FROM ternary_rewards ${where} ORDER BY id ASC`).all(...params) as any[]
+
+  return rows.map(
+    (row): PersistedTernaryReward => ({
+      id: row.id,
+      policy_version: row.policy_version,
+      decision_id: row.decision_id,
+      task_id: row.task_id,
+      subject_kind: row.subject_kind,
+      cross_family_verdict: row.cross_family_verdict,
+      failure_severity: row.failure_severity,
+      failure_signal_available: row.failure_signal_available === 1,
+      reward: row.reward,
+      created_at: row.created_at,
+    }),
+  )
+}

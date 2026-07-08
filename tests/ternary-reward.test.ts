@@ -52,6 +52,8 @@ import {
   persistTernaryReward,
   hasTernaryReward,
   type TernaryRewardRecord,
+  getTernaryRewards,
+  type PersistedTernaryReward,
 } from '../verification/ternary-reward'
 import { ALL_FAILURE_CLASSES, ALL_FAILURE_SEVERITIES } from '../verification/failure-classification'
 import { ALL_CROSS_FAMILY_VERDICTS } from '../verification/cross-family-critique'
@@ -1472,5 +1474,210 @@ describe('ATM-028: audit atomicity, two-direction fault injection (REQ-019)', ()
       db.prepare("SELECT * FROM audit_log WHERE action = 'ternary_reward_assigned'").all(),
     ) as Record<string, unknown>[]
     expect(auditRows.length).toBe(0)
+  })
+})
+
+// ===========================================================================
+// STAGE 5 of build-p8/PLAN.md: EPIC-05 (P-downstream read accessor) —
+// ATM-022 (getTernaryRewards filters/ordering/coercion), ATM-023 (scope-guard:
+// no reward-consumption code in the module), ATM-024 (forward-compat
+// pass-through: unrecognized verdict/severity + newer policy_version).
+// ===========================================================================
+
+/**
+ * Inserts a ternary_rewards row DIRECTLY (bypassing persistTernaryReward() /
+ * the feature flag), so ATM-024's forward-compat proof can write
+ * arbitrary/unrecognized verdict + severity + policy_version values, and
+ * ATM-022's `since` test can control created_at. Mirrors P7's own
+ * insertCrossFamilyCritiqueRowDirect() direct-insert test helper.
+ */
+function insertTernaryRewardRowDirect(
+  db: Database,
+  opts: {
+    decisionId?: number | null
+    taskId?: number | null
+    subjectKind?: string
+    policyVersion?: number
+    crossFamilyVerdict?: string | null
+    failureSeverity?: string | null
+    failureSignalAvailable?: 0 | 1
+    reward?: number
+    createdAt?: string
+  },
+): number {
+  const row = db
+    .prepare(`
+      INSERT INTO ternary_rewards (
+        policy_version, decision_id, task_id, subject_kind,
+        cross_family_verdict, failure_severity, failure_signal_available, reward, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING id
+    `)
+    .get(
+      opts.policyVersion ?? 1,
+      opts.decisionId === undefined ? null : opts.decisionId,
+      opts.taskId === undefined ? null : opts.taskId,
+      opts.subjectKind ?? 'decision',
+      opts.crossFamilyVerdict === undefined ? null : opts.crossFamilyVerdict,
+      opts.failureSeverity === undefined ? null : opts.failureSeverity,
+      opts.failureSignalAvailable ?? 0,
+      opts.reward ?? 0,
+      opts.createdAt ?? '2026-07-08T00:00:00Z',
+    ) as { id: number }
+  return row.id
+}
+
+// ---------------------------------------------------------------------------
+// ATM-022 / REQ-014 [P1] — getTernaryRewards()
+// ---------------------------------------------------------------------------
+describe('ATM-022: getTernaryRewards() (REQ-014)', () => {
+  const TEST_DB = '/tmp/p8-tr-atm022.db'
+  let taskDb: TaskDB
+  let decisionA: number
+  let decisionB: number
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    decisionA = taskDb.run((db) => insertDecisionRow(db, { taskId: 800 }))
+    decisionB = taskDb.run((db) => insertDecisionRow(db, { taskId: 801 }))
+    // 5 rows across 2 decisions, all 3 reward values, distinct created_at.
+    taskDb.run((db) => insertTernaryRewardRowDirect(db, { decisionId: decisionA, reward: -1, createdAt: '2026-07-01T00:00:00Z', failureSignalAvailable: 1 }))
+    taskDb.run((db) => insertTernaryRewardRowDirect(db, { decisionId: decisionA, reward: 0, createdAt: '2026-07-02T00:00:00Z', failureSignalAvailable: 0 }))
+    taskDb.run((db) => insertTernaryRewardRowDirect(db, { decisionId: decisionA, reward: 1, createdAt: '2026-07-03T00:00:00Z', failureSignalAvailable: 1 }))
+    taskDb.run((db) => insertTernaryRewardRowDirect(db, { decisionId: decisionB, reward: -1, createdAt: '2026-07-04T00:00:00Z', failureSignalAvailable: 1 }))
+    taskDb.run((db) => insertTernaryRewardRowDirect(db, { decisionId: decisionB, reward: 1, createdAt: '2026-07-05T00:00:00Z', failureSignalAvailable: 0 }))
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-022: no-filter → all 5 rows in ascending id order', () => {
+    const rows = taskDb.run((db) => getTernaryRewards(db))
+    expect(rows.length).toBe(5)
+    const ids = rows.map((r) => r.id)
+    expect([...ids]).toEqual([...ids].sort((a, b) => a - b))
+  })
+
+  test('ATM-022: filter by decisionId → only that decision, ascending id', () => {
+    const rowsA = taskDb.run((db) => getTernaryRewards(db, { decisionId: decisionA }))
+    expect(rowsA.length).toBe(3)
+    expect(rowsA.every((r) => r.decision_id === decisionA)).toBe(true)
+    const ids = rowsA.map((r) => r.id)
+    expect([...ids]).toEqual([...ids].sort((a, b) => a - b))
+  })
+
+  test('ATM-022: filter by reward → only rows with that reward', () => {
+    const negatives = taskDb.run((db) => getTernaryRewards(db, { reward: -1 }))
+    expect(negatives.length).toBe(2)
+    expect(negatives.every((r) => r.reward === -1)).toBe(true)
+
+    const positives = taskDb.run((db) => getTernaryRewards(db, { reward: 1 }))
+    expect(positives.length).toBe(2)
+    expect(positives.every((r) => r.reward === 1)).toBe(true)
+  })
+
+  test('ATM-022: filter by since (inclusive created_at floor)', () => {
+    const recent = taskDb.run((db) => getTernaryRewards(db, { since: '2026-07-03T00:00:00Z' }))
+    // 07-03, 07-04, 07-05 → 3 rows
+    expect(recent.length).toBe(3)
+    expect(recent.every((r) => r.created_at >= '2026-07-03T00:00:00Z')).toBe(true)
+  })
+
+  test('ATM-022: combined decisionId + reward filter', () => {
+    const rows = taskDb.run((db) => getTernaryRewards(db, { decisionId: decisionB, reward: 1 }))
+    expect(rows.length).toBe(1)
+    expect(rows[0].decision_id).toBe(decisionB)
+    expect(rows[0].reward).toBe(1)
+  })
+
+  test('ATM-022: failure_signal_available INTEGER 0/1 coerced to boolean false/true (typeof boolean)', () => {
+    const rows = taskDb.run((db) => getTernaryRewards(db))
+    for (const r of rows) {
+      expect(typeof r.failure_signal_available).toBe('boolean')
+    }
+    // decisionA row1 seeded with =1 → true; row2 with =0 → false.
+    const rowsA = taskDb.run((db) => getTernaryRewards(db, { decisionId: decisionA }))
+    expect(rowsA[0].failure_signal_available).toBe(true)
+    expect(rowsA[1].failure_signal_available).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-023 / REQ-015(b) [P1] — no-downstream-consumption scope-guard
+// ---------------------------------------------------------------------------
+describe('ATM-023: no-downstream-consumption scope-guard (REQ-015(b))', () => {
+  test('ATM-023: module never writes a reward back into memories.importance/quality or any decisions/memories UPDATE', () => {
+    expect(MODULE_SOURCE).not.toMatch(/memories\.importance/)
+    expect(MODULE_SOURCE).not.toMatch(/memories\.quality/)
+    expect(MODULE_SOURCE).not.toMatch(/UPDATE\s+decisions/i)
+    expect(MODULE_SOURCE).not.toMatch(/UPDATE\s+memories/i)
+    // the only write statements in the module target ternary_rewards + audit_log
+    expect(MODULE_SOURCE).not.toMatch(/UPDATE\s+/i)
+  })
+
+  test('ATM-023: module does not import memory.ts', () => {
+    const importLines = MODULE_SOURCE.split('\n').filter((l) => /^\s*import\b/.test(l))
+    for (const line of importLines) {
+      expect(line).not.toMatch(/from\s+['"]\.\.\/memory['"]/)
+      expect(line).not.toMatch(/from\s+['"]\.\/memory['"]/)
+      expect(line).not.toMatch(/memory\.ts/)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-024 / REQ-015(a) [P2] — forward-compat read pass-through
+// ---------------------------------------------------------------------------
+describe('ATM-024: forward-compat read pass-through (REQ-015(a))', () => {
+  const TEST_DB = '/tmp/p8-tr-atm024.db'
+  let taskDb: TaskDB
+  let decisionId: number
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    decisionId = taskDb.run((db) => insertDecisionRow(db, { taskId: 900 }))
+  })
+  afterEach(() => wipeDbFile(TEST_DB))
+
+  test('ATM-024: row with unknown cross_family_verdict + policy_version=999 → returned UNCHANGED', () => {
+    taskDb.run((db) =>
+      insertTernaryRewardRowDirect(db, {
+        decisionId,
+        crossFamilyVerdict: 'future_verdict_v2',
+        policyVersion: 999,
+        reward: 0,
+      }),
+    )
+    const rows = taskDb.run((db) => getTernaryRewards(db, { decisionId }))
+    expect(rows.length).toBe(1)
+    expect(rows[0].cross_family_verdict).toBe('future_verdict_v2')
+    expect(rows[0].policy_version).toBe(999)
+  })
+
+  test('ATM-024: separate row with unknown failure_severity → returned UNCHANGED', () => {
+    taskDb.run((db) =>
+      insertTernaryRewardRowDirect(db, {
+        decisionId,
+        failureSeverity: 'sev_future_v2',
+        failureSignalAvailable: 1,
+        reward: 0,
+      }),
+    )
+    const rows = taskDb.run((db) => getTernaryRewards(db, { decisionId }))
+    expect(rows.length).toBe(1)
+    expect(rows[0].failure_severity).toBe('sev_future_v2')
+  })
+
+  test('ATM-024: reading these forward-compat rows never throws', () => {
+    taskDb.run((db) => insertTernaryRewardRowDirect(db, { decisionId, crossFamilyVerdict: 'future_verdict_v2', failureSeverity: 'sev_future_v2', policyVersion: 999, reward: 0 }))
+    let caught: unknown = null
+    let rows: PersistedTernaryReward[] = []
+    try {
+      rows = taskDb.run((db) => getTernaryRewards(db))
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeNull()
+    expect(rows.length).toBe(1)
   })
 })
