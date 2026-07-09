@@ -624,6 +624,12 @@ export class TaskDB {
     // flag-gated no-op and the finalize_decision wiring hook is inert until this
     // flag is turned ON (server.ts wiring lands in a later stage).
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('ternary_reward_enabled', 0)")
+    // T3 EPIC-04 (REQ-012/ATM-011): cross-family attribution registry
+    // injection at the critique_position call sites. DEFAULT OFF — distinct
+    // from the already-ON cross_family_critique_enabled, so populating the
+    // agent-family registry doesn't retroactively shift the live verdict
+    // distribution until an operator explicitly flips this flag.
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('cross_family_attribution_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
