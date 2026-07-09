@@ -150,3 +150,141 @@ describe('fault_count decay on successful heartbeat', () => {
     expect(state?.fault_count).toBe(3)
   })
 })
+
+// T4 (ATM-022/REQ-021): reward_consumer_enabled feature flag — default OFF,
+// idempotent seed. Sits next to the P8 ternary_reward_enabled flag in
+// db.ts migrate(); this is the EPIC-05 prereq flag gating the future
+// reward-consumer / memory-importance learning loop (scaffolded in a later
+// T4 packet — this packet only lays the flag + cursor-table foundation).
+describe('T4 reward_consumer_enabled feature flag (ATM-022)', () => {
+  let flagPath: string
+
+  beforeEach(() => {
+    flagPath = `/tmp/t4-reward-flag-${crypto.randomUUID()}.db`
+  })
+
+  test('a fresh TaskDB seeds reward_consumer_enabled to false (OFF)', () => {
+    const db = new TaskDB(flagPath)
+    try {
+      expect(db.isFeatureEnabled('reward_consumer_enabled')).toBe(false)
+      const row = db.run(d =>
+        d.prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'reward_consumer_enabled'").get(),
+      ) as { enabled: number } | null
+      expect(row).not.toBeNull()
+      expect(row!.enabled).toBe(0)
+    } finally {
+      db.close()
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { unlinkSync(flagPath + suffix) } catch {}
+      }
+    }
+  })
+
+  test('flipping the flag ON then re-migrating (fresh TaskDB against the same file) does not clobber it back to 0', () => {
+    const first = new TaskDB(flagPath)
+    first.setFeatureFlag('reward_consumer_enabled', true)
+    first.close()
+
+    const second = new TaskDB(flagPath) // constructor re-runs migrate()
+    try {
+      expect(second.isFeatureEnabled('reward_consumer_enabled')).toBe(true)
+    } finally {
+      second.close()
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { unlinkSync(flagPath + suffix) } catch {}
+      }
+    }
+  })
+})
+
+// T4 (ATM-006/REQ-006): reward_consumption_cursor table — durable,
+// keyed-by-consumer high-water-mark cursor. Sits next to the P8
+// ternary_rewards table in db.ts migrate(); this is the STABLE cross-spec
+// read contract a future T1 retention/pruning consumer must honor (column
+// names + defaults are exact-verbatim per the packet spec).
+describe('T4 reward_consumption_cursor table + seed (ATM-006)', () => {
+  let cursorPath: string
+
+  beforeEach(() => {
+    cursorPath = `/tmp/t4-reward-cursor-${crypto.randomUUID()}.db`
+  })
+
+  test('a fresh migrate() creates reward_consumption_cursor with the documented columns', () => {
+    const db = new TaskDB(cursorPath)
+    try {
+      const columns = db.run(d => d.prepare("PRAGMA table_info('reward_consumption_cursor')").all()) as {
+        name: string
+        notnull: number
+        dflt_value: string | null
+      }[]
+      const columnNames = columns.map(c => c.name).sort()
+      expect(columnNames).toEqual(
+        ['consumer', 'last_consumed_reward_id', 'claimed_by', 'claimed_at', 'updated_at'].sort(),
+      )
+      const lastConsumed = columns.find(c => c.name === 'last_consumed_reward_id')
+      expect(lastConsumed).toBeDefined()
+      expect(lastConsumed!.notnull).toBe(1)
+      expect(String(lastConsumed!.dflt_value)).toContain('0')
+    } finally {
+      db.close()
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { unlinkSync(cursorPath + suffix) } catch {}
+      }
+    }
+  })
+
+  test('a fresh migrate() seeds exactly one row for the memory_importance consumer', () => {
+    const db = new TaskDB(cursorPath)
+    try {
+      const rows = db.run(d => d.prepare('SELECT * FROM reward_consumption_cursor').all()) as {
+        consumer: string
+        last_consumed_reward_id: number
+        claimed_by: string | null
+        claimed_at: string | null
+        updated_at: string
+      }[]
+      expect(rows).toHaveLength(1)
+      expect(rows[0].consumer).toBe('memory_importance')
+      expect(rows[0].last_consumed_reward_id).toBe(0)
+      expect(rows[0].claimed_by).toBeNull()
+      expect(rows[0].claimed_at).toBeNull()
+      expect(rows[0].updated_at).not.toBeNull()
+    } finally {
+      db.close()
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { unlinkSync(cursorPath + suffix) } catch {}
+      }
+    }
+  })
+
+  test('re-migrating (fresh TaskDB against the same file) is idempotent — still exactly one row, values unchanged', () => {
+    const first = new TaskDB(cursorPath)
+    first.run(d =>
+      d
+        .prepare(
+          "UPDATE reward_consumption_cursor SET last_consumed_reward_id = 42, claimed_by = 'someone', claimed_at = datetime('now') WHERE consumer = 'memory_importance'",
+        )
+        .run(),
+    )
+    first.close()
+
+    const second = new TaskDB(cursorPath) // constructor re-runs migrate()
+    try {
+      const rows = second.run(d => d.prepare('SELECT * FROM reward_consumption_cursor').all()) as {
+        consumer: string
+        last_consumed_reward_id: number
+        claimed_by: string | null
+      }[]
+      // INSERT OR IGNORE must not have re-inserted/reset the seeded row.
+      expect(rows).toHaveLength(1)
+      expect(rows[0].consumer).toBe('memory_importance')
+      expect(rows[0].last_consumed_reward_id).toBe(42)
+      expect(rows[0].claimed_by).toBe('someone')
+    } finally {
+      second.close()
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { unlinkSync(cursorPath + suffix) } catch {}
+      }
+    }
+  })
+})
