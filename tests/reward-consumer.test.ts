@@ -562,3 +562,126 @@ describe('ATM-027: fail-closed on batch-start missing cursor row (REQ-032)', () 
     expect(() => consumePendingRewards(taskDb, mem)).not.toThrow()
   })
 })
+
+// ---------------------------------------------------------------------------
+// ATM-026 / REQ-024, REQ-031, REQ-033, REQ-034 [P1] — lease lifecycle
+// ---------------------------------------------------------------------------
+describe('ATM-026: lease lifecycle — acquire / blocked / guarded release / expired takeover (REQ-024/031/033/034)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm026.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-026 (i): a LIVE lease held by another run → skippedLocked, zero mutations, in-txn existence-read ordering', () => {
+    const memId = seedMemory(mem, { importance: 2, sourceTaskId: 11 })
+    seedReward(taskDb, { reward: 1, taskId: 11 })
+    setLease(taskDb, 'other-live-holder', "datetime('now')")
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const sp = spyPrepare(taskDb)
+    const result = consumePendingRewards(taskDb, mem)
+    sp.restore()
+
+    expect(result).toEqual({
+      processed: 0,
+      skippedNoLinkage: 0,
+      skippedLocked: true,
+      cursorMissing: false,
+      abortedOnCursorFailure: false,
+      leaseLost: false,
+    })
+    expect(decaySpy).toHaveBeenCalledTimes(0)
+    expect(importanceOf(taskDb, memId)).toBe(2)
+    // The other holder's lease is untouched; the cursor never advanced.
+    expect(cursorRow(taskDb)!.claimed_by).toBe('other-live-holder')
+    expect(cursorRow(taskDb)!.last_consumed_reward_id).toBe(0)
+
+    // REQ-024 in-txn snapshot: existence read between the lease UPDATE and the claim-txn COMMIT.
+    const iUpdate = sp.calls.findIndex((s) => /UPDATE reward_consumption_cursor/.test(s) && /claimed_by = \?/.test(s))
+    const iExists = sp.calls.findIndex((s) => /SELECT 1 AS present/.test(s))
+    const iCommit = sp.calls.findIndex((s) => /COMMIT/.test(s))
+    expect(iUpdate).toBeGreaterThanOrEqual(0)
+    expect(iExists).toBeGreaterThan(iUpdate)
+    expect(iCommit).toBeGreaterThan(iExists)
+  })
+
+  test('ATM-026 (ii): after a NORMAL batch → claimed_by / claimed_at are NULL and the cursor advanced', () => {
+    const memId = seedMemory(mem, { importance: 2, sourceTaskId: 22 })
+    const rid = seedReward(taskDb, { reward: 1, taskId: 22 })
+
+    const result = consumePendingRewards(taskDb, mem)
+
+    expect(result.processed).toBe(1)
+    expect(importanceOf(taskDb, memId)).toBe(3)
+    const row = cursorRow(taskDb)!
+    expect(row.claimed_by).toBeNull()
+    expect(row.claimed_at).toBeNull()
+    expect(row.last_consumed_reward_id).toBe(rid)
+  })
+
+  test('ATM-026 (iii): a batch whose body throws still NULLs the lease (try/finally release)', () => {
+    seedMemory(mem, { importance: 2, sourceTaskId: 33 })
+    seedReward(taskDb, { reward: 1, taskId: 33 })
+    // Force the body to throw AFTER the lease is acquired (inside a row's mutation phase).
+    spyOn(mem, 'decayMemory').mockImplementation(() => {
+      throw new Error('injected mid-batch fault')
+    })
+
+    expect(() => consumePendingRewards(taskDb, mem)).toThrow('injected mid-batch fault')
+
+    // The finally still ran the guarded release.
+    const row = cursorRow(taskDb)!
+    expect(row.claimed_by).toBeNull()
+    expect(row.claimed_at).toBeNull()
+  })
+
+  test('ATM-026 (iv): a lease back-dated past CLAIM_LEASE_MS (renewal suppressed) is re-acquired and processing proceeds', () => {
+    const memId = seedMemory(mem, { importance: 2, sourceTaskId: 44 })
+    const rid = seedReward(taskDb, { reward: 1, taskId: 44 })
+    // Dead holder: claimed long ago, never renewing.
+    setLease(taskDb, 'dead-holder', "'2020-01-01 00:00:00'")
+
+    const result = consumePendingRewards(taskDb, mem)
+
+    expect(result.skippedLocked).toBe(false)
+    expect(result.processed).toBe(1)
+    expect(importanceOf(taskDb, memId)).toBe(3)
+    const row = cursorRow(taskDb)!
+    expect(row.last_consumed_reward_id).toBe(rid)
+    // Lease released at the end (not left held by the dead holder or by us).
+    expect(row.claimed_by).toBeNull()
+  })
+
+  test('ATM-026 (v): a stale former holder’s guarded release does NOT clobber a successor’s live lease', () => {
+    const memId = seedMemory(mem, { importance: 2, sourceTaskId: 55 })
+    seedReward(taskDb, { reward: 1, taskId: 55 })
+
+    let stolen = false
+    const result = consumePendingRewards(taskDb, mem, {
+      onMemoriesResolved: () => {
+        // Simulate a successor B stealing the lease mid-batch (before A's first mutation).
+        if (!stolen) {
+          stolen = true
+          setLease(taskDb, 'successor-B', "datetime('now')")
+        }
+      },
+    })
+
+    // A lost the lease at its REQ-035 pre-mutation gate → zero mutations, leaseLost.
+    expect(result.leaseLost).toBe(true)
+    expect(importanceOf(taskDb, memId)).toBe(2)
+    // A's guarded release (claimed_by = <A>) did NOT clobber B's live lease.
+    expect(cursorRow(taskDb)!.claimed_by).toBe('successor-B')
+  })
+})
