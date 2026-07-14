@@ -411,6 +411,22 @@ describe('ATM-010: module doc-comment states the T1 prune contract verbatim (REQ
     expect(MODULE_SOURCE).toMatch(/monotonically/)
     expect(MODULE_SOURCE).toMatch(/consumed by every registered consumer/)
   })
+
+  test('ATM-010 (PK-T4-3 survival): the verbatim T1 prune-bound contract survived the exactly-once-core rewrite (T1 KO-5 re-verify anchor)', () => {
+    // The CROSS-SPEC CURSOR CONTRACT block must survive PK-T4-3 EXACTLY — T1's
+    // future EPIC-03 authoring greps these literals; the exactly-once core must
+    // not have disturbed them.
+    const minFragment = 'SELECT MIN(last_consumed_reward_id) FROM reward_consumption_cursor'
+    // Present exactly once (not duplicated, not dropped).
+    expect(MODULE_SOURCE.split(minFragment).length - 1).toBe(1)
+    // All four sub-clause anchors (a)-(d) co-present after the rewrite.
+    expect(MODULE_SOURCE).toContain("T1's prune bound for `ternary_rewards`")
+    expect(MODULE_SOURCE).toContain('FAIL-SAFE:')
+    expect(MODULE_SOURCE).toContain('SECOND-CONSUMER RULE:')
+    expect(MODULE_SOURCE).toContain('SAFETY ARGUMENT:')
+    // REQ-010: do NOT renumber — the contract is still labelled REQ-010/ATM-010.
+    expect(MODULE_SOURCE).toMatch(/REQ-010,\s*ATM-010/)
+  })
 })
 
 // ===========================================================================
