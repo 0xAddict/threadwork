@@ -109,7 +109,7 @@ fi
 
 # --- run tsc, normalize error lines (strip (line,col)), compare to baseline multiset ---
 echo "[typecheck-ko-t3] bunx tsc -p tsconfig.ko-t3.json"
-TSC_OUT="$(bunx tsc -p tsconfig.ko-t3.json 2>&1)"
+TSC_OUT="$(bunx tsc -p tsconfig.ko-t3.json 2>&1)"; TSC_EXIT=$?
 
 # Primary error lines only (continuation lines lack 'error TS').
 ERRLINES="$(printf '%s\n' "$TSC_OUT" | grep -E 'error TS[0-9]' || true)"
@@ -125,6 +125,21 @@ FAIL=0
 [ "$SERVER_ADDITIVE_FAIL" -ne 0 ] && FAIL=1
 [ "$SERVER_SUPPRESSION_FAIL" -ne 0 ] && FAIL=1
 
+# BOSS RULING v2 — tsc-execution proof (WHITELIST, fail-closed): a HEALTHY run
+# emits diagnostics and exits 1 (DiagnosticsPresent / --noEmit) or 2
+# (OutputsGenerated). Anything else means tsc did NOT run as a typechecker:
+# exit 0 = clean output (the 3 pinned baseline errors vanished), 3-125 = no
+# legitimate meaning here, >=126 = launch/not-found/crash. Fail closed.
+echo "[typecheck-ko-t3] tsc exit=$TSC_EXIT (execution-proof whitelist: {1,2})"
+case "$TSC_EXIT" in
+  1|2) : ;;  # ran with diagnostics — the signature checks below validate them
+  *)
+    echo "[typecheck-ko-t3] FAIL: tsc exit $TSC_EXIT outside the {1,2} ran-with-diagnostics whitelist —" >&2
+    echo "[typecheck-ko-t3]   0=clean(baseline vanished) / 3-125=undefined(fail-closed) / >=126=launch-or-crash." >&2
+    FAIL=1
+    ;;
+esac
+
 # New = normalized current signatures not accounted for by the baseline multiset.
 NEW_SIGS="$(comm -13 <(printf '%s\n' "$NORM_BASE") <(printf '%s\n' "$NORM_CUR") || true)"
 MISSING_SIGS="$(comm -23 <(printf '%s\n' "$NORM_BASE") <(printf '%s\n' "$NORM_CUR") || true)"
@@ -135,11 +150,15 @@ if [ -n "$NEW_SIGS" ]; then
   FAIL=1
 fi
 if [ -n "$MISSING_SIGS" ]; then
-  # A missing baseline signature means a pristine error vanished — usually a
-  # non-additive server.ts edit. Report (the additive guard above is the hard
-  # catch; this is a corroborating signal).
-  echo "[typecheck-ko-t3] WARN: a pristine baseline error signature is no longer present (check server.ts additive-only):" >&2
+  # BOSS RULING v2: promoted WARN -> hard FAIL. Nothing in the T3 era may
+  # legitimately remove a pinned baseline error, so ANY vanished baseline
+  # signature means tsc did not run / did not check the expected surface (the
+  # silent-tsc false-pass this guard closes) — consistent with the diff-level
+  # baseline-error-line content-match guard above.
+  echo "[typecheck-ko-t3] FAIL: a pristine baseline error signature is no longer present —" >&2
+  echo "[typecheck-ko-t3]   tsc did not run as a typechecker over the expected surface (silent-false-pass guard). Missing:" >&2
   printf '%s\n' "$MISSING_SIGS" >&2
+  FAIL=1
 fi
 if [ "$TOTAL_ERR" -ne "$EXPECT_BASELINE" ] && [ -z "$NEW_SIGS" ]; then
   echo "[typecheck-ko-t3] NOTE: total error count $TOTAL_ERR != baseline $EXPECT_BASELINE but no NEW signatures — see MISSING above." >&2
