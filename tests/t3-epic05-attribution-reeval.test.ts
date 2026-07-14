@@ -16,11 +16,12 @@ import { join } from 'path'
 import { readFileSync } from 'fs'
 import { TaskDB } from '../db'
 import type { Database } from 'bun:sqlite'
+import { spawn } from 'child_process'
+import { writeFileSync } from 'fs'
 import {
   runAttributionReeval,
   isCanonicalSqliteDatetime,
   recomputeDecisionCritiques,
-  claimRun,
   __setAttributionReevalTestSeamsForTests,
   type AttributionReevalOptions,
 } from '../verification/attribution-reeval'
@@ -433,62 +434,78 @@ describe('ATM-023: claim protocol — existence-check FIRST, claim closed before
 // ATM-024 — concurrent double invocation
 // ===========================================================================
 describe('ATM-024: concurrent double invocation -> exactly one proceeds (REQ-024/025/026)', () => {
-  test('two connections, one claim row, no duplicate decision_reeval rows', async () => {
+  test('TWO REAL PROCESSES racing the same DB file: exactly one claim row + one decision_reeval, no dupes', async () => {
     const dir = mkdtempSync(join(tmpdir(), 't3-epic05-conc-'))
     tmpDirs.push(dir)
     const dbPath = join(dir, 'tasks.db')
-    const a = new TaskDB(dbPath)
-    dbs.push(a)
-    a.setFeatureFlag('cross_family_critique_enabled', true)
-    a.setFeatureFlag('cross_family_attribution_enabled', true)
-    a.setFeatureFlag('ternary_reward_enabled', true)
-    const dec = seedDecisiveCandidate(a.getHandle())
-    const b = new TaskDB(dbPath)
-    dbs.push(b)
+    // Seed via TaskDB (migrate + flags + a decisive candidate), then close so the
+    // two racing processes contend only with each other.
+    const seedDb = new TaskDB(dbPath)
+    seedDb.setFeatureFlag('cross_family_critique_enabled', true)
+    seedDb.setFeatureFlag('cross_family_attribution_enabled', true)
+    seedDb.setFeatureFlag('ternary_reward_enabled', true)
+    const dec = seedDecisiveCandidate(seedDb.getHandle())
+    seedDb.run(db => db.exec('PRAGMA wal_checkpoint(TRUNCATE)'))
+    seedDb.close()
 
-    // Single-threaded bun executes these sequentially (runAttributionReeval is
-    // synchronous), so one runs fully and the other short-circuits on the
-    // committed run row — the singleton UNIQUE + BEGIN IMMEDIATE re-check is what
-    // guarantees safety under true OS-level concurrency (proven structurally by
-    // ATM-012 + ATM-023b).
-    const [ra, rb] = await Promise.all([
-      Promise.resolve().then(() => runAttributionReeval(a.getHandle(), baseOpts())),
-      Promise.resolve().then(() => runAttributionReeval(b.getHandle(), baseOpts())),
-    ])
-    const statuses = [ra.status, rb.status].sort()
-    expect(statuses).toEqual(['complete', 'skipped_existing_run'])
-    expect(countRuns(a.getHandle())).toBe(1)
-    expect(reevalRows(a.getHandle(), dec).length).toBe(1)
+    // Standalone runner: invokes runAttributionReeval on a raw handle (NODE_ENV
+    // is NOT 'test' here -> the production path, no test seam). busy_timeout lets
+    // a concurrent claimer wait for the tiny claim txn and then abort via the
+    // re-check instead of an immediate SQLITE_BUSY.
+    const modulePath = join(import.meta.dir, '..', 'verification', 'attribution-reeval.ts')
+    const runnerPath = join(dir, 'reeval-runner.ts')
+    writeFileSync(
+      runnerPath,
+      `import { Database } from 'bun:sqlite'
+import { runAttributionReeval } from ${JSON.stringify(modulePath)}
+const db = new Database(process.argv[2])
+db.exec('PRAGMA busy_timeout = 5000')
+try {
+  const res = runAttributionReeval(db, {
+    registry: { steve: 'openai', boss: 'anthropic' },
+    windowFloor: ${JSON.stringify(FLOOR)},
+    windowCeiling: ${JSON.stringify(CEILING)},
+    activationTimestamp: ${JSON.stringify(ACTIVATION)},
+    attestNoExplicitModelIds: true,
   })
+  console.log(JSON.stringify(res))
+} catch (e) {
+  console.log(JSON.stringify({ status: 'error', reason: String(e) }))
+} finally {
+  db.close()
+}
+`,
+    )
 
-  test('claimRun re-check: a row that appeared after step-0 (contended claim) -> false, no duplicate/overwrite', () => {
-    // DETERMINISTIC proof of the claim-transaction contention path the
-    // single-threaded Promise.all test cannot exercise: simulate a competing
-    // claimer that committed its 'running' row AFTER this run passed step-0 but
-    // BEFORE its own claim. claimRun's BEGIN IMMEDIATE re-check must see it,
-    // ROLLBACK, and return false — never a second row (the singleton row is
-    // preserved verbatim).
-    const { h } = mkFixture()
-    h.prepare("INSERT INTO attribution_reeval_runs (singleton_key, status, window_floor, window_ceiling) VALUES (1, 'running', ?, ?)").run(FLOOR, CEILING)
-    const existing = runRow(h)
-    const ok = claimRun(h, FLOOR, CEILING)
-    expect(ok).toBe(false)
-    expect(countRuns(h)).toBe(1)
-    expect(runRow(h)).toEqual(existing) // untouched — no overwrite
-  })
+    const spawnReeval = (): Promise<{ code: number | null; out: string }> =>
+      new Promise((resolve) => {
+        const cp = spawn('bun', [runnerPath, dbPath], { stdio: ['ignore', 'pipe', 'pipe'] })
+        let out = ''
+        cp.stdout.on('data', (d) => { out += String(d) })
+        cp.on('close', (code) => resolve({ code, out: out.trim() }))
+      })
 
-  test('claimRun on a clean DB inserts exactly one running row and commits (no open txn left)', () => {
-    const { h } = mkFixture()
-    const ok = claimRun(h, FLOOR, CEILING)
-    expect(ok).toBe(true)
-    expect(countRuns(h)).toBe(1)
-    expect(runRow(h).status).toBe('running')
-    // Transaction is closed — a subsequent write on the same handle succeeds
-    // immediately (would throw "cannot start a transaction within a transaction"
-    // or block if claimRun left one open).
-    expect(() => h.prepare('BEGIN IMMEDIATE').run()).not.toThrow()
-    h.prepare('COMMIT').run()
-  })
+    // Start BOTH before awaiting -> genuine OS-level concurrency on the DB file.
+    const [ra, rb] = await Promise.all([spawnReeval(), spawnReeval()])
+    const statuses = [ra, rb]
+      .map((r) => {
+        try { return String(JSON.parse(r.out).status) } catch { return 'parse-error:' + r.out }
+      })
+      .sort()
+
+    // Neither process errored; EXACTLY ONE proceeded to complete; the other did
+    // NOT scan (short-circuited on the committed run row, or lost the claim).
+    expect(statuses).not.toContain('error')
+    expect(statuses.filter((s) => s === 'complete').length).toBe(1)
+    const loser = statuses.find((s) => s !== 'complete')
+    expect(loser === 'skipped_existing_run' || loser === 'refused').toBe(true)
+
+    // DB invariants: exactly one claim row + exactly one decision_reeval row.
+    const checkDb = new TaskDB(dbPath)
+    dbs.push(checkDb)
+    expect(countRuns(checkDb.getHandle())).toBe(1)
+    expect(reevalRows(checkDb.getHandle(), dec).length).toBe(1)
+  }, 30000)
 })
 
 // ===========================================================================
@@ -634,6 +651,15 @@ describe('ATM-029: registry is a required explicit param; no loader import; impo
     // Strip comments — the constraint is about CODE, not the header comment that
     // documents WHY the loader is deliberately absent.
     const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+
+    // EVERY import statement in this module MUST be a named import (`import {` or
+    // `import type {`). Namespace (`import * as X from`), default (`import X from`),
+    // and side-effect (`import '...'`) forms are FORBIDDEN — codex iter2: the
+    // named-import allowlist parser below only sees `{ ... }` blocks, so any other
+    // import form could smuggle in an extra value binding undetected.
+    for (const head of code.match(/^\s*import\b[^\n]*/gm) || []) {
+      expect(/^\s*import\s+(?:type\s+)?\{/.test(head)).toBe(true)
+    }
 
     // Parse every `import { ... } from '...'` declaration; collect the VALUE
     // symbols (skip whole `import type {...}` blocks AND per-specifier `type`

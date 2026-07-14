@@ -1717,8 +1717,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               // BEFORE the agent-label path — precedence: explicit critic_model_id
               // arg > AGENT_MODEL_ID > EPIC-02 agent registry. Producer-side is out
               // of scope (a critic cannot know the producer's model), so
-              // producerFamily below is unchanged.
-              const effectiveCriticModelId = criticModelId ?? resolveCallerModelId()
+              // producerFamily below is unchanged. The AGENT_MODEL_ID adoption is
+              // gated on cross_family_attribution_enabled too (REQ-006): with the
+              // flag OFF the OFF path stays byte-identical to pre-T3 even when
+              // AGENT_MODEL_ID is set.
+              const effectiveCriticModelId =
+                criticModelId ??
+                (db.isFeatureEnabled('cross_family_attribution_enabled') ? resolveCallerModelId() : undefined)
               const producerFamily = producerModelId
                 ? resolveModelFamily(producerModelId)
                 : resolveAgentDefaultFamily(producerAgent, attributionRegistry)

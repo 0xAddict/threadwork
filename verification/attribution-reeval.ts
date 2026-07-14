@@ -73,9 +73,21 @@ interface _AttributionReevalTestSeams {
 }
 let _testSeams: _AttributionReevalTestSeams | null = null
 
-/** TEST-ONLY (never called from production): install/clear the re-eval test seams. */
+/** TEST-ONLY (never honored in production): install/clear the re-eval test seams. */
 export function __setAttributionReevalTestSeamsForTests(seams: _AttributionReevalTestSeams | null): void {
   _testSeams = seams
+}
+
+/**
+ * The seams are honored ONLY under `bun test` (which sets NODE_ENV='test').
+ * In production NODE_ENV is never 'test', so this returns null REGARDLESS of any
+ * __setAttributionReevalTestSeamsForTests call — persistTernaryReward is always
+ * the real helper and the completion timing is fixed. This makes the seam
+ * production-INERT: no importer can influence runAttributionReeval's behavior
+ * (codex iter2 P0).
+ */
+function _activeTestSeams(): _AttributionReevalTestSeams | null {
+  return process.env.NODE_ENV === 'test' ? _testSeams : null
 }
 
 export type AttributionReevalStatus = 'skipped_existing_run' | 'refused' | 'aborted' | 'complete'
@@ -122,6 +134,12 @@ function isFlagOn(db: Database, name: string): boolean {
 function isUniquenessConflict(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err)
   return /UNIQUE constraint failed/i.test(msg)
+}
+
+/** A concurrent writer holds the write lock (SQLite BUSY / locked). */
+function isBusy(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return /SQLITE_BUSY|database is locked|database table is locked/i.test(msg)
 }
 
 /**
@@ -209,7 +227,7 @@ export function recomputeDecisionCritiques(
  * on a lost re-check OR a singleton-uniqueness conflict (concurrent claim). The
  * transaction is CLOSED before any candidate read / persistTernaryReward call.
  */
-export function claimRun(db: Database, floor: string, ceiling: string): boolean {
+function claimRun(db: Database, floor: string, ceiling: string): boolean {
   db.prepare('BEGIN IMMEDIATE').run()
   try {
     const still = db.prepare('SELECT id FROM attribution_reeval_runs LIMIT 1').get()
@@ -228,7 +246,11 @@ export function claimRun(db: Database, floor: string, ceiling: string): boolean 
     } catch {
       // already rolled back / no active txn
     }
-    if (isUniquenessConflict(err)) return false
+    // Lost the claim under concurrency: a singleton-uniqueness conflict OR a
+    // write-lock contention (SQLITE_BUSY) from a simultaneous claimer — abort
+    // without scanning (REQ-024/025; the spec's "fails the re-check or the
+    // singleton INSERT" concurrent-loser path).
+    if (isUniquenessConflict(err) || isBusy(err)) return false
     throw err
   }
 }
@@ -310,7 +332,7 @@ export function runAttributionReeval(db: Database, options: AttributionReevalOpt
 
   // Step 3: candidate scan — reward=0 subject_kind='decision' rows in
   // [windowFloor, windowCeiling) (floor-inclusive, ceiling-exclusive; REQ-033).
-  const persist = _testSeams?.persistOverride ?? persistTernaryReward
+  const persist = _activeTestSeams()?.persistOverride ?? persistTernaryReward
   const candidates = getTernaryRewards(db, { reward: 0, since: options.windowFloor }).filter(
     (r) => r.subject_kind === 'decision' && r.created_at < options.windowCeiling,
   )
@@ -384,7 +406,7 @@ export function runAttributionReeval(db: Database, options: AttributionReevalOpt
   }
 
   // TEST-ONLY seam (ATM-031): fires after the scan, before completion.
-  _testSeams?.afterScanBeforeComplete?.()
+  _activeTestSeams()?.afterScanBeforeComplete?.()
 
   // Step 4: completion — re-check BOTH flags atomically, then mark complete.
   if (!completeRun(db, rowsScanned, rowsReassessed, rowsSkipped)) {

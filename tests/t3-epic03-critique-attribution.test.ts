@@ -246,6 +246,40 @@ describe('ATM-009: critic_model_id fallback chain at critique_position (REQ-010/
   )
 
   test(
+    '(REQ-006 parity) attribution flag OFF + AGENT_MODEL_ID set -> critic stays unknown (adoption is flag-gated, byte-identical to pre-T3)',
+    async () => {
+      // Regression for the codex iter2 finding: the AGENT_MODEL_ID adoption must
+      // be gated on cross_family_attribution_enabled, so a set AGENT_MODEL_ID must
+      // NOT shift attribution while the flag is OFF.
+      const tmpHome = mkTmpHome()
+      const { dbPath, decisionId } = seedFixture(tmpHome, {
+        critiqueFlagOn: true,
+        attributionFlagOn: false, // OFF
+        openedBy: 'steve',
+      })
+      const client = await connectServer(tmpHome, 'boss', 'gpt-5.5') // AGENT_MODEL_ID set
+
+      const result: any = await client.callTool({
+        name: 'critique_position',
+        arguments: {
+          decision_id: decisionId,
+          critique: 'flag-off + AGENT_MODEL_ID must stay unknown',
+          severity: 'blocker',
+        },
+      })
+      expect(result.isError).toBeFalsy()
+
+      const rows = readCrossFamilyRow(dbPath, decisionId)
+      expect(rows.length).toBe(1)
+      // Flag OFF -> resolveCallerModelId is NOT consulted -> agent path -> 'unknown'
+      // (NOT 'openai'). Byte-identical to the pre-T3 baseline.
+      expect(rows[0].critic_family).toBe('unknown')
+      expect(rows[0].producer_family).toBe('unknown')
+      expect(rows[0].is_cross_family).toBe(0)
+    },
+  )
+
+  test(
     '(c) neither explicit arg nor AGENT_MODEL_ID -> falls through to the EPIC-02 registry/agent path unchanged',
     async () => {
       const tmpHome = mkTmpHome()
