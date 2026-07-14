@@ -54,16 +54,28 @@ export interface AttributionReevalOptions {
   /** REQ-028: hard-required operator attestation that no in-window critique
    *  carried an explicit producer/critic model id. */
   attestNoExplicitModelIds: boolean
-  /**
-   * TEST-ONLY seams — undefined in production. `persistOverride` substitutes the
-   * persist helper (ATM-030 null-return injection); `afterScanBeforeComplete`
-   * fires between the candidate scan and the completion transaction (ATM-031
-   * mid-run flag-flip). Neither is reachable on any production call path.
-   */
-  __test?: {
-    persistOverride?: (db: Database, record: TernaryRewardRecord) => number | null
-    afterScanBeforeComplete?: () => void
-  }
+}
+
+// ---------------------------------------------------------------------------
+// TEST-ONLY seams. DELIBERATELY NOT part of AttributionReevalOptions — the
+// public runAttributionReeval(db, options) contract carries ZERO test hooks, so
+// no production CALLER can influence persistence or completion timing by
+// constructing options (codex iter1 P0). A test installs these via
+// __setAttributionReevalTestSeamsForTests and MUST reset them afterward. This
+// mirrors the codebase's established test-only-export convention
+// (agent-family-registry.ts's __resetAgentFamilyRegistryCacheForTests).
+// ---------------------------------------------------------------------------
+interface _AttributionReevalTestSeams {
+  /** ATM-030: substitute the persist helper (e.g. force a null return). */
+  persistOverride?: (db: Database, record: TernaryRewardRecord) => number | null
+  /** ATM-031: fires between the candidate scan and the completion transaction. */
+  afterScanBeforeComplete?: () => void
+}
+let _testSeams: _AttributionReevalTestSeams | null = null
+
+/** TEST-ONLY (never called from production): install/clear the re-eval test seams. */
+export function __setAttributionReevalTestSeamsForTests(seams: _AttributionReevalTestSeams | null): void {
+  _testSeams = seams
 }
 
 export type AttributionReevalStatus = 'skipped_existing_run' | 'refused' | 'aborted' | 'complete'
@@ -197,7 +209,7 @@ export function recomputeDecisionCritiques(
  * on a lost re-check OR a singleton-uniqueness conflict (concurrent claim). The
  * transaction is CLOSED before any candidate read / persistTernaryReward call.
  */
-function claimRun(db: Database, floor: string, ceiling: string): boolean {
+export function claimRun(db: Database, floor: string, ceiling: string): boolean {
   db.prepare('BEGIN IMMEDIATE').run()
   try {
     const still = db.prepare('SELECT id FROM attribution_reeval_runs LIMIT 1').get()
@@ -298,7 +310,7 @@ export function runAttributionReeval(db: Database, options: AttributionReevalOpt
 
   // Step 3: candidate scan — reward=0 subject_kind='decision' rows in
   // [windowFloor, windowCeiling) (floor-inclusive, ceiling-exclusive; REQ-033).
-  const persist = options.__test?.persistOverride ?? persistTernaryReward
+  const persist = _testSeams?.persistOverride ?? persistTernaryReward
   const candidates = getTernaryRewards(db, { reward: 0, since: options.windowFloor }).filter(
     (r) => r.subject_kind === 'decision' && r.created_at < options.windowCeiling,
   )
@@ -372,7 +384,7 @@ export function runAttributionReeval(db: Database, options: AttributionReevalOpt
   }
 
   // TEST-ONLY seam (ATM-031): fires after the scan, before completion.
-  options.__test?.afterScanBeforeComplete?.()
+  _testSeams?.afterScanBeforeComplete?.()
 
   // Step 4: completion — re-check BOTH flags atomically, then mark complete.
   if (!completeRun(db, rowsScanned, rowsReassessed, rowsSkipped)) {

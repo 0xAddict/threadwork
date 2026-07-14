@@ -20,6 +20,8 @@ import {
   runAttributionReeval,
   isCanonicalSqliteDatetime,
   recomputeDecisionCritiques,
+  claimRun,
+  __setAttributionReevalTestSeamsForTests,
   type AttributionReevalOptions,
 } from '../verification/attribution-reeval'
 import { persistTernaryReward } from '../verification/ternary-reward'
@@ -58,6 +60,7 @@ function mkFixture(opts: { attribution?: boolean; ternary?: boolean } = {}): { t
 }
 
 afterEach(() => {
+  __setAttributionReevalTestSeamsForTests(null) // reset any installed test seam
   for (const db of dbs.splice(0)) {
     try { db.close() } catch { /* already closed */ }
   }
@@ -368,13 +371,21 @@ describe('ATM-018: both-flags gate refuses with zero writes (REQ-021)', () => {
     ['ternary OFF', true, false],
     ['both OFF', false, false],
   ] as const) {
-    test(`${name} -> refused, no claim row, no reeval row`, () => {
+    test(`${name} -> refused, ZERO writes to ternary_rewards / cross_family_critiques / attribution_reeval_runs`, () => {
       const { h } = mkFixture({ attribution, ternary })
       const dec = seedDecisiveCandidate(h)
+      // Full-content snapshots of every table the re-eval could touch.
+      const trBefore = h.prepare('SELECT * FROM ternary_rewards ORDER BY id').all()
+      const cfBefore = h.prepare('SELECT * FROM cross_family_critiques ORDER BY id').all()
+
       const res = runAttributionReeval(h, baseOpts())
       expect(res.status).toBe('refused')
+
+      // No claim row, and every table byte-identical to pre-run (no writes, no mutations).
       expect(countRuns(h)).toBe(0)
       expect(reevalRows(h, dec).length).toBe(0)
+      expect(h.prepare('SELECT * FROM ternary_rewards ORDER BY id').all()).toEqual(trBefore)
+      expect(h.prepare('SELECT * FROM cross_family_critiques ORDER BY id').all()).toEqual(cfBefore)
     })
   }
 })
@@ -449,6 +460,35 @@ describe('ATM-024: concurrent double invocation -> exactly one proceeds (REQ-024
     expect(countRuns(a.getHandle())).toBe(1)
     expect(reevalRows(a.getHandle(), dec).length).toBe(1)
   })
+
+  test('claimRun re-check: a row that appeared after step-0 (contended claim) -> false, no duplicate/overwrite', () => {
+    // DETERMINISTIC proof of the claim-transaction contention path the
+    // single-threaded Promise.all test cannot exercise: simulate a competing
+    // claimer that committed its 'running' row AFTER this run passed step-0 but
+    // BEFORE its own claim. claimRun's BEGIN IMMEDIATE re-check must see it,
+    // ROLLBACK, and return false — never a second row (the singleton row is
+    // preserved verbatim).
+    const { h } = mkFixture()
+    h.prepare("INSERT INTO attribution_reeval_runs (singleton_key, status, window_floor, window_ceiling) VALUES (1, 'running', ?, ?)").run(FLOOR, CEILING)
+    const existing = runRow(h)
+    const ok = claimRun(h, FLOOR, CEILING)
+    expect(ok).toBe(false)
+    expect(countRuns(h)).toBe(1)
+    expect(runRow(h)).toEqual(existing) // untouched — no overwrite
+  })
+
+  test('claimRun on a clean DB inserts exactly one running row and commits (no open txn left)', () => {
+    const { h } = mkFixture()
+    const ok = claimRun(h, FLOOR, CEILING)
+    expect(ok).toBe(true)
+    expect(countRuns(h)).toBe(1)
+    expect(runRow(h).status).toBe('running')
+    // Transaction is closed — a subsequent write on the same handle succeeds
+    // immediately (would throw "cannot start a transaction within a transaction"
+    // or block if claimRun left one open).
+    expect(() => h.prepare('BEGIN IMMEDIATE').run()).not.toThrow()
+    h.prepare('COMMIT').run()
+  })
 })
 
 // ===========================================================================
@@ -485,21 +525,19 @@ describe('ATM-026: mid-run uniqueness conflict for one decision is caught, skipp
     // race for X: it inserts the conflicting decision_reeval row, then delegates
     // to the REAL persistTernaryReward — which throws a genuine UNIQUE conflict.
     let injected = false
-    const opts = baseOpts({
-      __test: {
-        persistOverride: (db, record) => {
-          if (record.decision_id === decX && !injected) {
-            injected = true
-            db.prepare(
-              `INSERT INTO ternary_rewards (policy_version, decision_id, task_id, subject_kind, cross_family_verdict, failure_severity, failure_signal_available, reward, created_at)
-               VALUES (1, ?, NULL, 'decision_reeval', 'block', NULL, 1, -1, ?)`,
-            ).run(record.decision_id, IN_WINDOW)
-          }
-          return persistTernaryReward(db, record)
-        },
+    __setAttributionReevalTestSeamsForTests({
+      persistOverride: (db, record) => {
+        if (record.decision_id === decX && !injected) {
+          injected = true
+          db.prepare(
+            `INSERT INTO ternary_rewards (policy_version, decision_id, task_id, subject_kind, cross_family_verdict, failure_severity, failure_signal_available, reward, created_at)
+             VALUES (1, ?, NULL, 'decision_reeval', 'block', NULL, 1, -1, ?)`,
+          ).run(record.decision_id, IN_WINDOW)
+        }
+        return persistTernaryReward(db, record)
       },
     })
-    const res = runAttributionReeval(h, opts)
+    const res = runAttributionReeval(h, baseOpts())
     expect(res.status).toBe('complete')
     expect(res.rowsSkipped).toBeGreaterThanOrEqual(1) // X's conflict counted skipped
     // Y got exactly one reeval row; X has exactly one (the injected one, no dup).
@@ -524,13 +562,17 @@ describe('ATM-027: attestation/format/round-trip/ordering/ceiling refusal gates 
     ['(i) timezone-suffixed string', { windowFloor: '2026-07-08 00:00:00Z' }],
   ]
   for (const [name, over] of variants) {
-    test(`${name} -> refused, zero writes`, () => {
+    test(`${name} -> refused, zero writes AND zero candidate scan`, () => {
       const { h } = mkFixture()
       const dec = seedDecisiveCandidate(h)
-      const res = runAttributionReeval(h, baseOpts(over))
+      const { proxy, sql } = spyHandle(h)
+      const res = runAttributionReeval(proxy, baseOpts(over))
       expect(res.status).toBe('refused')
       expect(countRuns(h)).toBe(0)
       expect(reevalRows(h, dec).length).toBe(0)
+      // Refusal precedes ANY candidate scan (getTernaryRewards) and ANY claim INSERT.
+      expect(sql.some(s => /SELECT \* FROM ternary_rewards/i.test(s))).toBe(false)
+      expect(sql.some(s => /INSERT INTO attribution_reeval_runs/i.test(s))).toBe(false)
     })
   }
 
@@ -587,23 +629,45 @@ describe('ATM-029: registry is a required explicit param; no loader import; impo
     expect(reevalRows(h, dec)[0].reward).toBe(-1)
   })
 
-  test('static: no loader import; value imports == allowlist; persistTernaryReward is the only write helper', () => {
+  test('static: value-import declarations are EXACTLY the REQ-034 allowlist (parsed, not substring)', () => {
     const src = readFileSync(join(import.meta.dir, '..', 'verification', 'attribution-reeval.ts'), 'utf-8')
-    // Strip comments first — the constraint is about CODE (imports/usage), not
-    // the header comment that documents WHY the loader is deliberately absent.
+    // Strip comments — the constraint is about CODE, not the header comment that
+    // documents WHY the loader is deliberately absent.
     const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
-    // No import of the loader or its module in the code.
+
+    // Parse every `import { ... } from '...'` declaration; collect the VALUE
+    // symbols (skip whole `import type {...}` blocks AND per-specifier `type`
+    // modifiers) and the modules they come from.
+    const importRe = /import\s+(type\s+)?\{([^}]*)\}\s+from\s+['"]([^'"]+)['"]/g
+    const valueSymbols = new Set<string>()
+    const valueModules = new Set<string>()
+    let m: RegExpExecArray | null
+    while ((m = importRe.exec(code)) !== null) {
+      if (m[1]) continue // `import type { ... }` — entirely type-only
+      for (let spec of m[2].split(',')) {
+        spec = spec.trim()
+        if (!spec || spec.startsWith('type ')) continue // per-specifier type import
+        valueSymbols.add(spec.split(/\s+as\s+/)[0].trim())
+        valueModules.add(m[3])
+      }
+    }
+
+    // EXACT allowlist (REQ-034): the 6 read/pure symbols + persistTernaryReward
+    // (the sole write helper). No extras, none missing.
+    const EXPECTED = [
+      'aggregateCrossFamilyVerdict', 'assignTernaryReward', 'evaluateCrossFamily',
+      'getCrossFamilyCritiques', 'getTernaryRewards', 'persistTernaryReward',
+      'resolveAgentDefaultFamily',
+    ]
+    expect([...valueSymbols].sort()).toEqual(EXPECTED)
+    // Value imports come ONLY from the two permitted host modules.
+    expect([...valueModules].sort()).toEqual(['./cross-family-critique', './ternary-reward'])
+    // The loader / its module never appears in code (no import, no usage).
     expect(/loadAgentFamilyRegistry/.test(code)).toBe(false)
     expect(/agent-family-registry/.test(code)).toBe(false)
-    // No OTHER host-module write helper is imported.
+    // Defense-in-depth: no other host-module write helper anywhere in code.
     for (const forbidden of ['persistCrossFamilyCritique', 'persistFailureClassification', 'assessAndPersistTernaryRewardForDecision']) {
-      expect(src.includes(forbidden)).toBe(false)
-    }
-    // The permitted write helper IS imported.
-    expect(src.includes('persistTernaryReward')).toBe(true)
-    // Value-import allowlist: each expected read/pure symbol appears in a non-type import.
-    for (const sym of ['resolveAgentDefaultFamily', 'evaluateCrossFamily', 'getCrossFamilyCritiques', 'aggregateCrossFamilyVerdict', 'assignTernaryReward', 'getTernaryRewards']) {
-      expect(src.includes(sym)).toBe(true)
+      expect(code.includes(forbidden)).toBe(false)
     }
   })
 })
@@ -616,16 +680,16 @@ describe('ATM-030: persistTernaryReward null return aborts, claim stays running 
     const { h } = mkFixture()
     const decA = seedDecisiveCandidate(h, '2026-07-08 08:00:00')
     const decB = seedDecisiveCandidate(h, '2026-07-08 09:00:00')
-    const opts = baseOpts({
-      __test: { persistOverride: () => null }, // every persist returns null
-    })
-    const res = runAttributionReeval(h, opts)
+    __setAttributionReevalTestSeamsForTests({ persistOverride: () => null }) // every persist returns null
+    const res = runAttributionReeval(h, baseOpts())
     expect(res.status).toBe('aborted')
     // The claim row remains 'running' (never flips to complete).
     expect(runRow(h).status).toBe('running')
     // No decision_reeval rows landed (the override never persists).
     expect(reevalRows(h).length).toBe(0)
-    // Aborted on the FIRST candidate — the second was never processed.
+    // Aborted on the FIRST candidate — the second was NEVER processed: exactly
+    // one candidate scanned, zero reassessed (proves the loop stopped).
+    expect(res.rowsScanned).toBe(1)
     expect(res.rowsReassessed).toBe(0)
     void decA; void decB
   })
@@ -639,10 +703,8 @@ describe('ATM-031: flag OFF before the completion txn aborts, claim stays runnin
     test(`flip ${flag} OFF after scan, before completion -> no complete marker`, () => {
       const { h, taskDb } = mkFixture()
       const dec = seedDecisiveCandidate(h)
-      const opts = baseOpts({
-        __test: { afterScanBeforeComplete: () => taskDb.setFeatureFlag(flag, false) },
-      })
-      const res = runAttributionReeval(h, opts)
+      __setAttributionReevalTestSeamsForTests({ afterScanBeforeComplete: () => taskDb.setFeatureFlag(flag, false) })
+      const res = runAttributionReeval(h, baseOpts())
       expect(res.status).toBe('aborted')
       expect(runRow(h).status).toBe('running')
       // The reeval row WAS persisted during the scan (that is fine — append-only);
@@ -660,11 +722,8 @@ describe('ATM-031: flag OFF before the completion txn aborts, claim stays runnin
     insertCrossFamily(h, { decisionId: decId, critiqueId: critId, createdAt: IN_WINDOW })
     insertTernary(h, { decisionId: decId, subjectKind: 'decision', reward: 0, createdAt: IN_WINDOW })
     const sameFamilyRegistry = Object.freeze({ steve: 'anthropic', boss: 'anthropic' }) as Readonly<Record<string, any>>
-    const opts = baseOpts({
-      registry: sameFamilyRegistry,
-      __test: { afterScanBeforeComplete: () => taskDb.setFeatureFlag('ternary_reward_enabled', false) },
-    })
-    const res = runAttributionReeval(h, opts)
+    __setAttributionReevalTestSeamsForTests({ afterScanBeforeComplete: () => taskDb.setFeatureFlag('ternary_reward_enabled', false) })
+    const res = runAttributionReeval(h, baseOpts({ registry: sameFamilyRegistry }))
     expect(res.status).toBe('aborted')
     expect(runRow(h).status).toBe('running')
     expect(reevalRows(h).length).toBe(0) // nothing decisive was ever persisted
