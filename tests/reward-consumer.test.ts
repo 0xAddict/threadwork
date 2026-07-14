@@ -1013,3 +1013,117 @@ describe('ATM-025: concurrent-invocation exactly-once (REQ-024/031/008)', () => 
     expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(r3)
   })
 })
+
+// ---------------------------------------------------------------------------
+// ATM-030 / REQ-034, REQ-030, REQ-028, REQ-035 [P1] — stale-takeover-while-
+// mid-row double-apply bound (the KO-4 hung-holder residual).
+// ---------------------------------------------------------------------------
+describe('ATM-030: stale takeover mid-row → duplicate bounded to that ONE row (REQ-034/030/028/035)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm030.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-030: A hung mid-row-N (between its two decayMemory calls) → B takes over; duplicate bounded to row N, all other rows once, A aborts leaseLost', () => {
+    // Row N resolves to TWO memories; a distinct row M resolves to one.
+    const memN1 = seedMemory(mem, { importance: 2, sourceTaskId: 400 })
+    const memN2 = seedMemory(mem, { importance: 2, sourceTaskId: 400 }) // same source_task → same reward row N
+    const rN = seedReward(taskDb, { reward: 1, taskId: 400 }) // id 1
+    const memM = seedMemory(mem, { importance: 2, sourceTaskId: 401 })
+    const rM = seedReward(taskDb, { reward: 1, taskId: 401 }) // id 2
+
+    const realDecay = MemoryDB.prototype.decayMemory
+    let firstCall = true
+    const decaySpy = spyOn(mem, 'decayMemory').mockImplementation((id: number, ni: number) => {
+      realDecay.call(mem, id, ni) // apply the real mutation
+      if (firstCall) {
+        firstCall = false
+        // A is now MID-ROW-N (memN1 already mutated). Simulate A hanging past
+        // CLAIM_LEASE_MS (renewal suppressed) so B can take over the lease.
+        taskDb.run((db) =>
+          db
+            .prepare("UPDATE reward_consumption_cursor SET claimed_at = '2020-01-01 00:00:00' WHERE consumer = 'memory_importance'")
+            .run(),
+        )
+        // B takes over the expired lease and processes the FULL pending set.
+        consumePendingRewards(taskDb, mem)
+      }
+    })
+
+    const aResult = consumePendingRewards(taskDb, mem)
+    // Capture recorded call targets BEFORE mockRestore (which resets mock.calls).
+    const decayTargets = decaySpy.mock.calls.map((c) => c[0] as number)
+    decaySpy.mockRestore()
+
+    // A's next per-row boundary (row N's renewal-first advance) saw the lost lease.
+    expect(aResult.leaseLost).toBe(true)
+
+    const callsFor = (id: number) => decayTargets.filter((t) => t === id).length
+    // Duplicate exposure is bounded to row N's two memories only.
+    expect(callsFor(memN1)).toBe(2)
+    expect(callsFor(memN2)).toBe(2)
+    // Every row OTHER than N was applied exactly once (across A + B).
+    expect(callsFor(memM)).toBe(1)
+    expect(importanceOf(taskDb, memM)).toBe(3)
+    // Final cursor equals the max pending id (advanced by B) — never regressed by A.
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rM)
+    // Row N's memories are double-applied but still clamped within [IMPORTANCE_MIN, IMPORTANCE_MAX].
+    for (const id of [memN1, memN2]) {
+      const v = importanceOf(taskDb, id)
+      expect(v).toBeGreaterThanOrEqual(IMPORTANCE_MIN)
+      expect(v).toBeLessThanOrEqual(IMPORTANCE_MAX)
+    }
+    expect(rN).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-005 / REQ-005 [P2] — batch-limit bound + incremental drain
+// ---------------------------------------------------------------------------
+describe('ATM-005: batch-limit drain (REQ-005)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm005.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-005: BATCH_LIMIT+50 rows → first run processes exactly BATCH_LIMIT (cursor at the limit-th id), second run drains 50', () => {
+    const total = REWARD_CONSUMER_BATCH_LIMIT + 50
+    const ids: number[] = []
+    for (let i = 0; i < total; i++) ids.push(seedReward(taskDb, { reward: 0 }))
+
+    const first = consumePendingRewards(taskDb, mem)
+    expect(first.processed).toBe(REWARD_CONSUMER_BATCH_LIMIT)
+    // Cursor advanced to exactly the BATCH_LIMIT-th row's id — not further.
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(ids[REWARD_CONSUMER_BATCH_LIMIT - 1])
+
+    const second = consumePendingRewards(taskDb, mem)
+    expect(second.processed).toBe(50)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(ids[total - 1])
+
+    // A third run has nothing left to drain.
+    const third = consumePendingRewards(taskDb, mem)
+    expect(third.processed).toBe(0)
+  })
+})
