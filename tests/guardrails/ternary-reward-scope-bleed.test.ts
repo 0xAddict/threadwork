@@ -95,10 +95,29 @@ describe('ATM-029: zero-scope-bleed guardrail (REQ-020)', () => {
     expect(deletionsOf(numstat)).toBe(0)
   })
 
-  test('ATM-029: server.ts has ZERO deletions since build base (purely additive)', () => {
+  // T3 PK-T3-3 INTERIM (boss RULING #2, cross-lane authorized; BANKED for
+  // CHECKPOINT #2 P8-lane semantic review): EPIC-02's REQUIRED registry injection
+  // adds a 2nd arg to two existing resolveAgentDefaultFamily calls — an inherent
+  // in-place edit the blunt deletionsOf()===0 rule wrongly rejected. Mirror the
+  // typecheck-ko-t3.sh guard: assert only that none of the 3 pristine tsc
+  // baseline-error server.ts lines is among the deletions since build base (the
+  // real baseline-swap risk), permitting benign in-place edits elsewhere.
+  test('ATM-029: server.ts baseline-error lines preserved since build base (in-place edits allowed; no baseline-error-line swap) [T3-interim]', () => {
     const numstat = gitNumstat('server.ts')
-    expect(numstat).not.toBe('') // P8 DID additively edit server.ts (the finalize hook)
-    expect(deletionsOf(numstat)).toBe(0)
+    expect(numstat).not.toBe('') // server.ts IS edited since base (P8 finalize hook + T3 EPIC-02 injection)
+    const deleted = execSync(`git diff ${BASE_COMMIT} -- server.ts`, { cwd: REPO, encoding: 'utf-8' })
+      .split('\n')
+      .filter((l) => l.startsWith('-') && !l.startsWith('---'))
+      .map((l) => l.slice(1))
+    // Derive the 3 baseline-error line contents (byte-exact, full indentation)
+    // from the base commit via stable unique substrings (tsc TS2345 x2 + TS2353).
+    const pristine = execSync(`git show ${BASE_COMMIT}:server.ts`, { cwd: REPO, encoding: 'utf-8' }).split('\n')
+    const SIGNATURES = ['getCircuitState(task.to_agent)', 'closeCircuit(task.to_agent)', 'addendum: isAddendum']
+    for (const sig of SIGNATURES) {
+      const errLine = pristine.find((l) => l.includes(sig))
+      expect(errLine).toBeDefined()
+      expect(deleted).not.toContain(errLine as string)
+    }
   })
 
   const DB_SOURCE = readFileSync(resolve(REPO, 'db.ts'), 'utf-8')

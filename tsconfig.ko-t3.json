@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "esnext",
+    "lib": ["esnext", "dom"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "typeRoots": ["./.typeroots"],
+    "types": ["bun-types", "node"]
+  },
+  "include": [
+    "types/bun-sqlite-widen.d.ts",
+    "verification/cross-family-critique.ts",
+    "verification/failure-classification.ts",
+    "verification/agent-family-registry.ts",
+    "verification/critique-attribution.ts",
+    "verification/ternary-reward.ts",
+    "verification/attribution-reeval.ts",
+    "scripts/t3-attribution-distribution.ts",
+    "decision.ts",
+    "db.ts",
+    "server.ts",
+    "tests/agent-family-registry.test.ts",
+    "tests/t3-epic02-critique-position-attribution.test.ts",
+    "tests/t3-epic03-critique-attribution.test.ts",
+    "tests/t3-epic05-attribution-reeval.test.ts",
+    "tests/t3-epic06-activation.test.ts",
+    "tests/guardrails/t3-cross-family-critique-scope-bleed.test.ts",
+    "tests/guardrails/t3-epic03-decision-scope-bleed.test.ts",
+    "tests/guardrails/t3-production-diff-allowlist.test.ts"
+  ]
+}
