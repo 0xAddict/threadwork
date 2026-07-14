@@ -636,6 +636,12 @@ export class TaskDB {
     // a scaffold stub in this stage); the Phase-5 consolidator call site and
     // full consume/lease/advance logic land in a later packet.
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('reward_consumer_enabled', 0)")
+    // T1 KO-SWEEP (#10376215, REQ-012/ATM-011): generalized retention/prune.
+    // DEFAULT OFF — the runHygiene() Step-6 prune path is flag-gated and inert
+    // until this flag is turned ON. All 3 append-only tables
+    // (failure_classifications, cross_family_critiques, ternary_rewards) ride
+    // this ONE flag. While OFF, runHygiene() is byte-identical to pre-T1 (REQ-003).
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('retention_prune_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
@@ -1245,6 +1251,31 @@ export class TaskDB {
     this.db.exec(
       "INSERT OR IGNORE INTO reward_consumption_cursor (consumer, last_consumed_reward_id) VALUES ('memory_importance', 0)",
     )
+    // T1 KO-SWEEP (#10376215, REQ-005/ATM-005): archive companion for the ONE
+    // table pruned via archive-then-delete (ternary_rewards). Mirrors the
+    // memory_archive base-DDL shape (db.ts:219-231): same base columns as
+    // ternary_rewards, but `id` is a plain PRIMARY KEY (the original id is
+    // preserved on copy — no AUTOINCREMENT) and `created_at` drops its
+    // datetime('now') default (the original value is copied verbatim by the
+    // explicit-column-list INSERT in PK-T1-3/ATM-006), plus `archived_at`.
+    // Additive-only; unused until retention_prune_enabled is ON (REQ-003).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ternary_rewards_archive (
+        id INTEGER PRIMARY KEY,
+        policy_version INTEGER NOT NULL,
+        decision_id INTEGER REFERENCES decisions(id),
+        task_id INTEGER,
+        subject_kind TEXT NOT NULL,
+        cross_family_verdict TEXT,
+        failure_severity TEXT,
+        failure_signal_available INTEGER NOT NULL,
+        reward INTEGER NOT NULL CHECK(reward IN (-1,0,1)),
+        created_at TEXT NOT NULL,
+        archived_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ternary_rewards_archive_archived_at ON ternary_rewards_archive(archived_at);
+    `)
   }
 
   createTask(input: CreateTaskInput): Task {
