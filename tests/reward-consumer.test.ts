@@ -16,7 +16,7 @@
 // sibling `tests/consolidator-reward-hook.test.ts` — do NOT add assertions
 // for consume/lease/advance/linkage logic here yet.
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { TaskDB } from '../db'
@@ -410,5 +410,155 @@ describe('ATM-010: module doc-comment states the T1 prune contract verbatim (REQ
     expect(MODULE_SOURCE).toMatch(/SAFETY ARGUMENT/)
     expect(MODULE_SOURCE).toMatch(/monotonically/)
     expect(MODULE_SOURCE).toMatch(/consumed by every registered consumer/)
+  })
+})
+
+// ===========================================================================
+// PK-T4-3 (EPIC-02 exactly-once core) — shared helpers.
+// ===========================================================================
+
+/** Insert one pending ternary_rewards row; returns its id. */
+function seedReward(
+  taskDb: TaskDB,
+  opts: { reward: -1 | 0 | 1; taskId?: number | null; decisionId?: number | null },
+): number {
+  return taskDb.run((db) => {
+    db.prepare(
+      `INSERT INTO ternary_rewards
+         (policy_version, decision_id, task_id, subject_kind, cross_family_verdict,
+          failure_severity, failure_signal_available, reward, created_at)
+       VALUES (1, ?, ?, 'decision', NULL, NULL, 1, ?, datetime('now'))`,
+    ).run(opts.decisionId ?? null, opts.taskId ?? null, opts.reward)
+    return (db.prepare('SELECT last_insert_rowid() AS id').get() as { id: number }).id
+  })
+}
+
+/** saveMemory a fact with an optional source_task_id; returns its id. */
+function seedMemory(mem: MemoryDB, opts: { importance: number; sourceTaskId?: number; content?: string }): number {
+  const saved = mem.saveMemory({
+    agent: 'boss',
+    content: opts.content ?? `m-${Math.random().toString(36).slice(2)}`,
+    category: 'fact',
+    importance: opts.importance,
+    source_task_id: opts.sourceTaskId,
+  })
+  return saved.id
+}
+
+function importanceOf(taskDb: TaskDB, id: number): number {
+  return taskDb.run(
+    (db) => (db.prepare('SELECT importance FROM memories WHERE id = ?').get(id) as { importance: number }).importance,
+  )
+}
+
+type FullCursorRow = {
+  consumer: string
+  last_consumed_reward_id: number
+  claimed_by: string | null
+  claimed_at: string | null
+  updated_at: string
+}
+
+function cursorRow(taskDb: TaskDB): FullCursorRow | null {
+  return taskDb.run(
+    (db) => db.prepare("SELECT * FROM reward_consumption_cursor WHERE consumer = 'memory_importance'").get() as
+      | FullCursorRow
+      | null,
+  )
+}
+
+function setLease(taskDb: TaskDB, claimedBy: string | null, claimedAtSql: string): void {
+  // claimedAtSql is a SQL expression, e.g. "datetime('now')" or "'2020-01-01 00:00:00'".
+  taskDb.run((db) =>
+    db
+      .prepare(
+        `UPDATE reward_consumption_cursor SET claimed_by = ?, claimed_at = ${claimedAtSql} WHERE consumer = 'memory_importance'`,
+      )
+      .run(claimedBy),
+  )
+}
+
+function auditCount(taskDb: TaskDB, action: string): number {
+  return taskDb.run(
+    (db) => (db.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE action = ?').get(action) as { n: number }).n,
+  )
+}
+
+/** Records the SQL text of every db.prepare() call in order; returns {calls, restore}. */
+function spyPrepare(taskDb: TaskDB): { calls: string[]; restore: () => void } {
+  const db = taskDb.getHandle() as any
+  const orig = db.prepare.bind(db)
+  const calls: string[] = []
+  db.prepare = (sql: string) => {
+    calls.push(sql)
+    return orig(sql)
+  }
+  return { calls, restore: () => { db.prepare = orig } }
+}
+
+// ---------------------------------------------------------------------------
+// ATM-027 / REQ-032 [P1] — fail-closed on batch-start missing cursor row
+// ---------------------------------------------------------------------------
+describe('ATM-027: fail-closed on batch-start missing cursor row (REQ-032)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm027.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-027: deleted cursor row → zero mutations, no recreate, cursorMissing, one error audit row, in-txn existence read', () => {
+    const memId = seedMemory(mem, { importance: 2, sourceTaskId: 77 })
+    seedReward(taskDb, { reward: 1, taskId: 77 })
+    // Integrity anomaly: the seed cursor row is gone.
+    taskDb.run((db) => db.prepare("DELETE FROM reward_consumption_cursor WHERE consumer = 'memory_importance'").run())
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const sp = spyPrepare(taskDb)
+    const result = consumePendingRewards(taskDb, mem)
+    sp.restore()
+
+    // FAIL CLOSED.
+    expect(result.cursorMissing).toBe(true)
+    expect(result.processed).toBe(0)
+    expect(decaySpy).toHaveBeenCalledTimes(0)
+    // The row is NOT recreated (no silent reprocess-from-0).
+    expect(cursorRow(taskDb)).toBeNull()
+    // The memory the reward would have nudged is untouched.
+    expect(importanceOf(taskDb, memId)).toBe(2)
+    // Exactly one error audit row, naming the missing cursor row.
+    expect(auditCount(taskDb, 'reward_consumer_error')).toBe(1)
+    const detail = taskDb.run(
+      (db) =>
+        (db.prepare("SELECT detail FROM audit_log WHERE action = 'reward_consumer_error'").get() as { detail: string })
+          .detail,
+    )
+    expect(detail).toContain('memory_importance')
+    expect(detail).toContain('missing')
+
+    // REQ-024 in-txn snapshot: existence read is between the lease UPDATE and the claim-txn COMMIT.
+    const iBegin = sp.calls.findIndex((s) => /BEGIN IMMEDIATE/.test(s))
+    const iUpdate = sp.calls.findIndex((s) => /UPDATE reward_consumption_cursor/.test(s) && /claimed_by = \?/.test(s))
+    const iExists = sp.calls.findIndex((s) => /SELECT 1 AS present/.test(s))
+    const iCommit = sp.calls.findIndex((s) => /COMMIT/.test(s))
+    expect(iBegin).toBeGreaterThanOrEqual(0)
+    expect(iUpdate).toBeGreaterThan(iBegin)
+    expect(iExists).toBeGreaterThan(iUpdate)
+    expect(iCommit).toBeGreaterThan(iExists)
+  })
+
+  test('ATM-027: fail-closed returns cleanly (never throws)', () => {
+    seedReward(taskDb, { reward: 1, taskId: 5 })
+    taskDb.run((db) => db.prepare("DELETE FROM reward_consumption_cursor WHERE consumer = 'memory_importance'").run())
+    expect(() => consumePendingRewards(taskDb, mem)).not.toThrow()
   })
 })
