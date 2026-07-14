@@ -907,3 +907,109 @@ describe('ATM-031: pre-mutation own-lease gate blocks a resumed stale holder (RE
     expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rM)
   })
 })
+
+// ---------------------------------------------------------------------------
+// ATM-009 / REQ-009 [P1] — idempotent no-op replay (normal, non-crash path)
+// ---------------------------------------------------------------------------
+describe('ATM-009: idempotent no-op replay (REQ-009)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm009.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-009: re-running with no new rows → processed 0, zero decayMemory calls, snapshot + cursor + updated_at unchanged, lease NULL', () => {
+    const memId = seedMemory(mem, { importance: 2, sourceTaskId: 9 })
+    const rid = seedReward(taskDb, { reward: 1, taskId: 9 })
+
+    const first = consumePendingRewards(taskDb, mem)
+    expect(first.processed).toBe(1)
+    expect(importanceOf(taskDb, memId)).toBe(3)
+    const rowAfterFirst = cursorRow(taskDb)!
+    expect(rowAfterFirst.last_consumed_reward_id).toBe(rid)
+    expect(rowAfterFirst.claimed_by).toBeNull()
+
+    // Replay with no new rows inserted.
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const second = consumePendingRewards(taskDb, mem)
+
+    expect(second.processed).toBe(0)
+    expect(decaySpy).toHaveBeenCalledTimes(0)
+    expect(importanceOf(taskDb, memId)).toBe(3) // snapshot unchanged
+    const rowAfterSecond = cursorRow(taskDb)!
+    expect(rowAfterSecond.last_consumed_reward_id).toBe(rid) // unchanged
+    expect(rowAfterSecond.updated_at).toBe(rowAfterFirst.updated_at) // no upsert → updated_at unchanged
+    // Lease transiently acquired+released, ending NULL as it began.
+    expect(rowAfterSecond.claimed_by).toBeNull()
+    expect(rowAfterSecond.claimed_at).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-025 / REQ-024, REQ-031, REQ-008 [P1] — concurrent exactly-once proof
+// ---------------------------------------------------------------------------
+describe('ATM-025: concurrent-invocation exactly-once (REQ-024/031/008)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm025.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-025: a concurrent B fired inside A’s seam is lease-blocked → deltas applied once, cursor=max, never regresses, exactly one skippedLocked', () => {
+    const m1 = seedMemory(mem, { importance: 2, sourceTaskId: 301 })
+    const m2 = seedMemory(mem, { importance: 2, sourceTaskId: 302 })
+    const m3 = seedMemory(mem, { importance: 2, sourceTaskId: 303 })
+    seedReward(taskDb, { reward: 1, taskId: 301 })
+    seedReward(taskDb, { reward: 1, taskId: 302 })
+    const r3 = seedReward(taskDb, { reward: 1, taskId: 303 })
+
+    const observedCursors: number[] = []
+    let bResult: RewardConsumptionResult | undefined
+    let bFired = false
+
+    const aResult = consumePendingRewards(taskDb, mem, {
+      onRowConsumed: () => {
+        observedCursors.push(getRewardConsumptionCursor(taskDb.getHandle()))
+        // Fire a truly concurrent B ONCE, while A still holds a live lease.
+        if (!bFired) {
+          bFired = true
+          bResult = consumePendingRewards(taskDb, mem)
+        }
+      },
+    })
+
+    expect(aResult.processed).toBe(3)
+    // Exactly one invocation is lease-blocked.
+    expect(bResult!.skippedLocked).toBe(true)
+    expect(bResult!.processed).toBe(0)
+    // Cursor never observed to regress at any seam checkpoint.
+    for (let i = 1; i < observedCursors.length; i++) {
+      expect(observedCursors[i] >= observedCursors[i - 1]).toBe(true)
+    }
+    // Every reward row's delta applied exactly once across both invocations.
+    expect(importanceOf(taskDb, m1)).toBe(3)
+    expect(importanceOf(taskDb, m2)).toBe(3)
+    expect(importanceOf(taskDb, m3)).toBe(3)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(r3)
+  })
+})
