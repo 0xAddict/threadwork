@@ -685,3 +685,225 @@ describe('ATM-026: lease lifecycle — acquire / blocked / guarded release / exp
     expect(cursorRow(taskDb)!.claimed_by).toBe('successor-B')
   })
 })
+
+// ---------------------------------------------------------------------------
+// ATM-008 / REQ-008, REQ-028, REQ-034 [P1] — per-row monotonic-upsert advance,
+// renewal-first ordering, MAX() never-regress, per-row lease renewal,
+// mid-batch cursor-row-deletion abort.
+// ---------------------------------------------------------------------------
+describe('ATM-008: per-row monotonic-upsert cursor advance + renewal-first + never-regress (REQ-008/028/034)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm008.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-008: 3 rows advance to N, N+1, N+2 in order; claimed_at non-decreasing per commit; final cursor = N+2', () => {
+    // Unlinked, neutral rewards → no gate, only the advance-txn renewal touches claimed_at.
+    const r1 = seedReward(taskDb, { reward: 0 })
+    const r2 = seedReward(taskDb, { reward: 0 })
+    const r3 = seedReward(taskDb, { reward: 0 })
+    expect([r1, r2, r3]).toEqual([1, 2, 3])
+
+    const observedCursors: number[] = []
+    const observedClaimedAts: string[] = []
+    const result = consumePendingRewards(taskDb, mem, {
+      onRowConsumed: () => {
+        observedCursors.push(getRewardConsumptionCursor(taskDb.getHandle()))
+        observedClaimedAts.push(cursorRow(taskDb)!.claimed_at as string)
+      },
+    })
+
+    expect(result.processed).toBe(3)
+    expect(observedCursors).toEqual([r1, r2, r3]) // strictly monotonic, no skip / double-advance
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(r3)
+    // claimed_at refreshed each commit (non-decreasing).
+    for (let i = 1; i < observedClaimedAts.length; i++) {
+      expect(observedClaimedAts[i] >= observedClaimedAts[i - 1]).toBe(true)
+    }
+  })
+
+  test('ATM-008: MAX() upsert never regresses — a later SMALLER upsert leaves the cursor unchanged', () => {
+    const r1 = seedReward(taskDb, { reward: 0 })
+    seedReward(taskDb, { reward: 0 })
+    const r3 = seedReward(taskDb, { reward: 0 })
+    consumePendingRewards(taskDb, mem)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(r3)
+
+    // Manual replay of the monotonic upsert with a SMALLER id → MAX() keeps r3.
+    taskDb.run((db) =>
+      db
+        .prepare(
+          `INSERT INTO reward_consumption_cursor (consumer, last_consumed_reward_id) VALUES ('memory_importance', ?)
+           ON CONFLICT(consumer) DO UPDATE SET last_consumed_reward_id = MAX(last_consumed_reward_id, excluded.last_consumed_reward_id)`,
+        )
+        .run(r1),
+    )
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(r3)
+  })
+
+  test('ATM-008: the advance transaction runs the guarded own-lease renewal BEFORE the monotonic upsert', () => {
+    seedReward(taskDb, { reward: 0 }) // unlinked/neutral → the only renewal is the advance-txn one
+
+    const sp = spyPrepare(taskDb)
+    consumePendingRewards(taskDb, mem)
+    sp.restore()
+
+    const iUpsert = sp.calls.findIndex((s) => /ON CONFLICT\(consumer\)/.test(s))
+    // The advance-txn renewal SETs claimed_at ONLY (the acquire UPDATE sets claimed_by too).
+    const iRenew = sp.calls.findIndex(
+      (s) => /SET\s+claimed_at = datetime\('now'\)\s+WHERE consumer = \? AND claimed_by = \?/.test(s),
+    )
+    expect(iUpsert).toBeGreaterThanOrEqual(0)
+    expect(iRenew).toBeGreaterThanOrEqual(0)
+    expect(iRenew).toBeLessThan(iUpsert) // renewal FIRST
+  })
+
+  test('ATM-008: mid-batch cursor-row deletion → advance renewal changes===0 → leaseLost, NO recreate, no further mutation', () => {
+    const r1 = seedReward(taskDb, { reward: 0 })
+    seedReward(taskDb, { reward: 0 }) // r2
+
+    let deleted = false
+    const result = consumePendingRewards(taskDb, mem, {
+      onRowConsumed: () => {
+        // After row 1's commit, delete the cursor row (integrity anomaly mid-batch).
+        if (!deleted) {
+          deleted = true
+          taskDb.run((db) =>
+            db.prepare("DELETE FROM reward_consumption_cursor WHERE consumer = 'memory_importance'").run(),
+          )
+        }
+      },
+    })
+
+    expect(result.processed).toBe(1) // only r1 committed
+    expect(result.leaseLost).toBe(true) // r2's advance renewal reported changes===0
+    // The INSERT arm is unreachable under renewal-first ordering → row NOT recreated.
+    expect(cursorRow(taskDb)).toBeNull()
+    // Sanity: r1 did commit before the deletion.
+    expect(r1).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-029 / REQ-029 [P1] — cursor-advance abort branch (changes !== 1)
+// ---------------------------------------------------------------------------
+describe('ATM-029: cursor-advance abort on changes!==1 (REQ-029)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm029.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-029: injected upsert changes===0 → batch stops, lease released, abortedOnCursorFailure, no throw, no further rows', () => {
+    seedReward(taskDb, { reward: 0 }) // r1 (unlinked → no mutation before its advance)
+    const memM = seedMemory(mem, { importance: 2, sourceTaskId: 200 })
+    seedReward(taskDb, { reward: 1, taskId: 200 }) // r2, would nudge memM if reached
+
+    // Inject a fault ONLY on the monotonic-upsert statement: report changes===0.
+    const db = taskDb.getHandle() as any
+    const orig = db.prepare.bind(db)
+    db.prepare = (sql: string) => {
+      if (/ON CONFLICT\(consumer\)/.test(sql)) {
+        return { run: () => ({ changes: 0, lastInsertRowid: 0 }) }
+      }
+      return orig(sql)
+    }
+
+    let result: RewardConsumptionResult | undefined
+    expect(() => {
+      result = consumePendingRewards(taskDb, mem)
+    }).not.toThrow()
+    db.prepare = orig
+
+    expect(result!.abortedOnCursorFailure).toBe(true)
+    expect(result!.processed).toBe(0) // r1's advance failed → not counted
+    // Cursor did NOT advance (renewal rolled back with the failed upsert).
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(0)
+    // Lease released via the try/finally.
+    expect(cursorRow(taskDb)!.claimed_by).toBeNull()
+    // r2 was never reached → memM untouched.
+    expect(importanceOf(taskDb, memM)).toBe(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-031 / REQ-035, REQ-008 [P1] — resumed stale holder blocked by the
+// pre-mutation own-lease gate (B holds lease, cursor not yet past the row).
+// ---------------------------------------------------------------------------
+describe('ATM-031: pre-mutation own-lease gate blocks a resumed stale holder (REQ-035)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm031.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-031: A paused at onMemoriesResolved, B takes lease, N > cursor → A gate fails, ZERO A-mutations, B processes all once', () => {
+    const memN = seedMemory(mem, { importance: 2, sourceTaskId: 100 })
+    const rN = seedReward(taskDb, { reward: 1, taskId: 100 }) // id 1 (first pending row)
+    const memM = seedMemory(mem, { importance: 2, sourceTaskId: 101 })
+    const rM = seedReward(taskDb, { reward: 1, taskId: 101 }) // id 2
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    let stolen = false
+    const aResult = consumePendingRewards(taskDb, mem, {
+      onMemoriesResolved: () => {
+        // At row N (before A's REQ-035 gate), simulate B taking over. Cursor is
+        // still 0, so N > cursor and REQ-030's re-check alone would NOT stop A.
+        if (!stolen) {
+          stolen = true
+          setLease(taskDb, 'holder-B', "datetime('now')")
+        }
+      },
+    })
+
+    // A's pre-mutation own-lease gate saw changes===0 → aborted with leaseLost, zero mutations.
+    expect(aResult.leaseLost).toBe(true)
+    expect(decaySpy).toHaveBeenCalledTimes(0)
+    expect(importanceOf(taskDb, memN)).toBe(2)
+    expect(importanceOf(taskDb, memM)).toBe(2)
+    // A's guarded release did not disturb B's lease; cursor never advanced past N.
+    expect(cursorRow(taskDb)!.claimed_by).toBe('holder-B')
+    expect(cursorRow(taskDb)!.last_consumed_reward_id).toBe(0)
+    expect(rN).toBe(1)
+
+    // Now B actually processes the full pending set (release B's simulated lease first).
+    decaySpy.mockRestore()
+    setLease(taskDb, null, 'NULL')
+    const bResult = consumePendingRewards(taskDb, mem)
+    expect(bResult.processed).toBe(2)
+    expect(importanceOf(taskDb, memN)).toBe(3) // applied exactly once
+    expect(importanceOf(taskDb, memM)).toBe(3)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rM)
+  })
+})
