@@ -1279,3 +1279,130 @@ describe('ATM-013: reward=0 → zero mutation, row still consumed (REQ-013)', ()
     expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
   })
 })
+
+// ---------------------------------------------------------------------------
+// ATM-014 / REQ-014 [P2] — the clamp-skip is PER-MEMORY, not per-row: a memory
+// already at a bound is skipped, but a co-resident memory on the SAME reward row
+// that is NOT at a bound still gets its ±DELTA nudge.
+// ---------------------------------------------------------------------------
+describe('ATM-014: clamp-skip is per-memory, not per-row (REQ-014)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm014.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-014: memory@importance=IMPORTANCE_MAX + reward=+1 → no decayMemory call', () => {
+    const memId = seedMemory(mem, { importance: IMPORTANCE_MAX, sourceTaskId: 141 })
+    const rid = seedReward(taskDb, { reward: 1, taskId: 141 })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    expect(decaySpy).toHaveBeenCalledTimes(0)
+    expect(importanceOf(taskDb, memId)).toBe(IMPORTANCE_MAX)
+    expect(result.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+
+  test('ATM-014: memory@importance=IMPORTANCE_MIN + reward=-1 → no decayMemory call', () => {
+    const memId = seedMemory(mem, { importance: IMPORTANCE_MIN, sourceTaskId: 142 })
+    const rid = seedReward(taskDb, { reward: -1, taskId: 142 })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    expect(decaySpy).toHaveBeenCalledTimes(0)
+    expect(importanceOf(taskDb, memId)).toBe(IMPORTANCE_MIN)
+    expect(result.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+
+  test('ATM-014: two memories on the SAME +1 reward row — the clamped one is skipped, the non-clamped one STILL gets decayMemory(id, 3)', () => {
+    // Both memories share source_task_id === the reward's task_id, so both resolve
+    // to the SAME reward row (ATM-030/ATM-021 co-resident idiom).
+    const SHARED_TASK = 143
+    const clampedId = seedMemory(mem, { importance: IMPORTANCE_MAX, sourceTaskId: SHARED_TASK }) // at MAX → skip
+    const liveId = seedMemory(mem, { importance: 2, sourceTaskId: SHARED_TASK }) // 2 → 3
+    const rid = seedReward(taskDb, { reward: 1, taskId: SHARED_TASK })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    // Per-memory independence: exactly one decay call, for the non-clamped memory.
+    expect(decaySpy).toHaveBeenCalledTimes(1)
+    expect(decaySpy).toHaveBeenCalledWith(liveId, 3)
+    const decayTargets = decaySpy.mock.calls.map((c) => c[0] as number)
+    expect(decayTargets).not.toContain(clampedId) // the clamped memory was skipped
+    expect(importanceOf(taskDb, clampedId)).toBe(IMPORTANCE_MAX) // unchanged at the bound
+    expect(importanceOf(taskDb, liveId)).toBe(3) // raised by DELTA
+    // One reward row consumed regardless of how many memories it touched.
+    expect(result.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-015 / REQ-015 [P2] — STATIC guardrail: the mapping function's DELTA and
+// CLAMP BOUNDS appear ONLY as their declared identifiers
+// (REWARD_IMPORTANCE_DELTA / IMPORTANCE_MIN / IMPORTANCE_MAX), never as inlined
+// numeric literals.
+//
+// LITERAL-SCOPING CHOICE (documented per packet requirement): computeNewImportance
+// also contains the reward-SIGN comparisons `reward > 0` and `reward < 0`. Those
+// `0`s are sign discriminators, NOT delta/clamp literals, and must NOT trip this
+// guardrail. We therefore scope the digit-ban to ONLY the clamp/delta ARITHMETIC
+// — the `Math.min(...)` / `Math.max(...)` calls — which are the sole place the
+// DELTA and the CLAMP BOUNDS may legitimately appear. A legitimate reward-sign
+// `0` lives OUTSIDE those calls and is never inspected; a hypothetical inlined
+// `Math.min(current + 1, 5)` WOULD carry `1`/`5` INSIDE a captured Math call and
+// trip the assertion. Source is extracted by reading the module text and slicing
+// the (non-exported, so `.toString()`-unavailable) function body.
+// ---------------------------------------------------------------------------
+describe('ATM-015: named-const guardrail — no inlined delta/clamp literals (REQ-015)', () => {
+  test('ATM-015: the clamp/delta arithmetic uses only named constants, zero bare numeric literals', () => {
+    // Slice the computeNewImportance function body out of the module source.
+    const fnStart = MODULE_SOURCE.indexOf('function computeNewImportance')
+    expect(fnStart).toBeGreaterThanOrEqual(0)
+    const after = MODULE_SOURCE.slice(fnStart)
+    const fnBody = after.slice(0, after.indexOf('\n}') + 2)
+
+    // Sanity: the slice really is the whole mapping function.
+    expect(fnBody).toContain('function computeNewImportance')
+    expect(fnBody).toContain('return current')
+
+    // Capture ONLY the DELTA/CLAMP arithmetic expressions (the scoping choice).
+    const mathCalls = [...fnBody.matchAll(/Math\.(?:min|max)\s*\([^)]*\)/g)].map((m) => m[0])
+    // Both the raise (min→MAX) and the lower (max→MIN) clamps are present.
+    expect(mathCalls.length).toBe(2)
+    const minCall = mathCalls.find((c) => c.startsWith('Math.min'))
+    const maxCall = mathCalls.find((c) => c.startsWith('Math.max'))
+    expect(minCall).toBeDefined()
+    expect(maxCall).toBeDefined()
+
+    for (const call of mathCalls) {
+      // ZERO bare numeric literals inside the clamp/delta arithmetic.
+      expect(call).not.toMatch(/[0-9]/)
+      // The DELTA appears only via its named identifier.
+      expect(call).toContain('REWARD_IMPORTANCE_DELTA')
+    }
+    // Each clamp bound appears only via its named identifier.
+    expect(minCall!).toContain('IMPORTANCE_MAX')
+    expect(maxCall!).toContain('IMPORTANCE_MIN')
+
+    // Scoping proof: the reward-SIGN comparisons DO legitimately carry a `0`,
+    // confirming why the digit-ban is scoped to the Math calls, not the whole body.
+    expect(fnBody).toMatch(/reward\s*>\s*0/)
+    expect(fnBody).toMatch(/reward\s*<\s*0/)
+  })
+})
