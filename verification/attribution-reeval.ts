@@ -228,8 +228,11 @@ export function recomputeDecisionCritiques(
  * transaction is CLOSED before any candidate read / persistTernaryReward call.
  */
 function claimRun(db: Database, floor: string, ceiling: string): boolean {
-  db.prepare('BEGIN IMMEDIATE').run()
   try {
+    // BEGIN IMMEDIATE is INSIDE the try (codex iter3): acquiring the write lock
+    // can ITSELF throw SQLITE_BUSY under concurrency, and that must be caught as a
+    // graceful lost-claim below — not escape as an unhandled throw.
+    db.prepare('BEGIN IMMEDIATE').run()
     const still = db.prepare('SELECT id FROM attribution_reeval_runs LIMIT 1').get()
     if (still) {
       db.prepare('ROLLBACK').run()

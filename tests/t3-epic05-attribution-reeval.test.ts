@@ -15,7 +15,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { readFileSync } from 'fs'
 import { TaskDB } from '../db'
-import type { Database } from 'bun:sqlite'
+import { Database } from 'bun:sqlite'
 import { spawn } from 'child_process'
 import { writeFileSync } from 'fs'
 import {
@@ -506,6 +506,43 @@ try {
     expect(countRuns(checkDb.getHandle())).toBe(1)
     expect(reevalRows(checkDb.getHandle(), dec).length).toBe(1)
   }, 30000)
+
+  test('lock-contention: a SQLITE_BUSY at the claim BEGIN IMMEDIATE returns refused, not a throw (codex iter3)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 't3-epic05-lock-'))
+    tmpDirs.push(dir)
+    const dbPath = join(dir, 'tasks.db')
+    const seedDb = new TaskDB(dbPath)
+    seedDb.setFeatureFlag('cross_family_critique_enabled', true)
+    seedDb.setFeatureFlag('cross_family_attribution_enabled', true)
+    seedDb.setFeatureFlag('ternary_reward_enabled', true)
+    seedDecisiveCandidate(seedDb.getHandle())
+    seedDb.run(db => db.exec('PRAGMA wal_checkpoint(TRUNCATE)'))
+    seedDb.close()
+
+    // conn A holds the writer lock (RESERVED, via BEGIN IMMEDIATE) for the whole call.
+    const connA = new Database(dbPath)
+    connA.exec('PRAGMA busy_timeout = 1')
+    connA.prepare('BEGIN IMMEDIATE').run()
+    try {
+      const connB = new Database(dbPath)
+      connB.exec('PRAGMA busy_timeout = 1')
+      try {
+        // B's step-0 read + gate reads succeed (readers don't block on RESERVED),
+        // but its claim BEGIN IMMEDIATE contends with A's held writer lock and
+        // BUSYs after 1ms. With BEGIN inside the try + isBusy(), B must return a
+        // graceful 'refused' — NOT propagate 'database is locked'.
+        let res: any
+        expect(() => { res = runAttributionReeval(connB, baseOpts()) }).not.toThrow()
+        expect(res.status).toBe('refused')
+        expect(countRuns(connB)).toBe(0) // B wrote no claim row
+      } finally {
+        connB.close()
+      }
+    } finally {
+      connA.prepare('ROLLBACK').run()
+      connA.close()
+    }
+  })
 })
 
 // ===========================================================================
