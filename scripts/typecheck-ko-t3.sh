@@ -50,7 +50,7 @@ provision_typeroots() {
 }
 provision_typeroots
 
-BASELINE_COMMIT="900750f"
+BASELINE_COMMIT="88bcbf5"
 EXPECT_BASELINE=3
 # The pristine server.ts baseline error signatures, col-agnostic (line/col
 # stripped). Sorted for a deterministic multiset compare.

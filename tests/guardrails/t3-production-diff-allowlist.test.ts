@@ -24,7 +24,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const REPO = resolve(__dirname, '..', '..')
-const BASE_COMMIT = '900750f'
+const BASE_COMMIT = '88bcbf5'
 
 function sh(cmd: string): string {
   return execSync(cmd, { cwd: REPO, encoding: 'utf-8' }).trim()
