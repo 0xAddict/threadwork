@@ -1185,6 +1185,34 @@ export class TaskDB {
       CREATE INDEX IF NOT EXISTS idx_ternary_rewards_reward ON ternary_rewards(reward);
       CREATE INDEX IF NOT EXISTS idx_ternary_rewards_created ON ternary_rewards(created_at);
     `)
+
+    // T3 EPIC-05 (ATM-012/ATM-025/ATM-026 — REQ-013/REQ-020/REQ-024/REQ-026):
+    // additive DDL for the bounded one-time neutral-0 attribution re-eval
+    // (verification/attribution-reeval.ts). Both objects are inert until an
+    // operator invokes runAttributionReeval; nothing here runs at boot.
+    //   - attribution_reeval_runs: DB-enforced SINGLETON claim row
+    //     (singleton_key UNIQUE) — the whole-job idempotency + concurrency lock.
+    //   - ux_ternary_reeval_decision: partial UNIQUE index making a SECOND
+    //     'decision_reeval' row per decision_id DB-impossible (per-decision
+    //     idempotency; the partial scope leaves normal 'decision' rows free to
+    //     repeat).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS attribution_reeval_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        singleton_key INTEGER NOT NULL DEFAULT 1 UNIQUE,
+        status TEXT NOT NULL CHECK(status IN ('running','complete')),
+        window_floor TEXT,
+        window_ceiling TEXT,
+        rows_scanned INTEGER,
+        rows_reassessed INTEGER,
+        rows_skipped INTEGER,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_ternary_reeval_decision
+        ON ternary_rewards(decision_id) WHERE subject_kind='decision_reeval';
+    `)
   }
 
   createTask(input: CreateTaskInput): Task {
