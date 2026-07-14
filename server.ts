@@ -52,6 +52,7 @@ import {
 } from './verification/cross-family-critique'
 // T3 EPIC-02 (REQ-005) — additive import: agent-family-registry loader.
 import { loadAgentFamilyRegistry } from './verification/agent-family-registry'
+import { resolveCallerModelId } from './verification/critique-attribution' // T3 EPIC-03 (REQ-009/010)
 // P8 Stage 6 (EPIC-04 wiring, REQ-013/ATM-020/021) — additive import of the
 // single ternary-reward orchestrator. See the finalize_decision hook below.
 import { assessAndPersistTernaryRewardForDecision } from './verification/ternary-reward'
@@ -1710,11 +1711,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               const attributionRegistry = db.isFeatureEnabled('cross_family_attribution_enabled')
                 ? loadAgentFamilyRegistry()
                 : undefined
+              // T3 EPIC-03 (REQ-009/010/011): critic-side model-id adoption.
+              // When the caller omits critic_model_id, fall back to the calling
+              // session's own model id (AGENT_MODEL_ID, via resolveCallerModelId)
+              // BEFORE the agent-label path — precedence: explicit critic_model_id
+              // arg > AGENT_MODEL_ID > EPIC-02 agent registry. Producer-side is out
+              // of scope (a critic cannot know the producer's model), so
+              // producerFamily below is unchanged.
+              const effectiveCriticModelId = criticModelId ?? resolveCallerModelId()
               const producerFamily = producerModelId
                 ? resolveModelFamily(producerModelId)
                 : resolveAgentDefaultFamily(producerAgent, attributionRegistry)
-              const criticFamily = criticModelId
-                ? resolveModelFamily(criticModelId)
+              const criticFamily = effectiveCriticModelId
+                ? resolveModelFamily(effectiveCriticModelId)
                 : resolveAgentDefaultFamily(SELF_LABEL, attributionRegistry)
 
               const evaluation = evaluateCrossFamily({

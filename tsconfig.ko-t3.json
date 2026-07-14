@@ -18,12 +18,15 @@
     "verification/cross-family-critique.ts",
     "verification/failure-classification.ts",
     "verification/agent-family-registry.ts",
+    "verification/critique-attribution.ts",
     "decision.ts",
     "db.ts",
     "server.ts",
     "tests/agent-family-registry.test.ts",
     "tests/t3-epic02-critique-position-attribution.test.ts",
+    "tests/t3-epic03-critique-attribution.test.ts",
     "tests/guardrails/t3-cross-family-critique-scope-bleed.test.ts",
+    "tests/guardrails/t3-epic03-decision-scope-bleed.test.ts",
     "tests/guardrails/t3-production-diff-allowlist.test.ts"
   ]
 }
