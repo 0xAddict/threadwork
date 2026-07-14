@@ -1597,3 +1597,123 @@ describe('ATM-019: supplementary decisions.memory_id linkage nudges the finalize
     expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
   })
 })
+
+// ---------------------------------------------------------------------------
+// ATM-020 / REQ-020 [P2] — resolved-then-vanished race-skip: a memory that is
+// resolved into a row's target set but DELETEd before the mutation phase is
+// skipped (getMemory → null → continue) without throwing; co-resident memories
+// on the same row still get their nudge.
+// ---------------------------------------------------------------------------
+describe('ATM-020: a resolved memory deleted before mutation is race-skipped; the other still nudges (REQ-020)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm020.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-020: onMemoriesResolved deletes ONE of two resolved memories → no throw, the OTHER still gets decayMemory', () => {
+    const SHARED_TASK = 202
+    const gone = seedMemory(mem, { importance: 2, sourceTaskId: SHARED_TASK }) // will be deleted mid-flight
+    const survivor = seedMemory(mem, { importance: 2, sourceTaskId: SHARED_TASK })
+    const rid = seedReward(taskDb, { reward: 1, taskId: SHARED_TASK })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    let deleted = false
+    let result: RewardConsumptionResult | undefined
+    expect(() => {
+      result = consumePendingRewards(taskDb, mem, {
+        onMemoriesResolved: (_rewardId, memoryIds) => {
+          // Seam fires AFTER resolution, BEFORE mutation. Both ids were resolved.
+          if (!deleted) {
+            deleted = true
+            expect(memoryIds).toContain(gone)
+            expect(memoryIds).toContain(survivor)
+            // Delete ONE resolved memory directly, simulating a concurrent removal.
+            taskDb.run((db) => db.prepare('DELETE FROM memories WHERE id = ?').run(gone))
+          }
+        },
+      })
+    }).not.toThrow()
+
+    // The vanished memory is race-skipped; the surviving one is nudged exactly once.
+    const decayTargets = decaySpy.mock.calls.map((c) => c[0] as number)
+    expect(decayTargets).toContain(survivor)
+    expect(decayTargets).not.toContain(gone)
+    expect(decaySpy).toHaveBeenCalledTimes(1)
+    expect(importanceOf(taskDb, survivor)).toBe(3)
+    expect(result!.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-021 / REQ-016+019 [P2] — deduplicated multi-memory fan-out: one reward
+// row whose task_id resolves 2 independent memories AND whose decision_id
+// resolves a 3rd (the finalizeDecision auto-summary, source_task_id=NULL) →
+// all 3 nudged exactly once in a single pass, deduplicated by the shared Set
+// (no memory nudged twice even across the primary+supplementary union).
+// ---------------------------------------------------------------------------
+describe('ATM-021: deduplicated fan-out across primary + supplementary paths — all nudged once (REQ-016+019)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm021.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-021: 2 primary (source_task_id) memories + 1 supplementary (decisions.memory_id) summary → 3 distinct nudges, no duplicate', () => {
+    const SHARED_TASK = 210
+    const p1 = seedMemory(mem, { importance: 2, sourceTaskId: SHARED_TASK }) // primary path
+    const p2 = seedMemory(mem, { importance: 2, sourceTaskId: SHARED_TASK }) // primary path
+
+    // The 3rd memory is the decision's own finalize-summary (source_task_id=NULL),
+    // reachable ONLY through decisions.memory_id.
+    const dec = new DecisionDB(taskDb, mem)
+    const decision = dec.openDecision('ATM-021 fan-out decision', null, 'boss')
+    const { memory: summary } = dec.finalizeDecision(decision.id, 'boss', 'accepted', 'converge')
+    expect(summary.source_task_id).toBeNull()
+    const summaryStart = importanceOf(taskDb, summary.id)
+
+    // ONE reward row that resolves via BOTH paths at once.
+    const rid = seedReward(taskDb, { reward: 1, taskId: SHARED_TASK, decisionId: decision.id })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    const decayTargets = decaySpy.mock.calls.map((c) => c[0] as number)
+    // All three resolved, each nudged exactly once — deduplicated union.
+    expect(decaySpy).toHaveBeenCalledTimes(3)
+    expect([...decayTargets].sort((a, b) => a - b)).toEqual([p1, p2, summary.id].sort((a, b) => a - b))
+    // No id appears twice across the primary+supplementary union (Set dedup).
+    expect(new Set(decayTargets).size).toBe(decayTargets.length)
+    for (const id of [p1, p2, summary.id]) {
+      expect(decayTargets.filter((t) => t === id).length).toBe(1)
+    }
+    // Importances applied once each: primaries 2→3, the summary +DELTA (clamped).
+    expect(importanceOf(taskDb, p1)).toBe(3)
+    expect(importanceOf(taskDb, p2)).toBe(3)
+    expect(importanceOf(taskDb, summary.id)).toBe(Math.min(summaryStart + REWARD_IMPORTANCE_DELTA, IMPORTANCE_MAX))
+    // A single reward row consumed regardless of the fan-out width.
+    expect(result.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+})
