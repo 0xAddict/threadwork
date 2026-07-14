@@ -50,6 +50,8 @@ import {
   getMandatoryCrossFamilyReviewClassifications,
   annotateWithFailureClass,
 } from './verification/cross-family-critique'
+// T3 EPIC-02 (REQ-005) — additive import: agent-family-registry loader.
+import { loadAgentFamilyRegistry } from './verification/agent-family-registry'
 // P8 Stage 6 (EPIC-04 wiring, REQ-013/ATM-020/021) — additive import of the
 // single ternary-reward orchestrator. See the finalize_decision hook below.
 import { assessAndPersistTernaryRewardForDecision } from './verification/ternary-reward'
@@ -1698,12 +1700,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 if (positionRow) producerAgent = positionRow.agent
               }
 
+              // T3 EPIC-02 (REQ-005/006/007): when cross_family_attribution_enabled
+              // is ON, inject the operator-maintained agent-family registry into the
+              // two agent-fallback resolveAgentDefaultFamily() calls so known agents
+              // resolve to their real family instead of 'unknown'. Flag OFF (default)
+              // => undefined registry => byte-identical pre-T3 behavior, and JS
+              // short-circuit means the loader is never invoked on the OFF path
+              // (REQ-006). This ternary is the SOLE loader call site.
+              const attributionRegistry = db.isFeatureEnabled('cross_family_attribution_enabled')
+                ? loadAgentFamilyRegistry()
+                : undefined
               const producerFamily = producerModelId
                 ? resolveModelFamily(producerModelId)
-                : resolveAgentDefaultFamily(producerAgent)
+                : resolveAgentDefaultFamily(producerAgent, attributionRegistry)
               const criticFamily = criticModelId
                 ? resolveModelFamily(criticModelId)
-                : resolveAgentDefaultFamily(SELF_LABEL)
+                : resolveAgentDefaultFamily(SELF_LABEL, attributionRegistry)
 
               const evaluation = evaluateCrossFamily({
                 producer_family: producerFamily,
