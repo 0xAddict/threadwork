@@ -1717,3 +1717,77 @@ describe('ATM-021: deduplicated fan-out across primary + supplementary paths —
     expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
   })
 })
+
+// ===========================================================================
+// PK-T4-6 (EPIC-05) — VERIFIER ATM for the `reward_consumed` observability row
+// (REQ-023). Reuses the PK-T4-3 helpers (seedReward/seedMemory/importanceOf/
+// wipeDbFile/spyOn(mem,'decayMemory')/per-block TEST_DB) + the DecisionDB open
+// idiom (ATM-018/019/021) for a concrete, non-null decision_id.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// ATM-024 / REQ-023 [P2] — a reward row that produces ≥1 real decayMemory call
+// emits EXACTLY ONE audit_log row (action='reward_consumed') whose `detail`
+// carries the row's decision_id, task_id, reward, and the memories-updated
+// count. Seed ONE +1 reward whose task_id links TWO not-at-bound memories, so
+// the row makes exactly two decayMemory calls → memories_updated=2.
+// ---------------------------------------------------------------------------
+describe('ATM-024: one reward_consumed audit row per ≥1-mutation reward; detail carries the tokens (REQ-023)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm024.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-024: 2 co-resident not-at-bound memories on ONE +1 reward → exactly one reward_consumed row; detail has decision_id/task_id/reward=1/memories_updated=2', () => {
+    const SHARED_TASK = 240
+    // An OPEN (unfinalized) decision → a concrete decision_id, but its
+    // decisions.memory_id back-link is NULL (ATM-018), so the SUPPLEMENTARY
+    // path adds NO third memory — memories_updated stays exactly 2.
+    const dec = new DecisionDB(taskDb, mem)
+    const decision = dec.openDecision('ATM-024 audit decision', null, 'boss')
+
+    // Two memories at importance=2 (NEITHER at a clamp bound) sharing the
+    // reward's source_task_id → both resolve via the primary path and both
+    // get their +DELTA nudge (2 → 3), i.e. exactly two real decayMemory calls.
+    const m1 = seedMemory(mem, { importance: 2, sourceTaskId: SHARED_TASK })
+    const m2 = seedMemory(mem, { importance: 2, sourceTaskId: SHARED_TASK })
+    const rid = seedReward(taskDb, { reward: 1, taskId: SHARED_TASK, decisionId: decision.id })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    // The row produced EXACTLY two real decayMemory calls (2 memories updated).
+    expect(decaySpy).toHaveBeenCalledTimes(2)
+    expect(importanceOf(taskDb, m1)).toBe(3)
+    expect(importanceOf(taskDb, m2)).toBe(3)
+    expect(result.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+
+    // REQ-023 — query audit_log directly: EXACTLY ONE reward_consumed row.
+    const rows = taskDb.run((db) =>
+      db.prepare("SELECT detail FROM audit_log WHERE action = 'reward_consumed'").all(),
+    ) as { detail: string }[]
+    expect(rows.length).toBe(1)
+
+    // …whose detail carries every token: the row's decision_id, task_id, reward,
+    // and the memories-updated count of 2.
+    const detail = rows[0].detail
+    expect(detail).toContain(`decision_id=${decision.id}`)
+    expect(detail).toContain(`task_id=${SHARED_TASK}`)
+    expect(detail).toContain('reward=1')
+    expect(detail).toContain('memories_updated=2')
+    // Belt-and-suspenders: the whole detail string is exactly the documented shape.
+    expect(detail).toBe(`decision_id=${decision.id} task_id=${SHARED_TASK} reward=1 memories_updated=2`)
+  })
+})

@@ -86,6 +86,13 @@ function countAuditRows(taskDb: TaskDB, action: string): number {
   )
 }
 
+/** The current `importance` of a single memory row (the value the consumer would move). */
+function readImportance(taskDb: TaskDB, id: number): number {
+  return taskDb.run(
+    (db) => (db.prepare('SELECT importance FROM memories WHERE id = ?').get(id) as { importance: number }).importance,
+  )
+}
+
 // ---------------------------------------------------------------------------
 // ATM-002 / REQ-002 [P1] — additive Phase-5 call site fires exactly once
 // ---------------------------------------------------------------------------
@@ -289,5 +296,101 @@ describe('ATM-028: injected consumer throw is swallowed, run() unaffected (REQ-0
     // No partial cursor corruption — the spy threw before touching the cursor.
     expect(readCursor(taskDb)).toEqual(cursorBefore)
     expect(readCursor(taskDb).last_consumed_reward_id).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-023 / REQ-022 [P1] — flag-OFF END-TO-END data-layer byte-parity.
+//
+// DISTINCT from ATM-003 (which deep-equals run()'s deterministic 6-key
+// PROJECTION to the committed golden baseline at the call-site layer). ATM-023
+// proves the underlying DATA LAYER the reward consumer would mutate — the
+// reward_consumption_cursor row, the linked memory's importance, and the
+// reward_consumed/reward_consumer_error audit rows — is byte-identical after a
+// full flag-OFF end-to-end run, seeded so it WOULD move if the consumer fired.
+//
+// NO spy: unlike ATM-003, this drives the REAL (unmocked) flag-OFF guard — the
+// real consumer must be short-circuited and the real data left pristine.
+// ---------------------------------------------------------------------------
+describe('ATM-023: flag-OFF full-pipeline end-to-end data-layer parity (REQ-022)', () => {
+  const TEST_DB = '/tmp/t4-hook-atm023.db'
+  let taskDb: TaskDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    // Flag left at its default (OFF) — no setFeatureFlag call.
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-023: a would-change-if-on reward+memory pair is byte-untouched after a full flag-OFF run() (cursor + importance + audit)', async () => {
+    // (1) Seed the deterministic consolidator workload (ATM-003 idiom) …
+    const seededMem = seedConsolidatorFixture(taskDb)
+    // … PLUS a "would-change-if-on" pair the consumer WOULD move if it fired:
+    //   a FRESH, active, importance=2, UNIQUE-content memory tagged with a
+    //   source_task_id, and a pending +1 reward carrying that same task_id.
+    //   Recent (default last_accessed=now) + unique + active means the
+    //   consolidator's OWN gather/decay/archive/prune all skip it (decay needs
+    //   last_accessed < now-1d; archive needs importance<=0 or superseded;
+    //   gather needs stale/duplicate/disputed) — so the ONLY thing that would
+    //   move its importance is the reward consumer, which is OFF. That is what
+    //   makes this flag-OFF parity assertion meaningful.
+    const LINKED_TASK = 92300
+    const linked = seededMem.saveMemory({
+      agent: 'boss',
+      content: 'ATM-023 reward-linked memory (unique, recent, active)',
+      category: 'fact',
+      importance: 2,
+      source_task_id: LINKED_TASK,
+    })
+    taskDb.run((db) =>
+      db
+        .prepare(
+          `INSERT INTO ternary_rewards
+             (policy_version, decision_id, task_id, subject_kind, cross_family_verdict,
+              failure_severity, failure_signal_available, reward, created_at)
+           VALUES (1, NULL, ?, 'decision', NULL, NULL, 1, 1, datetime('now'))`,
+        )
+        .run(LINKED_TASK),
+    )
+
+    // Sanity: the flag really is OFF (default), so the consumer must be skipped.
+    expect(taskDb.isFeatureEnabled('reward_consumer_enabled')).toBe(false)
+
+    // (2) Capture BEFORE: the linked memory's importance + the full cursor row.
+    const importanceBefore = readImportance(taskDb, linked.id)
+    expect(importanceBefore).toBe(2) // seeded value; +1 reward WOULD raise it to 3 if consumed
+    const cursorBefore = readCursor(taskDb)
+    expect(cursorBefore.last_consumed_reward_id).toBe(0)
+    expect(cursorBefore.claimed_by).toBeNull()
+    expect(cursorBefore.claimed_at).toBeNull()
+
+    // (3) Run the full consolidator END-TO-END, flag OFF, dryRun=false,
+    //     scope='all' (the ATM-003 instantiation idiom). NO spy — the real
+    //     flag-OFF guard must skip the real consumer.
+    const mem = new (require('../memory').MemoryDB)(taskDb)
+    const c = new MemoryConsolidator(mem, taskDb, false, 50, 'all')
+    await c.run(FIXTURE_TRIGGER_REASON)
+
+    // (4a) CURSOR: ZERO writes beyond the migrate() seed — last_consumed_reward_id
+    //      still 0, claimed_by NULL, claimed_at NULL; byte-identical row overall.
+    const cursorAfter = readCursor(taskDb)
+    expect(cursorAfter.last_consumed_reward_id).toBe(0)
+    expect(cursorAfter.claimed_by).toBeNull()
+    expect(cursorAfter.claimed_at).toBeNull()
+    expect(cursorAfter).toEqual(cursorBefore) // includes updated_at — no upsert touched it
+
+    // (4b) IMPORTANCE: ZERO change on the reward-linked memory.
+    expect(readImportance(taskDb, linked.id)).toBe(importanceBefore)
+    expect(readImportance(taskDb, linked.id)).toBe(2)
+
+    // (4c) AUDIT: ZERO consumer rows of either action.
+    expect(countAuditRows(taskDb, 'reward_consumed')).toBe(0)
+    expect(countAuditRows(taskDb, 'reward_consumer_error')).toBe(0)
   })
 })
