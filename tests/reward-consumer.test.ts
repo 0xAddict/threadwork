@@ -21,6 +21,7 @@ import { readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { TaskDB } from '../db'
 import { MemoryDB } from '../memory'
+import { DecisionDB } from '../decision'
 import {
   REWARD_CONSUMER_BATCH_LIMIT,
   CLAIM_LEASE_MS,
@@ -1404,5 +1405,195 @@ describe('ATM-015: named-const guardrail — no inlined delta/clamp literals (RE
     // confirming why the digit-ban is scoped to the Math calls, not the whole body.
     expect(fnBody).toMatch(/reward\s*>\s*0/)
     expect(fnBody).toMatch(/reward\s*<\s*0/)
+  })
+})
+
+// ===========================================================================
+// PK-T4-5 (EPIC-04 — decision→memory linkage) VERIFIER ATMs. Prove the PRIMARY
+// `source_task_id` union (REQ-016/REQ-017), the empty-union graceful no-op
+// (REQ-018), the SUPPLEMENTARY `decisions.memory_id` finalize-summary path
+// (REQ-019 — the ONE real new impl this packet), the resolved-then-vanished
+// race-skip (REQ-020), and the deduplicated multi-memory fan-out across both
+// paths (REQ-016+019). Reuse the PK-T4-3 helpers (seedReward/seedMemory/
+// importanceOf/cursorRow/wipeDbFile/spyOn(mem,'decayMemory')/per-block
+// TEST_DB). The finalizeDecision() seeding idiom (openDecision → finalize →
+// auto-memory with source_task_id=NULL + decisions.memory_id back-link) is
+// taken from tests/ternary-reward-finalize-integration.test.ts /
+// tests/decision.test.ts.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// ATM-016 / REQ-016 [P1] — PRIMARY source_task_id linkage: a rewarded row's
+// task_id resolves the memory tagged with that same source_task_id.
+// ---------------------------------------------------------------------------
+describe('ATM-016: primary source_task_id linkage nudges the tagged memory (REQ-016)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm016.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-016: saveMemory(source_task_id=42) + reward row task_id=42 reward=1 → decayMemory(id, 3) once', () => {
+    const memId = seedMemory(mem, { importance: 2, sourceTaskId: 42 })
+    const rid = seedReward(taskDb, { reward: 1, taskId: 42 })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    expect(decaySpy).toHaveBeenCalledTimes(1)
+    expect(decaySpy).toHaveBeenCalledWith(memId, 3) // min(2 + DELTA, MAX) = 3
+    expect(importanceOf(taskDb, memId)).toBe(3)
+    expect(result.processed).toBe(1)
+    expect(result.skippedNoLinkage).toBe(0)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-017 / REQ-017 [P1] — a reward row with BOTH task_id and decision_id NULL
+// resolves to zero memories: primary path skipped, no exception, cursor still
+// advances (the row is consumed as a graceful no-op).
+// ---------------------------------------------------------------------------
+describe('ATM-017: null task_id + null decision_id → no linkage, no throw, cursor advances (REQ-017)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm017.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-017: reward row task_id=null decision_id=null → zero decayMemory calls, cursor advances, no exception', () => {
+    const rid = seedReward(taskDb, { reward: 1, taskId: null, decisionId: null })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    let result: RewardConsumptionResult | undefined
+    expect(() => {
+      result = consumePendingRewards(taskDb, mem)
+    }).not.toThrow()
+
+    // Both linkage paths short-circuit on their null guard → empty union.
+    expect(decaySpy).toHaveBeenCalledTimes(0)
+    expect(result!.skippedNoLinkage).toBe(1)
+    // The row is still consumed and the durable cursor advances past it.
+    expect(result!.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-018 / REQ-018 [P1] — empty-union graceful no-op: a task_id matching no
+// memory AND a decision whose decisions.memory_id is NULL (unfinalized) →
+// zero mutations, cursor advances, skippedNoLinkage incremented.
+// ---------------------------------------------------------------------------
+describe('ATM-018: empty-union (unmatched task_id + null decisions.memory_id) is a graceful no-op (REQ-018)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm018.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-018: task_id matches no memory + decision_id whose decisions.memory_id is NULL → no mutation, cursor advances, skippedNoLinkage', () => {
+    // An OPEN (never finalized) decision → its decisions.memory_id column is NULL,
+    // so the supplementary path resolves nothing.
+    const dec = new DecisionDB(taskDb, mem)
+    const decision = dec.openDecision('ATM-018 unfinalized decision', null, 'boss')
+    // Sanity: an unfinalized decision has a NULL memory_id back-link.
+    const memoryIdOfDecision = taskDb.run(
+      (db) => (db.prepare('SELECT memory_id FROM decisions WHERE id = ?').get(decision.id) as { memory_id: number | null }).memory_id,
+    )
+    expect(memoryIdOfDecision).toBeNull()
+
+    // task_id 9999 is tagged on no memory.
+    const rid = seedReward(taskDb, { reward: 1, taskId: 9999, decisionId: decision.id })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    expect(decaySpy).toHaveBeenCalledTimes(0)
+    expect(result.skippedNoLinkage).toBe(1)
+    // Graceful no-op: still consumed, cursor advanced past it.
+    expect(result.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-019 / REQ-019 [P1] — the SUPPLEMENTARY decisions.memory_id path. The REAL
+// finalizeDecision() auto-memory has source_task_id=NULL by construction, so
+// the PRIMARY path is STRUCTURALLY blind to it; the decisions.memory_id
+// back-link is the only deterministic route. Proves the supplementary path
+// fires exactly where the primary cannot.
+// ---------------------------------------------------------------------------
+describe('ATM-019: supplementary decisions.memory_id linkage nudges the finalize-summary memory (REQ-019)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm019.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-019: real finalizeDecision() summary (source_task_id=NULL) is nudged via decisions.memory_id where the primary path is blind', () => {
+    const dec = new DecisionDB(taskDb, mem)
+    const decision = dec.openDecision('ATM-019 finalize decision', null, 'boss')
+    const { memory: summary } = dec.finalizeDecision(decision.id, 'boss', 'accepted', 'ship it')
+
+    // By construction: the auto-memory carries NO source_task_id — the primary
+    // source_task_id query can NEVER reach it.
+    expect(summary.source_task_id).toBeNull()
+    expect(summary.state).toBe('active')
+    const summaryImportance = importanceOf(taskDb, summary.id)
+
+    // A reward row referencing the decision (task_id NULL → primary resolves nothing).
+    const rid = seedReward(taskDb, { reward: 1, taskId: null, decisionId: decision.id })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    // The supplementary path resolved the decision's own summary and nudged it.
+    expect(decaySpy).toHaveBeenCalledTimes(1)
+    expect(decaySpy).toHaveBeenCalledWith(summary.id, Math.min(summaryImportance + REWARD_IMPORTANCE_DELTA, IMPORTANCE_MAX))
+    expect(importanceOf(taskDb, summary.id)).toBe(Math.min(summaryImportance + REWARD_IMPORTANCE_DELTA, IMPORTANCE_MAX))
+    // This is a real linkage (NOT a no-linkage skip), consumed, cursor advanced.
+    expect(result.skippedNoLinkage).toBe(0)
+    expect(result.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
   })
 })

@@ -218,8 +218,8 @@ function processRewardRow(
   opts: RewardConsumptionOpts | undefined,
   result: RewardConsumptionResult,
 ): RowOutcome {
-  // (1) Resolve the linked-memory set (EPIC-04 primary path).
-  const memoryIds = resolveTargetMemories(db, reward)
+  // (1) Resolve the linked-memory set (EPIC-04 primary + supplementary paths).
+  const memoryIds = resolveTargetMemories(db, mem, reward)
   // Test-only seam: fires after resolution, before any mutation for this row.
   opts?.onMemoriesResolved?.(reward.id, memoryIds.slice())
 
@@ -269,17 +269,49 @@ function processRewardRow(
 }
 
 // ---------------------------------------------------------------------------
-// REQ-016/REQ-017 — PRIMARY `source_task_id` linkage resolution (read-only).
-// The supplementary `decisions.memory_id` path (REQ-019) is a later packet.
+// REQ-016/REQ-017/REQ-019 — target-memory resolution (read-only). Unions two
+// deterministic linkage paths into one DEDUPLICATED Set:
+//
+//   PRIMARY (REQ-016/REQ-017): memories tagged with this reward row's
+//   `source_task_id == reward.task_id` (active only). Skipped when
+//   `reward.task_id` is null.
+//
+//   SUPPLEMENTARY (REQ-019): the finalize-summary memory a `finalizeDecision()`
+//   auto-created for `reward.decision_id`, resolved via the `decisions.memory_id`
+//   back-link. finalizeDecision()'s auto-memory INSERT never sets
+//   `source_task_id`, so the PRIMARY path is structurally blind to it — this
+//   back-link is the ONLY deterministic route. Read via a raw scalar SQL query
+//   on the shared db handle (NOT a value-import from decision.ts, preserving the
+//   REQ-026/REQ-027 import allowlist), then gated on an active-state check
+//   through the already-passed `MemoryDB` handle. Skipped when
+//   `reward.decision_id` is null, when `decisions.memory_id` is null, or when
+//   the linked memory is absent/superseded. Deduplicated against the primary
+//   result by the shared Set.
 // ---------------------------------------------------------------------------
-function resolveTargetMemories(db: Database, reward: PersistedTernaryReward): number[] {
+function resolveTargetMemories(db: Database, mem: MemoryDB, reward: PersistedTernaryReward): number[] {
   const ids = new Set<number>()
+
+  // PRIMARY path (REQ-016/REQ-017).
   if (reward.task_id !== null && reward.task_id !== undefined) {
     const rows = db
       .prepare("SELECT id FROM memories WHERE source_task_id = ? AND state != 'superseded'")
       .all(reward.task_id) as { id: number }[]
     for (const r of rows) ids.add(r.id)
   }
+
+  // SUPPLEMENTARY path (REQ-019) — the decision's own finalize-summary memory.
+  if (reward.decision_id !== null && reward.decision_id !== undefined) {
+    const decRow = db
+      .prepare('SELECT memory_id FROM decisions WHERE id = ?')
+      .get(reward.decision_id) as { memory_id: number | null } | undefined
+    const summaryId = decRow?.memory_id
+    if (summaryId !== null && summaryId !== undefined) {
+      const m = mem.getMemory(summaryId)
+      // Only union an ACTIVE (non-superseded) linked memory.
+      if (m && m.state !== 'superseded') ids.add(summaryId)
+    }
+  }
+
   return [...ids]
 }
 
