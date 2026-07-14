@@ -630,6 +630,12 @@ export class TaskDB {
     // agent-family registry doesn't retroactively shift the live verdict
     // distribution until an operator explicitly flips this flag.
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('cross_family_attribution_enabled', 0)")
+    // T4 EPIC-05 (REQ-021/ATM-022): reward-consumer / memory-importance learning
+    // loop. DEFAULT OFF — this packet only lays the flag + cursor-table
+    // foundation (verification/reward-consumer.ts's consumePendingRewards() is
+    // a scaffold stub in this stage); the Phase-5 consolidator call site and
+    // full consume/lease/advance logic land in a later packet.
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('reward_consumer_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
@@ -1213,6 +1219,32 @@ export class TaskDB {
       CREATE UNIQUE INDEX IF NOT EXISTS ux_ternary_reeval_decision
         ON ternary_rewards(decision_id) WHERE subject_kind='decision_reeval';
     `)
+    // T4 EPIC-02 (REQ-006/ATM-006): durable reward-consumption cursor. Keyed
+    // by `consumer` (not a singleton row) so a future second consumer of
+    // getTernaryRewards() can track its own independent high-water-mark
+    // without contending on this one. `claimed_by`/`claimed_at` are the
+    // consumer-level lease-serialization columns a later packet's
+    // consumePendingRewards() acquires/renews/releases — untouched (NULL) by
+    // this migrate()-time seed. This table + the seeded 'memory_importance'
+    // row is the STABLE, DURABLE cross-spec read contract documented
+    // verbatim in verification/reward-consumer.ts's module doc-comment
+    // (REQ-010) that a future T1 retention/pruning consumer must honor.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS reward_consumption_cursor (
+        consumer TEXT PRIMARY KEY,
+        last_consumed_reward_id INTEGER NOT NULL DEFAULT 0,
+        claimed_by TEXT,
+        claimed_at TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `)
+    // This migrate()-time seed is the ONLY legitimate creator of the
+    // 'memory_importance' row — runtime code (a later packet's
+    // consumePendingRewards()) never recreates it; a missing row at batch
+    // start is a fail-closed integrity anomaly it must surface, not repair.
+    this.db.exec(
+      "INSERT OR IGNORE INTO reward_consumption_cursor (consumer, last_consumed_reward_id) VALUES ('memory_importance', 0)",
+    )
   }
 
   createTask(input: CreateTaskInput): Task {
