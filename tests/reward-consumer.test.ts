@@ -1143,3 +1143,139 @@ describe('ATM-005: batch-limit drain (REQ-005)', () => {
     expect(third.processed).toBe(0)
   })
 })
+
+// ===========================================================================
+// PK-T4-4 (EPIC-03) — VERIFIER ATMs for the bounded, clamped ±1 importance
+// map (`computeNewImportance`, reward-consumer.ts). The core is ACCEPTED as-is;
+// these ATMs prove its observable ±1/clamp/skip behaviour and the named-const
+// guardrail. They reuse the PK-T4-3 helpers (seedReward/seedMemory/
+// importanceOf/wipeDbFile/spyOn(mem,'decayMemory')/per-block TEST_DB).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// ATM-011 / REQ-011 [P1] — reward=+1 raises a linked memory's importance by
+// DELTA, clamped at IMPORTANCE_MAX (min(importance + DELTA, 5)).
+// ---------------------------------------------------------------------------
+describe('ATM-011: reward=+1 → +DELTA importance, clamped at MAX (REQ-011)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm011.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-011: memory@importance=2, linked reward=+1 → decayMemory(id, 3) called EXACTLY once', () => {
+    const memId = seedMemory(mem, { importance: 2, sourceTaskId: 111 })
+    const rid = seedReward(taskDb, { reward: 1, taskId: 111 })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    expect(decaySpy).toHaveBeenCalledTimes(1)
+    expect(decaySpy).toHaveBeenCalledWith(memId, 3) // min(2 + DELTA, MAX) = 3
+    expect(importanceOf(taskDb, memId)).toBe(3)
+    expect(result.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+
+  test('ATM-011: memory@importance=IMPORTANCE_MAX, linked reward=+1 → NO decayMemory call (clamp = redundant-write skip)', () => {
+    const memId = seedMemory(mem, { importance: IMPORTANCE_MAX, sourceTaskId: 112 })
+    const rid = seedReward(taskDb, { reward: 1, taskId: 112 })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    // min(5 + DELTA, MAX) = 5 = current → the clamped same-value write is skipped.
+    expect(decaySpy).toHaveBeenCalledTimes(0)
+    expect(importanceOf(taskDb, memId)).toBe(IMPORTANCE_MAX)
+    // The row is still consumed (linked, zero net mutation) and the cursor advances.
+    expect(result.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-012 / REQ-012 [P1] — reward=-1 lowers a linked memory's importance by
+// DELTA, clamped at IMPORTANCE_MIN (max(importance - DELTA, 0)).
+// ---------------------------------------------------------------------------
+describe('ATM-012: reward=-1 → -DELTA importance, clamped at MIN (REQ-012)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm012.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-012: memory@importance=3, linked reward=-1 → decayMemory(id, 2) called EXACTLY once', () => {
+    const memId = seedMemory(mem, { importance: 3, sourceTaskId: 121 })
+    const rid = seedReward(taskDb, { reward: -1, taskId: 121 })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    expect(decaySpy).toHaveBeenCalledTimes(1)
+    expect(decaySpy).toHaveBeenCalledWith(memId, 2) // max(3 - DELTA, MIN) = 2
+    expect(importanceOf(taskDb, memId)).toBe(2)
+    expect(result.processed).toBe(1)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ATM-013 / REQ-013 [P1] — reward=0 leaves the linked memory unchanged, yet the
+// row is still consumed and the cursor advances past it (cross-checked like
+// ATM-008). A neutral reward is a zero-mutation consumption, NOT a no-linkage.
+// ---------------------------------------------------------------------------
+describe('ATM-013: reward=0 → zero mutation, row still consumed (REQ-013)', () => {
+  const TEST_DB = '/tmp/t4-rc-atm013.db'
+  let taskDb: TaskDB
+  let mem: MemoryDB
+
+  beforeEach(() => {
+    wipeDbFile(TEST_DB)
+    taskDb = new TaskDB(TEST_DB)
+    mem = new MemoryDB(taskDb)
+  })
+  afterEach(() => {
+    try {
+      taskDb.close()
+    } catch {}
+    wipeDbFile(TEST_DB)
+  })
+
+  test('ATM-013: memory@importance=3, linked reward=0 → ZERO decayMemory calls; cursor STILL advances past the row', () => {
+    const memId = seedMemory(mem, { importance: 3, sourceTaskId: 131 })
+    const rid = seedReward(taskDb, { reward: 0, taskId: 131 })
+
+    const decaySpy = spyOn(mem, 'decayMemory')
+    const result = consumePendingRewards(taskDb, mem)
+
+    // Neutral reward → computeNewImportance returns current unchanged → no mutation.
+    expect(decaySpy).toHaveBeenCalledTimes(0)
+    expect(importanceOf(taskDb, memId)).toBe(3)
+    // The row is consumed with zero mutation: processed, and the durable cursor
+    // advanced past it (ATM-008-style cross-check).
+    expect(result.processed).toBe(1)
+    // The memory WAS linked (present, just neutral) — this is NOT a no-linkage skip.
+    expect(result.skippedNoLinkage).toBe(0)
+    expect(getRewardConsumptionCursor(taskDb.getHandle())).toBe(rid)
+  })
+})
