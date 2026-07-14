@@ -2,6 +2,12 @@ import type { TaskDB } from './db'
 import type { MemoryDB, Memory, Classification } from './memory'
 import { runDecay, runArchive, runPrune, getDecayWindowDays } from './consolidate'
 import { guardClassificationElevation } from './memory-integrity'
+// T4 EPIC-01 (REQ-002 · ATM-002): the ONE additive reward-consumer hook, wired
+// into the Phase-5 scope==='all' block below. Imported BY NAME (not as a
+// namespace) so the ATM-002/004/028 tests can intercept this exact call by
+// spying the live ESM binding (the repo's proven cross-module spy convention),
+// rather than a whole-module mock that leaks across files in this Bun.
+import { consumePendingRewards } from './verification/reward-consumer'
 
 export interface ConsolidationResult {
   runId: number
@@ -315,6 +321,40 @@ export class MemoryConsolidator {
         decayed = runDecay(this.mem)
         archived = runArchive(this.mem)
         pruned = runPrune(this.mem)
+
+        // T4 EPIC-01 (REQ-002/003/004/025 · ATM-002/003/004/028): the ONE,
+        // additive, opt-in reward-consumption call site — positioned alongside
+        // (never replacing) the decay/archive/prune calls above, reached only
+        // inside this existing scope==='all' gate (REQ-002). It is SKIPPED
+        // entirely when `reward_consumer_enabled` is OFF (the default → run()
+        // stays byte-identical to the pre-T4 baseline, REQ-003) OR when this is
+        // a dryRun (REQ-004: reward consumption's cursor advance is a one-way,
+        // exactly-once-intended operation and must never fire speculatively —
+        // a DELIBERATE divergence from the decay/archive/prune quirk above,
+        // which ignore dryRun). Its OWN try/catch records any fault exactly
+        // once (one console.error line AND one best-effort audit_log row,
+        // action='reward_consumer_error') and swallows it, so a consumer error
+        // NEVER alters run()'s return value, phasesCompleted, summary, or
+        // mutation count, and NEVER propagates to run()'s caller (REQ-025).
+        if (!this.dryRun && this.taskDb.isFeatureEnabled('reward_consumer_enabled')) {
+          try {
+            consumePendingRewards(this.taskDb, this.mem)
+          } catch (rcErr) {
+            const rcMsg = rcErr instanceof Error ? rcErr.message : String(rcErr)
+            console.error(`[reward-consumer] consumePendingRewards threw, swallowed: ${rcMsg}`)
+            try {
+              this.taskDb.run(db =>
+                db
+                  .prepare(
+                    `INSERT INTO audit_log (agent, action, detail, memory_id) VALUES ('consolidator', 'reward_consumer_error', ?, NULL)`,
+                  )
+                  .run(rcMsg),
+              )
+            } catch {
+              /* best-effort audit; a logging failure must never surface to run() */
+            }
+          }
+        }
       }
       phasesCompleted.push('prune')
 

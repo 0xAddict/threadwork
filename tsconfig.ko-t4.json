@@ -16,6 +16,11 @@
   "include": [
     "types/bun-sqlite-widen.d.ts",
     "db.ts",
-    "tests/db.test.ts"
+    "consolidator.ts",
+    "verification/reward-consumer.ts",
+    "tests/db.test.ts",
+    "tests/reward-consumer.test.ts",
+    "tests/consolidator-reward-hook.test.ts",
+    "tests/fixtures/reward-consumer-fixture.ts"
   ]
 }

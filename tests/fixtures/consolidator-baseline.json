@@ -1,0 +1,14 @@
+{
+  "triggerReason": "baseline-fixture",
+  "phasesCompleted": [
+    "orient",
+    "gather",
+    "validate",
+    "consolidate",
+    "prune"
+  ],
+  "mutations": 0,
+  "dryRun": false,
+  "summary": "[scope=all] Orient: 4 active, 0.00 dispute rate. Gathered 4 signals, validated 0 actions, executed 0 mutations (dry_run=false). Decay: 4, Archive: 4, Prune: 0.",
+  "scope": "all"
+}
