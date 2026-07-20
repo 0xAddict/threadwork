@@ -7,7 +7,7 @@
  * files under tests/ are permitted and expected; the ko-t1 tooling
  * (scripts/typecheck-ko-t1.sh, tsconfig.ko-t1.json) is non-production and
  * exempt. The protected files (verification/*.ts, decision.ts, memory.ts) must
- * be byte-untouched since the lane base (900750f).
+ * be byte-untouched since the lane base (4db813f, postscrub).
  *
  * "Production file" here = a tracked-or-untracked `.ts` file not under tests/.
  * The diff is taken working-tree-vs-base so the guard is valid both before and
@@ -19,7 +19,7 @@ import { execSync } from 'node:child_process'
 import { resolve } from 'node:path'
 
 const REPO = resolve(__dirname, '..', '..')
-const BASE = '900750f'
+const BASE = '4db813f'
 
 function sh(cmd: string): string {
   return execSync(cmd, { cwd: REPO, encoding: 'utf-8' }).trim()
@@ -44,7 +44,7 @@ describe('ATM-015: production diff scope ⊆ {db.ts, server.ts}', () => {
     expect(prod).toContain('server.ts')
   })
 
-  test('protected files are byte-untouched since base 900750f', () => {
+  test('protected files are byte-untouched since base 4db813f', () => {
     const protectedDiff = sh(
       `git diff --name-only ${BASE} -- decision.ts memory.ts verification/`,
     )

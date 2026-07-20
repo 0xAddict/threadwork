@@ -9,7 +9,7 @@
 # gate before it fails downstream. Mirrors scripts/typecheck-p8.sh.
 #
 # DELTA ALLOW-LIST (parallel to typecheck-p8.sh): `server.ts` carries PRE-EXISTING
-# latent tsc errors at the T1 base commit 900750f — the SAME 3 signatures p8
+# latent tsc errors at the T1 postscrub base commit 4db813f — the SAME 3 signatures p8
 # pinned. They are NOT T1's and cannot be fixed without editing non-T1 server.ts
 # lines (violates the additive discipline / ATM-015 diff-scope). The gate ALLOWS
 # exactly the baseline signatures (col-agnostic) and FAILS on anything else —
@@ -19,7 +19,7 @@
 # BASELINE-SWAP GUARD (mirrors typecheck-p8.sh): the count + signature checks
 # alone are "swappable" (an edit that deletes one pristine baseline error line
 # while adding a new same-signature error elsewhere could net the same count).
-# Pinning the server.ts diff vs pristine 900750f to be PURELY ADDITIVE (zero
+# Pinning the server.ts diff vs pristine 4db813f to be PURELY ADDITIVE (zero
 # deleted lines) + scanning added lines for new ts-suppression directives closes
 # that gap structurally.
 #
@@ -77,11 +77,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-BASELINE_COMMIT="900750f"
+BASELINE_COMMIT="4db813f"
 EXPECT_BASELINE=3
 # The pristine server.ts baseline error signatures, col-agnostic (line/col
 # stripped). Sorted for a deterministic multiset compare. Re-verified live at
-# T1 base 900750f — identical to the p8 baseline.
+# T1 postscrub base 4db813f — identical to the p8 baseline.
 read -r -d '' BASELINE_SIGS <<'EOF'
 server.ts: error TS2345: Argument of type 'string | null' is not assignable to parameter of type 'string'.
 server.ts: error TS2345: Argument of type 'string | null' is not assignable to parameter of type 'string'.
