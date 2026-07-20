@@ -29,7 +29,7 @@ import { TaskDB } from '../../db'
 import { MemoryDB } from '../../memory'
 import { DecisionDB } from '../../decision'
 import { AuditLog } from '../../audit'
-import { forceDebrief } from '../../debrief'
+import { forceDebrief, checkAndRunDebrief } from '../../debrief'
 import { recordExpectedOutcome, reflect } from '../../reflection/outcome-feedback'
 import type { Database } from 'bun:sqlite'
 
@@ -260,6 +260,48 @@ describe('PK-PF1-4 fault-injection (5 sites) — a forced hook throw must not af
       expect(result).toBeTruthy()
       expect(typeof result.durationMs).toBe('number')
       expect(result.error).toBeFalsy()
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('PK-PF1-5 fold (E3): a throwing isFeatureEnabled() flag-read itself does not affect checkAndRunDebrief()/forceDebrief()\'s own return value — end-to-end, real import', async () => {
+    const { db, path } = freshDb()
+    try {
+      const mem = new MemoryDB(db)
+      const dec = new DecisionDB(db, mem)
+      const audit = new AuditLog(db)
+      // Deliberately do NOT set the flag — the point is to prove the flag
+      // READ itself, not reflect(), is what's under fault-injection here.
+      // Force isFeatureEnabled() to throw ONLY for PF1's own flag name —
+      // DebriefDaemon.gatherContext() legitimately calls isFeatureEnabled()
+      // for its OWN, unrelated flags (e.g. memory_sanitization_enabled) as
+      // pre-existing, non-PF1 behavior; a blind blanket-throw would corrupt
+      // that unrelated call path too and produce a false failure signal that
+      // has nothing to do with PF1's fault-isolation guarantee.
+      const original = TaskDB.prototype.isFeatureEnabled
+      TaskDB.prototype.isFeatureEnabled = function (this: TaskDB, flagName: string): boolean {
+        if (flagName === 'outcome_feedback_enabled') {
+          throw new Error('injected flag-read failure')
+        }
+        return original.call(this, flagName)
+      }
+      try {
+        // Load-bearing assertion: NEITHER call throws all the way out to the
+        // caller, regardless of what checkAndRunDebrief()'s own gates decide
+        // (a fresh/empty DB may or may not pass the idle/volume gates —
+        // that's orthogonal to what's under test here).
+        let r1: unknown
+        await expect((async () => { r1 = await checkAndRunDebrief(db, mem, dec, audit) })()).resolves.toBeUndefined()
+        expect(r1 === null || typeof r1 === 'object').toBe(true)
+
+        const r2 = await forceDebrief(db, mem, dec, audit)
+        expect(r2).toBeTruthy()
+        expect(typeof r2.durationMs).toBe('number')
+        expect(r2.error).toBeFalsy()
+      } finally {
+        TaskDB.prototype.isFeatureEnabled = original
+      }
     } finally {
       cleanup(db, path)
     }

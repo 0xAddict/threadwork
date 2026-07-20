@@ -11,6 +11,7 @@ import {
   supersedeSharedPattern,
   getSharedPatterns,
   getOutcomeExpectations,
+  computeSignature,
 } from '../../reflection/outcome-feedback'
 
 // PK-PF1-1 (ATM-PF1-01/02) + PK-PF1-2 (ATM-PF1-03/04) + PK-PF1-3
@@ -1044,5 +1045,104 @@ describe('PK-PF1-5 fold: supersedeSharedPattern() validation + full-lineage dedu
     } finally {
       cleanup(db, path)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PK-PF1-5 codex round 1 fold — E2/HIGH, boss's L2 lock, RECURRENCE-COLLISION
+// test class: two DISTINCT tasks with equivalent descriptions must produce
+// IDENTICAL signatures, so N>=3 distillation is actually reachable for real
+// cross-task data. `buildExpectedOutcome()` below reproduces server.ts's
+// exact argument-construction template — cross-checked by the static test at
+// the end of this section so the reproduction can never silently drift from
+// the real code. (The companion UNIQUENESS-STRIPPING test class lives in
+// tests/guardrails/pf1-4-wiring.guard.test.ts, since it's a pure static scan
+// of server.ts's source, not a runtime/signature test.)
+// ---------------------------------------------------------------------------
+
+describe('PK-PF1-5 fold (E2/L2): RECURRENCE-COLLISION — equivalent descriptions produce identical signatures, distillation reachable', () => {
+  function freshDb(): { db: TaskDB; path: string } {
+    const path = `/tmp/pf1-5-recurrence-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    db.setFeatureFlag('outcome_feedback_enabled', true)
+    return { db, path }
+  }
+  function cleanup(db: TaskDB, path: string): void {
+    db.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(path + suffix) } catch {}
+    }
+  }
+  // Mirrors server.ts's `Expected outcome: ${description}` template exactly
+  // — see the static cross-check test below.
+  function buildExpectedOutcome(description: string): string {
+    return `Expected outcome: ${description}`
+  }
+  function seedTaskAndExpectation(db: TaskDB, description: string, result: string): { taskId: number; expectationId: number } {
+    const taskId = db.run(handle => handle.prepare(
+      "INSERT INTO tasks (from_agent, to_agent, description, priority, status, result) VALUES ('sadie', 'sadie', ?, 'normal', 'completed', ?) RETURNING id",
+    ).get(description, result) as { id: number }).id
+    const expectationId = db.run(handle => persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: buildExpectedOutcome(description) }))!
+    return { taskId, expectationId }
+  }
+
+  test('two DISTINCT tasks (different task_ids) with the equivalent description produce IDENTICAL stored expected_outcome text (no task_id leaked into the text)', () => {
+    const { db, path } = freshDb()
+    try {
+      const t1 = seedTaskAndExpectation(db, 'ship the widget', 'done')
+      const t2 = seedTaskAndExpectation(db, 'ship the widget', 'done')
+      expect(t1.taskId).not.toBe(t2.taskId) // genuinely distinct tasks
+
+      const row1 = db.run(handle => getOutcomeExpectations(handle, { taskId: t1.taskId }))[0]
+      const row2 = db.run(handle => getOutcomeExpectations(handle, { taskId: t2.taskId }))[0]
+      expect(row1.expected_outcome).toBe(row2.expected_outcome) // byte-identical text
+      expect(row1.expected_outcome).not.toContain(String(t1.taskId))
+      expect(row1.expected_outcome).not.toContain(String(t2.taskId))
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('two DISTINCT tasks with equivalent descriptions produce the IDENTICAL computeSignature() output', () => {
+    const { db, path } = freshDb()
+    try {
+      const desc = 'run the nightly export'
+      const exp1 = buildExpectedOutcome(desc)
+      const exp2 = buildExpectedOutcome(desc)
+      const diff1 = diffOutcome({ expected: exp1, actual: 'export failed: timeout' })
+      const diff2 = diffOutcome({ expected: exp2, actual: 'export failed: connection reset' }) // different actual text — still same signature, since signature is expected-side only
+      const sig1 = computeSignature(diff1.matched, exp1)
+      const sig2 = computeSignature(diff2.matched, exp2)
+      expect(sig1).toBe(sig2)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('3 DISTINCT tasks with equivalent descriptions reach the N>=3 distillation threshold via reflect() — this is the actual reachability proof', () => {
+    const { db, path } = freshDb()
+    try {
+      seedTaskAndExpectation(db, 'restart the ingestion pipeline', 'restarted successfully')
+      seedTaskAndExpectation(db, 'restart the ingestion pipeline', 'restarted successfully')
+      seedTaskAndExpectation(db, 'restart the ingestion pipeline', 'restarted successfully')
+
+      const r1 = db.run(handle => reflect(handle))
+      expect(r1.diffed).toBe(3)
+      expect(r1.distilled).toBe(1) // pre-E2, this was always 0 — 3 distinct task_ids meant 3 distinct signatures, never reachable
+
+      const patterns = db.run(handle => getSharedPatterns(handle))
+      expect(patterns.length).toBe(1)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('STATIC CROSS-CHECK: server.ts\'s actual expected_outcome argument template matches buildExpectedOutcome() above exactly, so this test file\'s reproduction cannot silently drift from the real code', () => {
+    expect(REFLECTION_TS).toBeTruthy() // sanity: file loaded
+    const serverTsPath = resolve(__dirname, '..', '..', 'server.ts')
+    const serverTs = readFileSync(serverTsPath, 'utf-8')
+    // All 4 sites must use the literal template `Expected outcome: ${...}`.
+    const occurrences = (serverTs.match(/expected_outcome: `Expected outcome: \$\{[^}]+\}`/g) ?? []).length
+    expect(occurrences).toBe(4)
   })
 })

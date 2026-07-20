@@ -887,8 +887,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           // externally communicated (before the nudge/postToGroup calls
           // below), not before the row exists (structurally impossible).
           // Additive, flag-gated internally, try/catch-swallowed.
+          // PK-PF1-5 (codex round 1 fold, E2/HIGH): expected_outcome is
+          // description-derived, NOT task_id-derived (boss's L1 lock) —
+          // `description` is already in scope here, no lookup needed.
           try {
-            recordExpectedOutcome(db.getHandle(), { task_id: task.id, expected_outcome: `Task #${task.id} delegated to ${to}: ${description}` })
+            recordExpectedOutcome(db.getHandle(), { task_id: task.id, expected_outcome: `Expected outcome: ${description}` })
           } catch {
             // swallowed — REQ-PF1-10
           }
@@ -931,8 +934,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // the claim action proceeds. Additive, flag-gated (internally, via
         // recordExpectedOutcome()'s own outcome_feedback_enabled check),
         // try/catch-swallowed — must never affect claim_task's own outcome.
+        // PK-PF1-5 (codex round 1 fold, E2/HIGH): expected_outcome is
+        // description-derived, NOT task_id-derived — no task-unique token
+        // anywhere in the signature-bearing text (boss's L1 lock), so tasks
+        // with equivalent descriptions collide onto the same signature and
+        // the N>=3 distillation path is actually reachable (boss's L2 lock).
         try {
-          recordExpectedOutcome(db.getHandle(), { task_id: taskId, expected_outcome: `Task #${taskId} claimed by ${SELF_LABEL}` })
+          const claimingTask = db.getTask(taskId)
+          recordExpectedOutcome(db.getHandle(), { task_id: taskId, expected_outcome: `Expected outcome: ${claimingTask?.description ?? ''}` })
         } catch {
           // swallowed — REQ-PF1-10
         }
@@ -2103,8 +2112,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // EPIC-PF1 (PK-PF1-4, REQ-PF1-01): pre-act expectation record, before
         // the assign action proceeds. Additive, flag-gated internally,
         // try/catch-swallowed.
+        // PK-PF1-5 (codex round 1 fold, E2/HIGH): expected_outcome is
+        // description-derived, NOT task_id-derived (boss's L1 lock).
         try {
-          recordExpectedOutcome(db.getHandle(), { task_id: taskId, expected_outcome: `Task #${taskId} assigned to ${toAgent} by ${SELF_LABEL}` })
+          const assigningTask = db.getTask(taskId)
+          recordExpectedOutcome(db.getHandle(), { task_id: taskId, expected_outcome: `Expected outcome: ${assigningTask?.description ?? ''}` })
         } catch {
           // swallowed — REQ-PF1-10
         }
@@ -2139,8 +2151,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // EPIC-PF1 (PK-PF1-4, REQ-PF1-01): pre-act expectation record, before
         // the transition action proceeds. Additive, flag-gated internally,
         // try/catch-swallowed.
+        // PK-PF1-5 (codex round 1 fold, E2/HIGH): expected_outcome is
+        // description-derived, NOT task_id-derived (boss's L1 lock).
         try {
-          recordExpectedOutcome(db.getHandle(), { task_id: taskId, expected_outcome: `Task #${taskId} transitioned to in_progress (GO) by ${SELF_LABEL}` })
+          const transitioningTask = db.getTask(taskId)
+          recordExpectedOutcome(db.getHandle(), { task_id: taskId, expected_outcome: `Expected outcome: ${transitioningTask?.description ?? ''}` })
         } catch {
           // swallowed — REQ-PF1-10
         }

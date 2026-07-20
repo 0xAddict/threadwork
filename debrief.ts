@@ -866,13 +866,16 @@ export async function checkAndRunDebrief(
   // EPIC-PF1 (PK-PF1-4, REQ-PF1-04): additive post-summarise pass, AFTER the
   // existing summarise step completes — never before, never in place of it.
   // Flag-gated, try/catch-swallowed; must never affect checkAndRunDebrief()'s
-  // own return value.
-  if (taskDb.isFeatureEnabled('outcome_feedback_enabled')) {
-    try {
+  // own return value. PK-PF1-5 (codex round 1 fold, E3/MED — boss-amended
+  // R1 allowlist): the flag READ itself now lives INSIDE the try too — a
+  // throwing isFeatureEnabled() (e.g. a DB error) must be swallowed exactly
+  // like a throwing reflect(), not propagate and alter pre-PF1 control flow.
+  try {
+    if (taskDb.isFeatureEnabled('outcome_feedback_enabled')) {
       reflect(taskDb.getHandle())
-    } catch {
-      // swallowed — REQ-PF1-10
     }
+  } catch {
+    // swallowed — REQ-PF1-10
   }
   return result
 }
@@ -889,13 +892,14 @@ export async function forceDebrief(
   const daemon = new DebriefDaemon(taskDb, mem, dec, audit)
   const result = await daemon.runDebrief(true)
   // EPIC-PF1 (PK-PF1-4, REQ-PF1-04): same additive post-summarise pass as
-  // checkAndRunDebrief() above.
-  if (taskDb.isFeatureEnabled('outcome_feedback_enabled')) {
-    try {
+  // checkAndRunDebrief() above. PK-PF1-5 (codex round 1 fold, E3/MED): flag
+  // read moved inside the try too — see checkAndRunDebrief()'s comment.
+  try {
+    if (taskDb.isFeatureEnabled('outcome_feedback_enabled')) {
       reflect(taskDb.getHandle())
-    } catch {
-      // swallowed — REQ-PF1-10
     }
+  } catch {
+    // swallowed — REQ-PF1-10
   }
   return result
 }

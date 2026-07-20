@@ -31,6 +31,37 @@
  * anchoring to the immediately-prior seam is the more precise, more
  * future-proof choice — mirrors ATM-015's own "BASE = the lane's own base"
  * discipline).
+ *
+ * --- PK-PF1-5 codex round 1 fold — FORMAL AMENDMENT (boss's dispositions,
+ * E2/E3) ---
+ *
+ * E2 (HIGH — expected_outcome text was task_id-derived, breaking
+ * distillation reachability): boss approved editing ONLY the 4 server.ts
+ * call-site `expected_outcome` ARGUMENT strings — hook structure, position
+ * relative to each mutation call, and try/catch wrapping stay untouched.
+ * `claim_task`/`assign_task`/`transition_task` each gained one additional
+ * line inside their existing `try` block (a `db.getTask(taskId)` lookup, to
+ * source the now-description-derived text — `description` wasn't in scope
+ * at those 3 sites before). `delegate_task` needed no lookup (`description`
+ * was already in scope) — only its argument string's content changed.
+ *
+ * E3 (MED — the `isFeatureEnabled()` flag read sat OUTSIDE the swallowed
+ * `try`): boss approved moving it inside, in both `checkAndRunDebrief()`
+ * and `forceDebrief()`.
+ *
+ * Net effect on THIS guard's mechanical checks: NONE. Every line E2/E3
+ * touch is content `PK-PF1-4` itself inserted (never anything present in
+ * the `71d0131` baseline), so from `71d0131`'s perspective these edits are
+ * still 100% additive — verified directly: `git diff 71d0131 -- server.ts`
+ * shows zero deleted lines (same as before the fold); `git diff 71d0131 --
+ * debrief.ts`'s deleted-line set is still EXACTLY the same two R1-approved
+ * tail-conversion lines (`return daemon.runDebrief(false)` /
+ * `return daemon.runDebrief(true)`) — no new deletion was introduced. The
+ * allowlist below is UNCHANGED code-wise; this comment block is the
+ * boss-directed formal record of the amendment (his ruling: "the
+ * diff-allowlist guard needs its expected-diff updated for exactly these 4
+ * argument strings — document that amendment in the guard itself" / "the R1
+ * allowlist accounting is FORMALLY AMENDED by boss to cover it").
  */
 
 import { test, expect, describe } from 'bun:test'
@@ -202,5 +233,53 @@ describe(`PK-PF1-4 (2) diff-allowlist vs ${BASE_COMMIT} — R1 pre-authorization
     const deleted = deletedLines(diff)
     const touchesRunDebrief = deleted.some(l => l.includes('async runDebrief('))
     expect(touchesRunDebrief).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PK-PF1-5 codex round 1 fold — E2/HIGH, boss's L2 lock, UNIQUENESS-STRIPPING
+// test class: task-unique tokens (ids, timestamps) must be PROVABLY ABSENT
+// from the signature-bearing `expected_outcome` argument text at all 4
+// server.ts call sites. Static source scan — the argument text itself is the
+// thing under test, not runtime behavior (that's the companion
+// RECURRENCE-COLLISION test class in
+// tests/reflection/outcome-feedback.test.ts's PK-PF1-5 fold section).
+// ---------------------------------------------------------------------------
+
+describe('PK-PF1-5 fold (E2/L2): UNIQUENESS-STRIPPING — no task-unique token in any expected_outcome argument', () => {
+  function expectedOutcomeArgText(caseLabel: string): string {
+    const body = caseBody(caseLabel, SERVER_TS)
+    const marker = 'expected_outcome: `'
+    const start = body.indexOf(marker)
+    expect(start).toBeGreaterThan(-1)
+    const contentStart = start + marker.length
+    const end = body.indexOf('`', contentStart)
+    expect(end).toBeGreaterThan(contentStart)
+    return body.slice(contentStart, end)
+  }
+
+  const sites = ['claim_task', 'delegate_task', 'assign_task', 'transition_task']
+
+  for (const site of sites) {
+    test(`${site}: expected_outcome argument text contains no taskId or task.id interpolation`, () => {
+      const text = expectedOutcomeArgText(site)
+      expect(text).not.toContain('${taskId}')
+      expect(text).not.toContain('${task.id}')
+    })
+  }
+
+  test('none of the 4 expected_outcome argument texts interpolate any other id-shaped variable (broad sweep over ${...id} / ${...Id} interpolations)', () => {
+    const idLikeInterpolation = /\$\{[a-zA-Z_][a-zA-Z0-9_.]*[iI]d\}/
+    for (const site of sites) {
+      const text = expectedOutcomeArgText(site)
+      expect(text).not.toMatch(idLikeInterpolation)
+    }
+  })
+
+  test('all 4 sites use the SAME uniform "Expected outcome: " prefix (no site-specific qualifier that could itself vary by call type and reduce cross-site collision reach)', () => {
+    for (const site of sites) {
+      const text = expectedOutcomeArgText(site)
+      expect(text.startsWith('Expected outcome: ')).toBe(true)
+    }
   })
 })
