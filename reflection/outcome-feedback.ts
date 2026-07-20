@@ -256,11 +256,30 @@ function signatureTag(signature: string): string {
  * ATM-PF1-06/REQ-PF1-05 — When 3 or more `outcome_expectations` diffs share
  * a signature (computeSignature(), OQ-2 exact-match v1), produces exactly
  * one confidence-scored `shared_patterns` row via persistSharedPattern().
- * Fewer than 3 -> returns `null`, zero writes. If an ACTIVE pattern already
- * exists for this exact signature (dedup via the `[[sig:...]]` tag),
- * returns `null` without writing again — reflect() calls this once per
- * signature-group on every pass, so this dedup is what prevents re-creating
- * the same pattern every time it re-observes an already-distilled group.
+ * Fewer than 3 -> returns `null`, zero writes. If ANY row — active OR
+ * superseded — already carries this exact signature's tag (dedup via the
+ * `[[sig:...]]` tag), returns `null` without writing again — reflect() calls
+ * this once per signature-group on every pass, so this dedup is what
+ * prevents re-creating the same pattern every time it re-observes an
+ * already-distilled group, INCLUDING after a valid supersedeSharedPattern()
+ * call (PK-PF1-5 codex round 1 fold, MED-3: checking only `is_active=1`
+ * meant a superseded row's signature would silently re-distill on the next
+ * pass, since the row that carried the tag was no longer active — fixed by
+ * checking the full lineage, not just the active subset).
+ *
+ * Dedup match is a STRICT PREFIX check (`pattern_text.startsWith(tag + ' ')`)
+ * done in application code, NOT a SQL `LIKE` substring search (PK-PF1-5
+ * codex round 1 fold, HIGH: `LIKE '%tag%'` treats `_`/`%` inside the
+ * signature as SQL wildcards — e.g. a real `foo_bar` signature's tag would
+ * false-match an unrelated `fooxbar` tag already on file — and a substring
+ * search over the WHOLE `pattern_text` is spoofable: a task's
+ * user-controlled `expected_outcome` text embedded later in `pattern_text`
+ * could itself contain a literal `[[sig:...]]`-shaped string and falsely
+ * suppress a DIFFERENT signature's distillation. Since `pattern_text` is
+ * ALWAYS constructed as `${tag} ${...}` below, a prefix check is both safe
+ * (no wildcard injection) and unspoofable (the tag can only ever be at
+ * position 0 — nothing in `${rep.expected_outcome}`, which appears strictly
+ * AFTER the tag, can forge a prefix match for a different signature).
  *
  * `corroborated` (REQ-PF1-11, "enrich pattern distillation" from the
  * read-only P6/P7/P8 triad) is computed by the CALLER (reflect(), which is
@@ -280,9 +299,11 @@ export function distillSharedPattern(
   }
 
   const tag = signatureTag(signature)
-  const existing = db
-    .prepare('SELECT id FROM shared_patterns WHERE is_active = 1 AND pattern_text LIKE ?')
-    .get(`%${tag}%`)
+  const prefix = `${tag} `
+  const allPatternTexts = db
+    .prepare('SELECT pattern_text FROM shared_patterns')
+    .all() as { pattern_text: string }[]
+  const existing = allPatternTexts.some(r => r.pattern_text.startsWith(prefix))
   if (existing) {
     return null
   }
@@ -318,12 +339,27 @@ export function distillSharedPattern(
  * LOCAL `BEGIN IMMEDIATE` transaction — the prior row is NEVER deleted
  * (never-delete lineage, REQ-PF1-06). Gated on `outcome_feedback_enabled`
  * like every other PF1 write. Row count goes `n -> n+1`, never back down.
+ *
+ * Validates `oldPatternId` refers to a row that actually exists AND is
+ * currently `is_active=1` BEFORE opening any transaction — returns `null`
+ * with zero writes otherwise (PK-PF1-5 codex round 1 fold, MED-3: the
+ * pre-fix version let a non-existent or already-superseded `oldPatternId`
+ * silently "succeed", inserting an orphan replacement row and logging a
+ * `shared_pattern_superseded` audit action for a supersession that never
+ * actually happened).
  */
 export function supersedeSharedPattern(db: Database, oldPatternId: number, newInput: SharedPatternInput): number | null {
   const flagRow = db
     .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'outcome_feedback_enabled'")
     .get() as { enabled: number } | null
   if (!flagRow || flagRow.enabled !== 1) {
+    return null
+  }
+
+  const oldRow = db
+    .prepare('SELECT id FROM shared_patterns WHERE id = ? AND is_active = 1')
+    .get(oldPatternId)
+  if (!oldRow) {
     return null
   }
 
@@ -362,13 +398,23 @@ export function supersedeSharedPattern(db: Database, oldPatternId: number, newIn
  * `{ diffed: 0, distilled: 0 }`.
  *
  * Phase 1 — diff every un-diffed `outcome_expectations` row whose task has
- * completed. `tasks.result` (populated by `completeTask()`/
- * `forceCompleteTask()`) is the only column at HEAD shaped like an "actual
- * outcome" — there is no dedicated `actual_outcome` column anywhere, so this
- * is the deliberate, documented source `diffOutcome()`'s `actual` input is
- * read from. Each diff is persisted back onto its own row (`diffed_at` +
- * JSON-encoded `diff_result`) inside its own LOCAL `BEGIN IMMEDIATE`
- * transaction.
+ * REACHED `status = 'completed'`, not merely acquired a non-null `result`.
+ * `tasks.result` (populated by `completeTask()`/`forceCompleteTask()`) is
+ * the only column at HEAD shaped like an "actual outcome" — there is no
+ * dedicated `actual_outcome` column anywhere, so this is the deliberate,
+ * documented source `diffOutcome()`'s `actual` input is read from. The
+ * explicit `status = 'completed'` filter (PK-PF1-5 codex round 1 fold,
+ * MED-1 — verified real against `completeTaskWithFinalizerCheck()`,
+ * `db.ts:1805/1874`) matters because a board-CARD row (`complexity_user`
+ * non-null) routes executor-completion to `status = 'review'` WHILE ALSO
+ * populating `result` in the same `UPDATE` — that row is NOT yet accepted
+ * by the human [Accept] gate (#13007 owns the review→completed advance);
+ * without this filter, `reflect()` would diff and permanently audit a
+ * card's outcome before the human ever accepted it. Plain agent tasks
+ * (`complexity_user` NULL) reach `status = 'completed'` directly, unchanged
+ * — this filter is a no-op for them. Each diff is persisted back onto its
+ * own row (`diffed_at` + JSON-encoded `diff_result`) inside its own LOCAL
+ * `BEGIN IMMEDIATE` transaction.
  *
  * Phase 2 (REQ-PF1-11) — consumes P6/P7/P8's read-contract triad
  * (getFailureClassifications/getCrossFamilyCritiques/getTernaryRewards)
@@ -399,7 +445,7 @@ export function reflect(db: Database): { diffed: number; distilled: number } {
       SELECT oe.id AS id, oe.task_id AS task_id, oe.expected_outcome AS expected_outcome, t.result AS actual
       FROM outcome_expectations oe
       JOIN tasks t ON t.id = oe.task_id
-      WHERE oe.diffed_at IS NULL AND t.result IS NOT NULL
+      WHERE oe.diffed_at IS NULL AND t.result IS NOT NULL AND t.status = 'completed'
     `)
     .all() as { id: number; task_id: number; expected_outcome: string; actual: string }[]
 

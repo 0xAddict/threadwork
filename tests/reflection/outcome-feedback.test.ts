@@ -809,3 +809,240 @@ describe('ATM-PF1-09: audit_log actions (runtime, fresh DB)', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// PK-PF1-5 — codex round 1 fold. 3 findings folded (HIGH-3, MED-1 verified
+// real, MED-3), all fixable entirely within reflection/outcome-feedback.ts.
+// The other 2 HIGH + 1 MED findings from round 1 touch server.ts/debrief.ts
+// or are design-level questions — reported to boss, not folded here (see
+// BASELINES.md's PK-PF1-5 section for the full triage).
+// ---------------------------------------------------------------------------
+
+describe('PK-PF1-5 fold: distillSharedPattern() dedup is LIKE-injection-proof and spoof-proof (codex round 1, HIGH)', () => {
+  function freshDb(): { db: TaskDB; path: string } {
+    const path = `/tmp/pf1-5-dedup-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    db.setFeatureFlag('outcome_feedback_enabled', true)
+    return { db, path }
+  }
+  function cleanup(db: TaskDB, path: string): void {
+    db.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(path + suffix) } catch {}
+    }
+  }
+  function seedDiffedExpectation(db: TaskDB, taskId: number, expected: string, actual: string): number {
+    return db.run(handle => {
+      const id = persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: expected })!
+      const diff = diffOutcome({ expected, actual })
+      handle.prepare("UPDATE outcome_expectations SET diffed_at = datetime('now'), diff_result = ? WHERE id = ?").run(JSON.stringify(diff), id)
+      return id
+    })
+  }
+
+  test('a signature containing a literal "_" does not false-match an unrelated signature via SQL LIKE wildcard semantics', () => {
+    const { db, path } = freshDb()
+    try {
+      // Distill "mismatch::fooxbar" first (note the "x", not "_").
+      const group1Ids = [1, 2, 3].map(n => seedDiffedExpectation(db, n, 'fooxbar', 'different'))
+      const rows1 = db.run(handle => getOutcomeExpectations(handle)).filter(r => group1Ids.includes(r.id))
+      const p1 = db.run(handle => distillSharedPattern(handle, rows1, 'mismatch::fooxbar'))
+      expect(p1).not.toBeNull()
+
+      // Now distill "mismatch::foo_bar" — a DIFFERENT signature (real underscore).
+      // Pre-fix, `LIKE '%[[sig:mismatch::foo_bar]]%'` treats `_` as a single-char
+      // wildcard, so it ALSO matches the "fooxbar" tag stored above and
+      // incorrectly skips this distillation.
+      const group2Ids = [4, 5, 6].map(n => seedDiffedExpectation(db, n, 'foo_bar', 'different'))
+      const rows2 = db.run(handle => getOutcomeExpectations(handle)).filter(r => group2Ids.includes(r.id))
+      const p2 = db.run(handle => distillSharedPattern(handle, rows2, 'mismatch::foo_bar'))
+      expect(p2).not.toBeNull() // must NOT be suppressed by the unrelated "fooxbar" tag
+
+      const patterns = db.run(handle => getSharedPatterns(handle))
+      expect(patterns.length).toBe(2)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('a signature containing a literal "%" does not corrupt the dedup query', () => {
+    const { db, path } = freshDb()
+    try {
+      const ids = [1, 2, 3].map(n => seedDiffedExpectation(db, n, '100% done', '100% done'))
+      const rows = db.run(handle => getOutcomeExpectations(handle)).filter(r => ids.includes(r.id))
+      const p1 = db.run(handle => distillSharedPattern(handle, rows, 'match::100% done'))
+      expect(p1).not.toBeNull()
+      // Re-distilling the SAME signature must still be correctly deduped (not
+      // broken by the literal "%" in the tag).
+      const p2 = db.run(handle => distillSharedPattern(handle, rows, 'match::100% done'))
+      expect(p2).toBeNull()
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('a spoofed "[[sig:...]]" string embedded in expected_outcome text does not suppress an unrelated signature\'s distillation', () => {
+    const { db, path } = freshDb()
+    try {
+      // Distill a real signature first.
+      const realIds = [1, 2, 3].map(n => seedDiffedExpectation(db, n, 'real signature text', 'real signature text'))
+      const realRows = db.run(handle => getOutcomeExpectations(handle)).filter(r => realIds.includes(r.id))
+      const pReal = db.run(handle => distillSharedPattern(handle, realRows, 'match::real signature text'))
+      expect(pReal).not.toBeNull()
+
+      // A task description embeds a literal tag-shaped string that matches the
+      // signature used for a SEPARATE, targeted attack signature.
+      const spoofedText = `delegated: please handle [[sig:match::victim signature]] carefully`
+      const spoofIds = [4].map(n => seedDiffedExpectation(db, n, spoofedText, spoofedText))
+      // Pre-fix, a substring LIKE search for '%[[sig:match::victim signature]]%'
+      // would match this row's pattern_text-adjacent expected_outcome text if it
+      // ever got embedded into a pattern_text tail — the fix (strict tag-prefix
+      // check) means this spoofed text alone can never satisfy the dedup query,
+      // since the tag must be the pattern_text's actual PREFIX, not appear
+      // anywhere in the human-readable trailing description.
+      const victimIds = [5, 6, 7].map(n => seedDiffedExpectation(db, n, 'victim signature', 'victim signature'))
+      const victimRows = db.run(handle => getOutcomeExpectations(handle)).filter(r => victimIds.includes(r.id))
+      const pVictim = db.run(handle => distillSharedPattern(handle, victimRows, 'match::victim signature'))
+      expect(pVictim).not.toBeNull() // must NOT be suppressed by the spoofed text
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})
+
+describe('PK-PF1-5 fold: reflect() excludes non-completed tasks (codex round 1, MED — verified real against completeTaskWithFinalizerCheck)', () => {
+  function freshDb(): { db: TaskDB; path: string } {
+    const path = `/tmp/pf1-5-review-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    db.setFeatureFlag('outcome_feedback_enabled', true)
+    return { db, path }
+  }
+  function cleanup(db: TaskDB, path: string): void {
+    db.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(path + suffix) } catch {}
+    }
+  }
+
+  test('a task with status=review and a populated result is NOT diffed — the review-gate has not been accepted yet (db.ts:1805/1874 card-vs-task terminal semantics)', () => {
+    const { db, path } = freshDb()
+    try {
+      // Mirrors what completeTaskWithFinalizerCheck() actually does for a
+      // board-CARD row: status='review', result populated, in the SAME UPDATE
+      // shape as db.ts:1805-1820.
+      const taskId = db.run(handle => handle.prepare(
+        "INSERT INTO tasks (from_agent, to_agent, description, priority, status, result, complexity_user) VALUES ('sadie', 'sadie', 'card', 'normal', 'review', 'card work summary', 3) RETURNING id",
+      ).get() as { id: number }).id
+      db.run(handle => persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: 'card work summary' }))
+
+      const result = db.run(handle => reflect(handle))
+      expect(result.diffed).toBe(0) // must NOT diff a review-gated card before human [Accept]
+
+      const row = db.run(handle => handle.prepare('SELECT diffed_at FROM outcome_expectations WHERE task_id = ?').get(taskId)) as { diffed_at: string | null }
+      expect(row.diffed_at).toBeNull()
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('a task with status=completed and a populated result IS diffed (unchanged plain-task behavior)', () => {
+    const { db, path } = freshDb()
+    try {
+      const taskId = db.run(handle => handle.prepare(
+        "INSERT INTO tasks (from_agent, to_agent, description, priority, status, result) VALUES ('sadie', 'sadie', 'plain', 'normal', 'completed', 'plain task result') RETURNING id",
+      ).get() as { id: number }).id
+      db.run(handle => persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: 'plain task result' }))
+
+      const result = db.run(handle => reflect(handle))
+      expect(result.diffed).toBe(1)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})
+
+describe('PK-PF1-5 fold: supersedeSharedPattern() validation + full-lineage dedup (codex round 1, MED)', () => {
+  function freshDb(): { db: TaskDB; path: string } {
+    const path = `/tmp/pf1-5-supersede-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    db.setFeatureFlag('outcome_feedback_enabled', true)
+    return { db, path }
+  }
+  function cleanup(db: TaskDB, path: string): void {
+    db.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(path + suffix) } catch {}
+    }
+  }
+  function seedDiffedExpectation(db: TaskDB, taskId: number, expected: string, actual: string): number {
+    return db.run(handle => {
+      const id = persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: expected })!
+      const diff = diffOutcome({ expected, actual })
+      handle.prepare("UPDATE outcome_expectations SET diffed_at = datetime('now'), diff_result = ? WHERE id = ?").run(JSON.stringify(diff), id)
+      return id
+    })
+  }
+
+  test('supersedeSharedPattern() returns null (no write) when oldPatternId does not exist', () => {
+    const { db, path } = freshDb()
+    try {
+      const before = db.run(handle => handle.prepare('SELECT COUNT(*) AS n FROM shared_patterns').get()) as { n: number }
+      const result = db.run(handle => supersedeSharedPattern(handle, 99999, { pattern_text: 'new', confidence: 0.9, source_expectation_id: 1 }))
+      expect(result).toBeNull()
+      const after = db.run(handle => handle.prepare('SELECT COUNT(*) AS n FROM shared_patterns').get()) as { n: number }
+      expect(after.n).toBe(before.n) // zero writes — no orphan replacement row
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('supersedeSharedPattern() returns null (no write) when oldPatternId is already inactive (already superseded)', () => {
+    const { db, path } = freshDb()
+    try {
+      const p1Id = db.run(handle => handle.prepare(
+        "INSERT INTO shared_patterns (pattern_text, confidence, is_active) VALUES ('p1', 0.7, 1) RETURNING id",
+      ).get() as { id: number }).id
+      const p2Id = db.run(handle => supersedeSharedPattern(handle, p1Id, { pattern_text: 'p2', confidence: 0.8, source_expectation_id: 1 }))
+      expect(p2Id).not.toBeNull()
+
+      // Attempting to supersede the now-INACTIVE p1 again must fail cleanly.
+      const before = db.run(handle => handle.prepare('SELECT COUNT(*) AS n FROM shared_patterns').get()) as { n: number }
+      const p3Id = db.run(handle => supersedeSharedPattern(handle, p1Id, { pattern_text: 'p3', confidence: 0.9, source_expectation_id: 1 }))
+      expect(p3Id).toBeNull()
+      const after = db.run(handle => handle.prepare('SELECT COUNT(*) AS n FROM shared_patterns').get()) as { n: number }
+      expect(after.n).toBe(before.n)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('after a valid supersede, distillSharedPattern() does NOT re-distill the same (now-superseded) signature', () => {
+    const { db, path } = freshDb()
+    try {
+      const ids = [1, 2, 3].map(n => seedDiffedExpectation(db, n, 'stable', 'stable'))
+      const rows = db.run(handle => getOutcomeExpectations(handle)).filter(r => ids.includes(r.id))
+      const p1 = db.run(handle => distillSharedPattern(handle, rows, 'match::stable'))
+      expect(p1).not.toBeNull()
+
+      // Supersede p1 with a manually-curated replacement (arbitrary pattern_text,
+      // simulating a human/curator supersede, not another auto-distill).
+      const p2 = db.run(handle => supersedeSharedPattern(handle, p1!, { pattern_text: 'curated replacement text', confidence: 0.95, source_expectation_id: rows[0].id }))
+      expect(p2).not.toBeNull()
+
+      // A 4th matching row accumulates — pre-fix, distillSharedPattern()'s
+      // "is_active=1" dedup filter finds NO active row for the "match::stable"
+      // tag (p1 is now inactive) and incorrectly re-distills, creating a
+      // duplicate active pattern for the same underlying signature.
+      const id4 = seedDiffedExpectation(db, 4, 'stable', 'stable')
+      const allRows = db.run(handle => getOutcomeExpectations(handle)).filter(r => [...ids, id4].includes(r.id))
+      const p3 = db.run(handle => distillSharedPattern(handle, allRows, 'match::stable'))
+      expect(p3).toBeNull() // must NOT re-distill — the signature was already handled (superseded)
+
+      const activePatterns = db.run(handle => getSharedPatterns(handle))
+      expect(activePatterns.length).toBe(1) // only the curated replacement is active
+      expect(activePatterns[0].pattern_text).toContain('curated replacement text')
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})
