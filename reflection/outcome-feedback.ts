@@ -33,29 +33,41 @@ export interface ExpectedOutcomeInput {
 /**
  * ATM-PF1-03/REQ-PF1-01/REQ-PF1-02 — Persists an ExpectedOutcomeInput as a
  * durable row in `outcome_expectations` (migrate()'d in db.ts, PK-PF1-1)
- * inside ONE LOCAL `BEGIN IMMEDIATE` transaction — mirrors
- * `decision.ts:156-206` (`finalizeDecision()`) and P8's
- * `persistTernaryReward()`, both of which check their feature flag BEFORE
- * opening any transaction. Gated on `outcome_feedback_enabled`
- * (REQ-PF1-08): when the flag row is missing or `enabled` is not exactly 1,
- * this returns `null` WITHOUT opening any transaction or inserting any row
- * — the flag-gate lives in the persist function itself (defense in depth),
- * not only at the future call sites PK-PF1-4 wires up.
+ * inside ONE LOCAL `BEGIN IMMEDIATE` transaction. Gated on
+ * `outcome_feedback_enabled` (REQ-PF1-08): when the flag is not exactly 1,
+ * this returns `null` WITHOUT inserting any row — the flag-gate lives in the
+ * persist function itself (defense in depth), not only at the future call
+ * sites PK-PF1-4 wires up.
+ *
+ * PK-PF1-5 codex round 3 fold (HIGH): the flag check happens INSIDE the
+ * transaction — the FIRST thing after `BEGIN IMMEDIATE`, not before it opens
+ * (that was round 1/2's structure, mirroring `decision.ts:156-206`'s and
+ * P8's `persistTernaryReward()`'s "check flag, then open transaction"
+ * shape). That shape has a real TOCTOU gap: another connection can flip the
+ * flag OFF in between this function's flag read and its `BEGIN IMMEDIATE`
+ * acquiring the write lock, and the write would still go through — codex
+ * reproduced exactly this, one `outcome_expectations` row committed while
+ * the flag ended at `0`. Re-checking the flag as the first statement AFTER
+ * `BEGIN IMMEDIATE` closes the gap: once the immediate lock is held, no
+ * other connection can flip the flag until this transaction
+ * commits/rolls back, so the re-checked value is authoritative for the
+ * whole transaction.
  *
  * Takes a raw `db: Database` handle (mirrors P6/P7/P8's own persist fns).
  * `recorded_at` is left to the column's own `DEFAULT (datetime('now'))`
  * (db.ts DDL) — this function never reads a wall clock itself.
  */
 export function persistOutcomeExpectation(db: Database, input: ExpectedOutcomeInput): number | null {
-  const flagRow = db
-    .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'outcome_feedback_enabled'")
-    .get() as { enabled: number } | null
-  if (!flagRow || flagRow.enabled !== 1) {
-    return null
-  }
-
   db.prepare('BEGIN IMMEDIATE').run()
   try {
+    const flagRow = db
+      .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'outcome_feedback_enabled'")
+      .get() as { enabled: number } | null
+    if (!flagRow || flagRow.enabled !== 1) {
+      db.prepare('ROLLBACK').run()
+      return null
+    }
+
     const inserted = db
       .prepare(`
         INSERT INTO outcome_expectations (task_id, expected_outcome)
@@ -191,8 +203,10 @@ export interface SharedPatternInput {
  * ATM-PF1-06/REQ-PF1-05 — Persists a SharedPatternInput as a durable row in
  * `shared_patterns` inside ONE LOCAL `BEGIN IMMEDIATE` transaction. Gated on
  * `outcome_feedback_enabled` exactly like persistOutcomeExpectation() — flag
- * check before any transaction opens, returns `null` with zero writes when
- * OFF. New rows default `is_active=1` (the DDL's column default).
+ * check happens as the first statement INSIDE the transaction (PK-PF1-5
+ * codex round 3 fold — see persistOutcomeExpectation()'s doc comment for
+ * why), returns `null` with zero writes when OFF. New rows default
+ * `is_active=1` (the DDL's column default).
  *
  * Kept as a standalone, spec-named primitive (the spec's Functions bullet
  * lists `persistSharedPattern()` explicitly) — but as of PK-PF1-5 codex
@@ -206,15 +220,21 @@ export interface SharedPatternInput {
  * future caller that doesn't need a co-transacted dedup check.
  */
 export function persistSharedPattern(db: Database, input: SharedPatternInput): number | null {
-  const flagRow = db
-    .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'outcome_feedback_enabled'")
-    .get() as { enabled: number } | null
-  if (!flagRow || flagRow.enabled !== 1) {
-    return null
-  }
-
+  // PK-PF1-5 codex round 3 fold (HIGH): flag check moved INSIDE the
+  // transaction — see persistOutcomeExpectation()'s doc comment for the
+  // TOCTOU this closes (flag flips OFF between an outside-transaction check
+  // and BEGIN IMMEDIATE acquiring the lock; codex reproduced it for every
+  // PF1 write path).
   db.prepare('BEGIN IMMEDIATE').run()
   try {
+    const flagRow = db
+      .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'outcome_feedback_enabled'")
+      .get() as { enabled: number } | null
+    if (!flagRow || flagRow.enabled !== 1) {
+      db.prepare('ROLLBACK').run()
+      return null
+    }
+
     const inserted = db
       .prepare(`
         INSERT INTO shared_patterns (pattern_text, confidence, source_expectation_id)
@@ -270,9 +290,23 @@ export function computeSignature(matched: boolean, expectedOutcome: string): str
  * victim's real distillation (codex reproduced this). Base64's output
  * alphabet (`A-Za-z0-9+/=`) cannot contain `[`, `]`, or a space, so this
  * class of collision is now structurally impossible, not just unlikely.
+ *
+ * PK-PF1-5 codex round 3 fold (MED): the encoding is `utf16le`, NOT `utf-8`.
+ * JS strings are UTF-16 and can contain LONE (unpaired) surrogates, which
+ * are not valid Unicode scalar values — `Buffer.from(str, 'utf-8')` silently
+ * replaces an invalid/lone surrogate with U+FFFD during encoding, which is
+ * NOT injective: a string containing a genuine U+FFFD character and a
+ * string containing an unrelated lone surrogate can produce IDENTICAL UTF-8
+ * bytes (both become U+FFFD's encoding), hence identical base64 output,
+ * even though the two original signatures are different strings (codex
+ * reproduced this, causing a real signature group's distillation to be
+ * falsely suppressed by an unrelated one). `Buffer.from(str, 'utf16le')`
+ * encodes the string's raw UTF-16 code units directly and losslessly (2
+ * bytes per code unit, no validity transformation), which is injective over
+ * all possible JS strings, including ones with lone surrogates.
  */
 function signatureTag(signature: string): string {
-  const encoded = Buffer.from(signature, 'utf-8').toString('base64')
+  const encoded = Buffer.from(signature, 'utf16le').toString('base64')
   return `[[sig:${encoded}]]`
 }
 
@@ -322,6 +356,12 @@ function signatureTag(signature: string): string {
  * persistSharedPattern() — SQLite doesn't support nested `BEGIN IMMEDIATE`
  * on one connection, so the insert logic is inlined here inside this
  * function's own transaction instead.
+ *
+ * PK-PF1-5 codex round 3 fold (HIGH): the flag check ALSO moved inside this
+ * same transaction (immediately after `BEGIN IMMEDIATE`, before the dedup
+ * check) rather than before it opens — see persistOutcomeExpectation()'s
+ * doc comment for the TOCTOU this closes. The `matchingGroup.length < 3`
+ * check stays outside (pure, no DB access, safe either way).
  */
 export function distillSharedPattern(
   db: Database,
@@ -330,13 +370,6 @@ export function distillSharedPattern(
   corroborated: boolean = false,
 ): number | null {
   if (matchingGroup.length < 3) {
-    return null
-  }
-
-  const flagRow = db
-    .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'outcome_feedback_enabled'")
-    .get() as { enabled: number } | null
-  if (!flagRow || flagRow.enabled !== 1) {
     return null
   }
 
@@ -360,6 +393,14 @@ export function distillSharedPattern(
 
   db.prepare('BEGIN IMMEDIATE').run()
   try {
+    const flagRow = db
+      .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'outcome_feedback_enabled'")
+      .get() as { enabled: number } | null
+    if (!flagRow || flagRow.enabled !== 1) {
+      db.prepare('ROLLBACK').run()
+      return null
+    }
+
     const allPatternTexts = db
       .prepare('SELECT pattern_text FROM shared_patterns')
       .all() as { pattern_text: string }[]
@@ -417,17 +458,23 @@ export function distillSharedPattern(
  * reproduced this). If the guarded update affects zero rows (another caller
  * won the race first), the whole transaction — including the replacement
  * row this call inserted — is rolled back, so no orphan row is left behind.
+ *
+ * PK-PF1-5 codex round 3 fold (HIGH): the flag check ALSO moved inside this
+ * transaction (immediately after `BEGIN IMMEDIATE`, before the existence
+ * check) rather than before it opens — see persistOutcomeExpectation()'s
+ * doc comment for the TOCTOU this closes.
  */
 export function supersedeSharedPattern(db: Database, oldPatternId: number, newInput: SharedPatternInput): number | null {
-  const flagRow = db
-    .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'outcome_feedback_enabled'")
-    .get() as { enabled: number } | null
-  if (!flagRow || flagRow.enabled !== 1) {
-    return null
-  }
-
   db.prepare('BEGIN IMMEDIATE').run()
   try {
+    const flagRow = db
+      .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'outcome_feedback_enabled'")
+      .get() as { enabled: number } | null
+    if (!flagRow || flagRow.enabled !== 1) {
+      db.prepare('ROLLBACK').run()
+      return null
+    }
+
     const oldRow = db
       .prepare('SELECT id FROM shared_patterns WHERE id = ? AND is_active = 1')
       .get(oldPatternId)
@@ -518,6 +565,17 @@ export function supersedeSharedPattern(db: Database, oldPatternId: number, newIn
  * >= 3 (REQ-PF1-05). distillSharedPattern()'s own dedup (the `[[sig:...]]`
  * tag) is what prevents re-distilling the same signature on every
  * subsequent pass.
+ *
+ * PK-PF1-5 codex round 3 fold (HIGH): the OUTER flag check above stays as a
+ * fast-path (avoids the un-diffed scan + triad reads entirely when clearly
+ * OFF), but is NOT sufficient alone for correctness — another connection
+ * could flip the flag OFF after this check but before a per-row write
+ * commits, and that row would still get diffed/audited while the flag reads
+ * `0` (codex reproduced this). Each per-row transaction in Phase 1's loop
+ * below therefore RE-CHECKS the flag as the first statement after its own
+ * `BEGIN IMMEDIATE`, authoritative for that row's write. Phase 3's writes go
+ * through `distillSharedPattern()`, which has its own internal re-check
+ * (see that function's doc comment) — no separate re-check needed here.
  */
 export function reflect(db: Database): { diffed: number; distilled: number } {
   const flagRow = db
@@ -541,6 +599,15 @@ export function reflect(db: Database): { diffed: number; distilled: number } {
     const diff = diffOutcome({ expected: row.expected_outcome, actual: row.actual })
     db.prepare('BEGIN IMMEDIATE').run()
     try {
+      const rowFlagRow = db
+        .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'outcome_feedback_enabled'")
+        .get() as { enabled: number } | null
+      if (!rowFlagRow || rowFlagRow.enabled !== 1) {
+        // Flag flipped OFF since the outer fast-path check — do not write.
+        db.prepare('ROLLBACK').run()
+        continue
+      }
+
       const updateResult = db
         .prepare("UPDATE outcome_expectations SET diffed_at = datetime('now'), diff_result = ? WHERE id = ? AND diffed_at IS NULL")
         .run(JSON.stringify(diff), row.id)

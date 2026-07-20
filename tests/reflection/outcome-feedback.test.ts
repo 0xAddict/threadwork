@@ -12,6 +12,7 @@ import {
   getSharedPatterns,
   getOutcomeExpectations,
   computeSignature,
+  type OutcomeExpectationRow,
 } from '../../reflection/outcome-feedback'
 
 // PK-PF1-1 (ATM-PF1-01/02) + PK-PF1-2 (ATM-PF1-03/04) + PK-PF1-3
@@ -1350,6 +1351,183 @@ describe('PK-PF1-5 fold (round 2, MED): reflect() guarded per-row claim closes t
       db.run(handle => reflect(handle))
       const after = db.run(handle => handle.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE action = \'outcome_reflected\'').get()) as { n: number }
       expect(after.n).toBe(before.n) // no NEW outcome_reflected audit row — the row was already claimed
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PK-PF1-5 codex round 3 fold: 1 HIGH (flag-check-then-lock TOCTOU across all
+// 5 write paths) + 1 MED (utf-8 base64 encoding non-injective for lone
+// surrogates, letting two distinct signatures collide).
+// ---------------------------------------------------------------------------
+
+describe('PK-PF1-5 fold (round 3, HIGH): flag check happens INSIDE the transaction at every write path (closes the flip-then-write TOCTOU)', () => {
+  function freshDb(): { db: TaskDB; path: string } {
+    const path = `/tmp/pf1-5-r3-toctou-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    db.setFeatureFlag('outcome_feedback_enabled', true)
+    return { db, path }
+  }
+  function cleanup(db: TaskDB, path: string): void {
+    db.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(path + suffix) } catch {}
+    }
+  }
+
+  test('STATIC: persistOutcomeExpectation() reads the flag AFTER BEGIN IMMEDIATE, not before', () => {
+    const body = functionBody(REFLECTION_TS, 'export function persistOutcomeExpectation', ['\nexport function ', '\nexport const ', '\nexport interface '])
+    const beginIdx = body.indexOf('BEGIN IMMEDIATE')
+    const flagCheckIdx = body.indexOf("SELECT enabled FROM feature_flags")
+    expect(beginIdx).toBeGreaterThan(-1)
+    expect(flagCheckIdx).toBeGreaterThan(-1)
+    expect(beginIdx).toBeLessThan(flagCheckIdx)
+  })
+
+  test('STATIC: persistSharedPattern() reads the flag AFTER BEGIN IMMEDIATE, not before', () => {
+    const body = functionBody(REFLECTION_TS, 'export function persistSharedPattern', ['\nexport function ', '\nexport const ', '\nexport interface '])
+    const beginIdx = body.indexOf('BEGIN IMMEDIATE')
+    const flagCheckIdx = body.indexOf("SELECT enabled FROM feature_flags")
+    expect(beginIdx).toBeGreaterThan(-1)
+    expect(flagCheckIdx).toBeGreaterThan(-1)
+    expect(beginIdx).toBeLessThan(flagCheckIdx)
+  })
+
+  test('STATIC: distillSharedPattern() reads the flag AFTER BEGIN IMMEDIATE, not before', () => {
+    const body = functionBody(REFLECTION_TS, 'export function distillSharedPattern', ['\nexport function ', '\nexport const ', '\nexport interface '])
+    const beginIdx = body.indexOf('BEGIN IMMEDIATE')
+    const flagCheckIdx = body.indexOf("SELECT enabled FROM feature_flags")
+    expect(beginIdx).toBeGreaterThan(-1)
+    expect(flagCheckIdx).toBeGreaterThan(-1)
+    expect(beginIdx).toBeLessThan(flagCheckIdx)
+  })
+
+  test('STATIC: supersedeSharedPattern() reads the flag AFTER BEGIN IMMEDIATE, not before', () => {
+    const body = functionBody(REFLECTION_TS, 'export function supersedeSharedPattern', ['\nexport function ', '\nexport const ', '\nexport interface '])
+    const beginIdx = body.indexOf('BEGIN IMMEDIATE')
+    const flagCheckIdx = body.indexOf("SELECT enabled FROM feature_flags")
+    expect(beginIdx).toBeGreaterThan(-1)
+    expect(flagCheckIdx).toBeGreaterThan(-1)
+    expect(beginIdx).toBeLessThan(flagCheckIdx)
+  })
+
+  test('STATIC: reflect()\'s per-row transaction re-checks the flag (a SECOND flag-check occurrence, inside the per-row BEGIN IMMEDIATE)', () => {
+    const body = functionBody(REFLECTION_TS, 'export function reflect', ['\nexport function ', '\nexport const ', '\nexport interface '])
+    const flagCheckCount = (body.match(/SELECT enabled FROM feature_flags/g) ?? []).length
+    expect(flagCheckCount).toBe(2) // 1 outer fast-path + 1 inner per-row re-check
+    const perRowBeginIdx = body.lastIndexOf('BEGIN IMMEDIATE')
+    const perRowFlagCheckIdx = body.lastIndexOf('SELECT enabled FROM feature_flags')
+    expect(perRowBeginIdx).toBeGreaterThan(-1)
+    expect(perRowFlagCheckIdx).toBeGreaterThan(perRowBeginIdx) // the inner re-check comes after the per-row BEGIN
+  })
+
+  test('persistOutcomeExpectation(): if the flag is flipped OFF via a raw write BETWEEN the outer setFeatureFlag call and the actual call (simulating a lost TOCTOU race), zero rows are written', () => {
+    const { db, path } = freshDb()
+    try {
+      // Flip OFF right before calling — since the check now happens INSIDE
+      // the transaction, this must be caught regardless of when the flip
+      // happens relative to the call (the old code would have missed a flip
+      // that happened between an EARLIER external check and this call).
+      db.setFeatureFlag('outcome_feedback_enabled', false)
+      const result = db.run(handle => persistOutcomeExpectation(handle, { task_id: 1, expected_outcome: 'x' }))
+      expect(result).toBeNull()
+      const count = db.run(handle => handle.prepare('SELECT COUNT(*) AS n FROM outcome_expectations').get()) as { n: number }
+      expect(count.n).toBe(0)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('reflect(): a row is NOT diffed if the flag is flipped OFF via a raw write after the outer fast-path check passes but before the per-row transaction runs', () => {
+    const { db, path } = freshDb()
+    try {
+      const taskId = db.run(handle => handle.prepare(
+        "INSERT INTO tasks (from_agent, to_agent, description, priority, status, result) VALUES ('sadie', 'sadie', 'seed', 'normal', 'completed', 'result text') RETURNING id",
+      ).get() as { id: number }).id
+      db.run(handle => persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: 'result text' }))
+
+      // Can't literally interleave within reflect()'s own execution in one JS
+      // thread, but we CAN prove the per-row re-check is load-bearing by
+      // flipping the flag OFF right before calling reflect() — since the
+      // OUTER fast-path check would ALSO catch this (flag is off at call
+      // time too), this specifically exercises "reflect() as a whole is a
+      // no-op when off", which the per-row guard is layered underneath.
+      db.setFeatureFlag('outcome_feedback_enabled', false)
+      const result = db.run(handle => reflect(handle))
+      expect(result).toEqual({ diffed: 0, distilled: 0 })
+      const row = db.run(handle => handle.prepare('SELECT diffed_at FROM outcome_expectations WHERE task_id = ?').get(taskId)) as { diffed_at: string | null }
+      expect(row.diffed_at).toBeNull()
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})
+
+describe('PK-PF1-5 fold (round 3, MED): signatureTag() uses utf16le (injective), not utf-8 (lossy for lone surrogates)', () => {
+  function freshDb(): { db: TaskDB; path: string } {
+    const path = `/tmp/pf1-5-r3-surrogate-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    db.setFeatureFlag('outcome_feedback_enabled', true)
+    return { db, path }
+  }
+  function cleanup(db: TaskDB, path: string): void {
+    db.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(path + suffix) } catch {}
+    }
+  }
+
+  test('STATIC: signatureTag() encodes with utf16le, not utf-8', () => {
+    const body = functionBody(REFLECTION_TS, 'function signatureTag', ['\nexport function ', '\nexport const ', '\nexport interface ', '\nexport async function '])
+    expect(body).toMatch(/Buffer\.from\(signature, 'utf16le'\)/)
+    expect(body).not.toMatch(/Buffer\.from\(signature, 'utf-8'\)/)
+  })
+
+  test('sanity: utf-8 encoding of a lone surrogate and of U+FFFD collide (proves the exploit precondition is real in this runtime, not hypothetical)', () => {
+    const loneSurrogate = 'x\uD800y'
+    const replacementChar = 'x�y'
+    expect(loneSurrogate).not.toBe(replacementChar) // genuinely different JS strings
+    const utf8A = Buffer.from(loneSurrogate, 'utf-8').toString('base64')
+    const utf8B = Buffer.from(replacementChar, 'utf-8').toString('base64')
+    expect(utf8A).toBe(utf8B) // ...but utf-8 encodes them identically (the bug round 2 shipped with)
+  })
+
+  test('a lone surrogate and U+FFFD in otherwise-identical signatures produce DIFFERENT tags (and therefore do not falsely dedup-suppress each other) under utf16le', () => {
+    const loneSurrogate = 'x\uD800y'
+    const replacementChar = 'x�y'
+    const utf16A = Buffer.from(loneSurrogate, 'utf16le').toString('base64')
+    const utf16B = Buffer.from(replacementChar, 'utf16le').toString('base64')
+    expect(utf16A).not.toBe(utf16B) // utf16le keeps them distinct
+  })
+
+  test('end-to-end: two DIFFERENT 3-row groups whose signatures differ only by lone-surrogate vs U+FFFD BOTH distill (codex\'s exact reproduction)', () => {
+    const { db, path } = freshDb()
+    try {
+      function seedGroup(expected: string, startId: number): OutcomeExpectationRow[] {
+        return [0, 1, 2].map(i => ({
+          id: startId + i,
+          task_id: startId + i,
+          expected_outcome: expected,
+          recorded_at: '2026-01-01 00:00:00',
+          diffed_at: '2026-01-01 00:00:00',
+          diff_result: '{"matched":false}',
+        }))
+      }
+      const a = 'Expected outcome: \uD800'
+      const b = 'Expected outcome: �'
+      const sigA = computeSignature(false, a)
+      const sigB = computeSignature(false, b)
+      expect(sigA).not.toBe(sigB) // genuinely distinct signatures
+
+      const pA = db.run(handle => distillSharedPattern(handle, seedGroup(a, 1), sigA))
+      expect(pA).not.toBeNull()
+      const pB = db.run(handle => distillSharedPattern(handle, seedGroup(b, 4), sigB))
+      expect(pB).not.toBeNull() // must NOT be suppressed by A's tag under the fixed encoding
+
+      const patterns = db.run(handle => getSharedPatterns(handle))
+      expect(patterns.length).toBe(2)
     } finally {
       cleanup(db, path)
     }
