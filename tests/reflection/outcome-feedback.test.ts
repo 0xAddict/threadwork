@@ -699,3 +699,113 @@ describe('ATM-PF1-05: reflect() (runtime, fresh DB, standalone)', () => {
     expect(reflectBody).not.toMatch(/persistFailureClassification|persistCrossFamilyCritique|persistTernaryReward/)
   })
 })
+
+// ---------------------------------------------------------------------------
+// PK-PF1-4 Stage B — ATM-PF1-09: 4 distinct audit_log actions
+// ---------------------------------------------------------------------------
+
+describe('ATM-PF1-09: audit_log actions (runtime, fresh DB)', () => {
+  function freshDb(): { db: TaskDB; path: string } {
+    const path = `/tmp/pf1-audit-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    db.setFeatureFlag('outcome_feedback_enabled', true)
+    return { db, path }
+  }
+  function cleanup(db: TaskDB, path: string): void {
+    db.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(path + suffix) } catch {}
+    }
+  }
+  function auditActions(db: TaskDB): string[] {
+    return db.run(handle => handle.prepare('SELECT action FROM audit_log ORDER BY id ASC').all() as { action: string }[]).map(r => r.action)
+  }
+
+  test('persistOutcomeExpectation() appends exactly one "outcome_expected" audit_log row, same transaction as the insert', () => {
+    const { db, path } = freshDb()
+    try {
+      const id = db.run(handle => persistOutcomeExpectation(handle, { task_id: 1, expected_outcome: 'x' }))
+      expect(id).not.toBeNull()
+      const actions = auditActions(db)
+      expect(actions.filter(a => a === 'outcome_expected').length).toBe(1)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('reflect() appends one "outcome_reflected" audit_log row per row it diffs', () => {
+    const { db, path } = freshDb()
+    try {
+      const taskId = db.run(handle => handle.prepare(
+        "INSERT INTO tasks (from_agent, to_agent, description, priority, status, result) VALUES ('sadie', 'sadie', 'seed', 'normal', 'completed', 'ok') RETURNING id",
+      ).get() as { id: number }).id
+      db.run(handle => persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: 'ok' }))
+      const result = db.run(handle => reflect(handle))
+      expect(result.diffed).toBe(1)
+      const actions = auditActions(db)
+      expect(actions.filter(a => a === 'outcome_reflected').length).toBe(1)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('distillSharedPattern() (via persistSharedPattern) appends exactly one "shared_pattern_distilled" audit_log row on a successful distill', () => {
+    const { db, path } = freshDb()
+    try {
+      const ids = [1, 2, 3].map(n => db.run(handle => {
+        const id = persistOutcomeExpectation(handle, { task_id: n, expected_outcome: 'z' })!
+        const diff = diffOutcome({ expected: 'z', actual: 'z' })
+        handle.prepare("UPDATE outcome_expectations SET diffed_at = datetime('now'), diff_result = ? WHERE id = ?").run(JSON.stringify(diff), id)
+        return id
+      }))
+      const rows = db.run(handle => getOutcomeExpectations(handle)).filter(r => ids.includes(r.id))
+      const patternId = db.run(handle => distillSharedPattern(handle, rows, 'match::z'))
+      expect(patternId).not.toBeNull()
+      const actions = auditActions(db)
+      expect(actions.filter(a => a === 'shared_pattern_distilled').length).toBe(1)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('supersedeSharedPattern() appends exactly one "shared_pattern_superseded" audit_log row', () => {
+    const { db, path } = freshDb()
+    try {
+      const p1Id = db.run(handle => handle.prepare(
+        "INSERT INTO shared_patterns (pattern_text, confidence, is_active) VALUES ('old', 0.7, 1) RETURNING id",
+      ).get() as { id: number }).id
+      const p2Id = db.run(handle => supersedeSharedPattern(handle, p1Id, { pattern_text: 'new', confidence: 0.9, source_expectation_id: 1 }))
+      expect(p2Id).not.toBeNull()
+      const actions = auditActions(db)
+      expect(actions.filter(a => a === 'shared_pattern_superseded').length).toBe(1)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('flag OFF: zero audit_log rows from any PF1 write path (no-op returns null before any write, incl. audit)', () => {
+    const path = `/tmp/pf1-audit-off-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    try {
+      const id = db.run(handle => persistOutcomeExpectation(handle, { task_id: 1, expected_outcome: 'x' }))
+      expect(id).toBeNull()
+      const actions = auditActions(db)
+      expect(actions.filter(a => ['outcome_expected', 'outcome_reflected', 'shared_pattern_distilled', 'shared_pattern_superseded'].includes(a)).length).toBe(0)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('a failed persistOutcomeExpectation() transaction (forced throw) rolls back the audit row too (all-or-nothing)', () => {
+    const { db, path } = freshDb()
+    try {
+      // task_id NOT NULL violation forces the INSERT (and therefore the whole txn) to throw.
+      // @ts-expect-error — deliberate NOT NULL violation to force a DB-level throw.
+      expect(() => db.run(handle => persistOutcomeExpectation(handle, { task_id: null, expected_outcome: 'x' }))).toThrow()
+      const actions = auditActions(db)
+      expect(actions.filter(a => a === 'outcome_expected').length).toBe(0)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})

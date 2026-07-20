@@ -63,6 +63,17 @@ export function persistOutcomeExpectation(db: Database, input: ExpectedOutcomeIn
         RETURNING id
       `)
       .get(input.task_id, input.expected_outcome) as { id: number }
+
+    // ATM-PF1-09/REQ-PF1-09: distinct audit row, SAME local transaction as
+    // the insert above — all-or-nothing (mirrors persistTernaryReward()'s
+    // exact idiom: a raw INSERT INTO audit_log against the same `db` handle,
+    // agent='system', not the AuditLog class — these persist fns only ever
+    // take a raw Database handle).
+    db.prepare(`
+      INSERT INTO audit_log (agent, action, detail, task_id)
+      VALUES (?, ?, ?, ?)
+    `).run('system', 'outcome_expected', JSON.stringify({ expected_outcome: input.expected_outcome }), input.task_id)
+
     db.prepare('COMMIT').run()
     return inserted.id
   } catch (err) {
@@ -200,6 +211,16 @@ export function persistSharedPattern(db: Database, input: SharedPatternInput): n
         RETURNING id
       `)
       .get(input.pattern_text, input.confidence, input.source_expectation_id) as { id: number }
+
+    // ATM-PF1-09/REQ-PF1-09: distinct audit row, same transaction. This
+    // function is called ONLY by distillSharedPattern() (never by
+    // supersedeSharedPattern(), which has its own inline insert below) —
+    // 'shared_pattern_distilled' is therefore always the correct action.
+    db.prepare(`
+      INSERT INTO audit_log (agent, action, detail, task_id)
+      VALUES (?, ?, ?, ?)
+    `).run('system', 'shared_pattern_distilled', JSON.stringify({ pattern_text: input.pattern_text, confidence: input.confidence, source_expectation_id: input.source_expectation_id }), null)
+
     db.prepare('COMMIT').run()
     return inserted.id
   } catch (err) {
@@ -316,6 +337,14 @@ export function supersedeSharedPattern(db: Database, oldPatternId: number, newIn
       `)
       .get(newInput.pattern_text, newInput.confidence, newInput.source_expectation_id) as { id: number }
     db.prepare('UPDATE shared_patterns SET is_active = 0, superseded_by = ? WHERE id = ?').run(inserted.id, oldPatternId)
+
+    // ATM-PF1-09/REQ-PF1-09: distinct audit row, same transaction as the
+    // insert+update pair above.
+    db.prepare(`
+      INSERT INTO audit_log (agent, action, detail, task_id)
+      VALUES (?, ?, ?, ?)
+    `).run('system', 'shared_pattern_superseded', JSON.stringify({ old_pattern_id: oldPatternId, new_pattern_id: inserted.id }), null)
+
     db.prepare('COMMIT').run()
     return inserted.id
   } catch (err) {
@@ -367,12 +396,12 @@ export function reflect(db: Database): { diffed: number; distilled: number } {
 
   const undiffed = db
     .prepare(`
-      SELECT oe.id AS id, oe.expected_outcome AS expected_outcome, t.result AS actual
+      SELECT oe.id AS id, oe.task_id AS task_id, oe.expected_outcome AS expected_outcome, t.result AS actual
       FROM outcome_expectations oe
       JOIN tasks t ON t.id = oe.task_id
       WHERE oe.diffed_at IS NULL AND t.result IS NOT NULL
     `)
-    .all() as { id: number; expected_outcome: string; actual: string }[]
+    .all() as { id: number; task_id: number; expected_outcome: string; actual: string }[]
 
   let diffedCount = 0
   for (const row of undiffed) {
@@ -381,6 +410,14 @@ export function reflect(db: Database): { diffed: number; distilled: number } {
     try {
       db.prepare("UPDATE outcome_expectations SET diffed_at = datetime('now'), diff_result = ? WHERE id = ?")
         .run(JSON.stringify(diff), row.id)
+
+      // ATM-PF1-09/REQ-PF1-09: distinct audit row per diffed row, same
+      // transaction as that row's UPDATE.
+      db.prepare(`
+        INSERT INTO audit_log (agent, action, detail, task_id)
+        VALUES (?, ?, ?, ?)
+      `).run('system', 'outcome_reflected', JSON.stringify({ outcome_expectation_id: row.id, matched: diff.matched }), row.task_id)
+
       db.prepare('COMMIT').run()
       diffedCount++
     } catch (err) {

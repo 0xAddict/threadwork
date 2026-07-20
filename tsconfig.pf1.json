@@ -19,6 +19,8 @@
     "db.ts",
     "server.ts",
     "debrief.ts",
-    "tests/reflection/outcome-feedback.test.ts"
+    "tests/reflection/outcome-feedback.test.ts",
+    "tests/reflection/pf1-4-sequence-behavior.test.ts",
+    "tests/guardrails/pf1-4-wiring.guard.test.ts"
   ]
 }

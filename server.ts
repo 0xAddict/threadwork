@@ -29,6 +29,10 @@ import { handleSaveMemory, handleGetBootBriefing, handleWriteHandoff } from './m
 import { isDenseEnabled } from './dense'
 import { DecisionDB, expireStaleDecisions } from './decision'
 import { forceDebrief } from './debrief'
+// EPIC-PF1 (PK-PF1-4, boss's OQ-1 mechanical-inclusion ruling): additive,
+// flag-gated, try/catch-swallowed pre-act hook at all 4 claim/delegation
+// sites below. See PF1-4-DESIGN.md.
+import { recordExpectedOutcome } from './reflection/outcome-feedback'
 import {
   DELEGATION_BRIEFS_FLAG,
   assembleDelegationBrief,
@@ -875,6 +879,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             delegation_brief: brief?.text ?? null,
           })
 
+          // EPIC-PF1 (PK-PF1-4, REQ-PF1-01): pre-act expectation record.
+          // delegate_task is the one asymmetric hook site — it CREATES the
+          // task, so there is no task_id to record against until
+          // db.delegateTask() above returns. This is the closest honest
+          // reading of "before the action proceeds": before delegation is
+          // externally communicated (before the nudge/postToGroup calls
+          // below), not before the row exists (structurally impossible).
+          // Additive, flag-gated internally, try/catch-swallowed.
+          try {
+            recordExpectedOutcome(db.getHandle(), { task_id: task.id, expected_outcome: `Task #${task.id} delegated to ${to}: ${description}` })
+          } catch {
+            // swallowed — REQ-PF1-10
+          }
+
           // Surfacing pointer (PC-4): keep the nudge small; the full brief is shown on
           // claim_task / list_tasks / boot. No brief ⇒ unchanged nudge (AC-5).
           const briefHint = brief ? ' A curated delegation brief is attached (shown when you claim_task).' : ''
@@ -908,6 +926,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'claim_task': {
         const taskId = args.task_id as number
         const sessionId = args.session_id as string | undefined
+
+        // EPIC-PF1 (PK-PF1-4, REQ-PF1-01): pre-act expectation record, before
+        // the claim action proceeds. Additive, flag-gated (internally, via
+        // recordExpectedOutcome()'s own outcome_feedback_enabled check),
+        // try/catch-swallowed — must never affect claim_task's own outcome.
+        try {
+          recordExpectedOutcome(db.getHandle(), { task_id: taskId, expected_outcome: `Task #${taskId} claimed by ${SELF_LABEL}` })
+        } catch {
+          // swallowed — REQ-PF1-10
+        }
 
         // Use session-aware claim
         const task = db.claimTaskWithSession(taskId, SELF_LABEL, sessionId ?? AGENT_SESSIONS[SELF_LABEL])
@@ -2072,6 +2100,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: `Invalid supervisor "${supervisor}". Valid agents: ${TEAM_AGENTS.join(', ')}`, isError: true }] }
         }
 
+        // EPIC-PF1 (PK-PF1-4, REQ-PF1-01): pre-act expectation record, before
+        // the assign action proceeds. Additive, flag-gated internally,
+        // try/catch-swallowed.
+        try {
+          recordExpectedOutcome(db.getHandle(), { task_id: taskId, expected_outcome: `Task #${taskId} assigned to ${toAgent} by ${SELF_LABEL}` })
+        } catch {
+          // swallowed — REQ-PF1-10
+        }
+
         const task = db.assignTask(taskId, toAgent, supervisor)
         if (!task) {
           audit.log(SELF_LABEL, 'task_failed', { task_id: taskId, reason: 'assign: not found or terminal' }, taskId)
@@ -2097,6 +2134,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         if (toStatus !== 'in_progress') {
           return { content: [{ type: 'text', text: `transition_task currently supports only to_status='in_progress' (the GO transition). Got "${toStatus}".`, isError: true }] }
+        }
+
+        // EPIC-PF1 (PK-PF1-4, REQ-PF1-01): pre-act expectation record, before
+        // the transition action proceeds. Additive, flag-gated internally,
+        // try/catch-swallowed.
+        try {
+          recordExpectedOutcome(db.getHandle(), { task_id: taskId, expected_outcome: `Task #${taskId} transitioned to in_progress (GO) by ${SELF_LABEL}` })
+        } catch {
+          // swallowed — REQ-PF1-10
         }
 
         const task = db.transitionToInProgress(taskId, sessionId ?? AGENT_SESSIONS[SELF_LABEL])
