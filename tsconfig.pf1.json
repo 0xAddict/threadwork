@@ -18,6 +18,7 @@
     "reflection/outcome-feedback.ts",
     "db.ts",
     "server.ts",
-    "debrief.ts"
+    "debrief.ts",
+    "tests/reflection/outcome-feedback.test.ts"
   ]
 }

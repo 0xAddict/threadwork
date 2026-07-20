@@ -13,6 +13,9 @@
 // `verification/` — PF1 is not a verification-axis capability (see PF-spec.md
 // Overlap/Isolation Proof carve #1). It must read the existing verification-axis
 // triad (getFailureClassifications/getCrossFamilyCritiques/getTernaryRewards)
-// strictly SELECT-only and must never import P5's withMemoryWriteTxn().
+// strictly SELECT-only, and per the Persistence idiom section of PF-spec.md,
+// all PF1 writes use the LOCAL BEGIN IMMEDIATE idiom (decision.ts:156-206) —
+// never P5's memory-write-transaction primitive (that helper belongs to the
+// P5 namespace; see PF-spec.md for why PF1 must not depend on it).
 
 export {};
