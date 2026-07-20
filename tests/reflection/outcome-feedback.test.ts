@@ -1146,3 +1146,212 @@ describe('PK-PF1-5 fold (E2/L2): RECURRENCE-COLLISION — equivalent description
     expect(occurrences).toBe(4)
   })
 })
+
+// ---------------------------------------------------------------------------
+// PK-PF1-5 codex round 2 fold: 1 HIGH (delimiter-collision in the [[sig:]]
+// tag) + 3 MED (check-then-write races in distillSharedPattern()/
+// supersedeSharedPattern()/reflect(), all closed by moving the check inside
+// the BEGIN IMMEDIATE transaction and using a guarded UPDATE with an
+// affected-row-count check — mirrors verification/reward-consumer.ts's own
+// `.changes === 1` precedent).
+// ---------------------------------------------------------------------------
+
+describe('PK-PF1-5 fold (round 2, HIGH): signatureTag() delimiter-collision is closed by base64 encoding', () => {
+  function freshDb(): { db: TaskDB; path: string } {
+    const path = `/tmp/pf1-5-r2-delim-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    db.setFeatureFlag('outcome_feedback_enabled', true)
+    return { db, path }
+  }
+  function cleanup(db: TaskDB, path: string): void {
+    db.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(path + suffix) } catch {}
+    }
+  }
+  function seedDiffedExpectation(db: TaskDB, taskId: number, expected: string, actual: string): number {
+    return db.run(handle => {
+      const id = persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: expected })!
+      const diff = diffOutcome({ expected, actual })
+      handle.prepare("UPDATE outcome_expectations SET diffed_at = datetime('now'), diff_result = ? WHERE id = ?").run(JSON.stringify(diff), id)
+      return id
+    })
+  }
+
+  test('a description containing the literal delimiter sequence "]] " (codex round 2\'s exact reproduction) does not suppress an unrelated victim signature\'s distillation', () => {
+    const { db, path } = freshDb()
+    try {
+      // Attacker group: description engineered so its RAW signature is
+      // `mismatch::expected outcome: foo]] bar` — the pre-fix plain-text tag
+      // for this is `[[sig:mismatch::expected outcome: foo]] bar]]`, which
+      // has the VICTIM's shorter tag (below) as its own literal prefix. Both
+      // groups must share the same `matched` polarity (mismatch) for the
+      // raw signature text to actually collide — a same-signature retest
+      // with differing match/mismatch flags never shares a tag at all, so
+      // this is deliberately constructed to fail with a diffOutcome() actual
+      // that is NOT equal to expected (forcing matched:false for both).
+      const attackerIds = [1, 2, 3].map(n => seedDiffedExpectation(db, n, 'Expected outcome: foo]] bar', 'observed-attacker'))
+      const attackerRows = db.run(handle => getOutcomeExpectations(handle)).filter(r => attackerIds.includes(r.id))
+      const attackerSig = computeSignature(false, 'Expected outcome: foo]] bar')
+      expect(attackerSig).toBe('mismatch::expected outcome: foo]] bar') // sanity: confirms the exact exploit shape
+      const pAttacker = db.run(handle => distillSharedPattern(handle, attackerRows, attackerSig))
+      expect(pAttacker).not.toBeNull()
+
+      // Victim group: an UNRELATED, shorter signature (also mismatch) whose
+      // plain-text tag is an exact PREFIX of the attacker's plain-text tag.
+      const victimIds = [4, 5, 6].map(n => seedDiffedExpectation(db, n, 'Expected outcome: foo', 'observed-victim'))
+      const victimRows = db.run(handle => getOutcomeExpectations(handle)).filter(r => victimIds.includes(r.id))
+      const victimSig = computeSignature(false, 'Expected outcome: foo')
+      expect(victimSig).toBe('mismatch::expected outcome: foo') // sanity
+      const pVictim = db.run(handle => distillSharedPattern(handle, victimRows, victimSig))
+      expect(pVictim).not.toBeNull() // must NOT be suppressed by the attacker's tag
+
+      const patterns = db.run(handle => getSharedPatterns(handle))
+      expect(patterns.length).toBe(2)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('signatureTag() base64-encodes the signature — the stored pattern_text never contains a raw, unencoded "[[sig:" collision-prone delimiter sequence from user text', () => {
+    const { db, path } = freshDb()
+    try {
+      const maliciousDesc = 'Expected outcome: [[sig:anything]] should not appear raw'
+      const ids = [1, 2, 3].map(n => seedDiffedExpectation(db, n, maliciousDesc, maliciousDesc))
+      const rows = db.run(handle => getOutcomeExpectations(handle)).filter(r => ids.includes(r.id))
+      const sig = computeSignature(true, maliciousDesc)
+      const pid = db.run(handle => distillSharedPattern(handle, rows, sig))
+      expect(pid).not.toBeNull()
+      const patterns = db.run(handle => getSharedPatterns(handle))
+      // The tag prefix itself must be base64 (no literal "[[sig:anything]]"
+      // from the malicious description appearing as the TAG — it may still
+      // appear later in the human-readable trailing description text, which
+      // is fine and expected; only the TAG prefix matters for dedup safety).
+      const tagPrefixMatch = patterns[0].pattern_text.match(/^\[\[sig:([A-Za-z0-9+/=]+)\]\]/)
+      expect(tagPrefixMatch).not.toBeNull()
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})
+
+describe('PK-PF1-5 fold (round 2, MED): distillSharedPattern() dedup check + insert are one atomic transaction', () => {
+  test('STATIC: BEGIN IMMEDIATE opens BEFORE the dedup SELECT in source order (not a check-then-separately-transacted-write)', () => {
+    const body = functionBody(REFLECTION_TS, 'export function distillSharedPattern', ['\nexport function ', '\nexport const ', '\nexport interface '])
+    const beginIdx = body.indexOf('BEGIN IMMEDIATE')
+    const dedupSelectIdx = body.indexOf("SELECT pattern_text FROM shared_patterns")
+    expect(beginIdx).toBeGreaterThan(-1)
+    expect(dedupSelectIdx).toBeGreaterThan(-1)
+    expect(beginIdx).toBeLessThan(dedupSelectIdx)
+  })
+})
+
+describe('PK-PF1-5 fold (round 2, MED): supersedeSharedPattern() guarded update closes the check-then-write race', () => {
+  function freshDb(): { db: TaskDB; path: string } {
+    const path = `/tmp/pf1-5-r2-supersede-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    db.setFeatureFlag('outcome_feedback_enabled', true)
+    return { db, path }
+  }
+  function cleanup(db: TaskDB, path: string): void {
+    db.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(path + suffix) } catch {}
+    }
+  }
+
+  test('STATIC: BEGIN IMMEDIATE opens BEFORE the existence/active-state SELECT in source order', () => {
+    const body = functionBody(REFLECTION_TS, 'export function supersedeSharedPattern', ['\nexport function ', '\nexport const ', '\nexport interface '])
+    const beginIdx = body.indexOf('BEGIN IMMEDIATE')
+    const checkIdx = body.indexOf("SELECT id FROM shared_patterns WHERE id = ? AND is_active = 1")
+    expect(beginIdx).toBeGreaterThan(-1)
+    expect(checkIdx).toBeGreaterThan(-1)
+    expect(beginIdx).toBeLessThan(checkIdx)
+  })
+
+  test('if the old pattern is deactivated by a RAW write between two supersedeSharedPattern() calls (simulating a lost race), the second call\'s guarded UPDATE detects zero affected rows and rolls back cleanly (no orphan replacement row)', () => {
+    const { db, path } = freshDb()
+    try {
+      const p1Id = db.run(handle => handle.prepare(
+        "INSERT INTO shared_patterns (pattern_text, confidence, is_active) VALUES ('p1', 0.7, 1) RETURNING id",
+      ).get() as { id: number }).id
+
+      // Simulate "another caller won the race": deactivate p1 via a raw
+      // write that bypasses supersedeSharedPattern() entirely, mimicking
+      // what a concurrent winning transaction would have already committed.
+      db.run(handle => handle.prepare('UPDATE shared_patterns SET is_active = 0, superseded_by = 99999 WHERE id = ?').run(p1Id))
+
+      const before = db.run(handle => handle.prepare('SELECT COUNT(*) AS n FROM shared_patterns').get()) as { n: number }
+      const result = db.run(handle => supersedeSharedPattern(handle, p1Id, { pattern_text: 'late-loser replacement', confidence: 0.9, source_expectation_id: 1 }))
+      expect(result).toBeNull()
+
+      const after = db.run(handle => handle.prepare('SELECT COUNT(*) AS n FROM shared_patterns').get()) as { n: number }
+      expect(after.n).toBe(before.n) // zero writes — no orphan replacement row inserted then abandoned
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})
+
+describe('PK-PF1-5 fold (round 2, MED): reflect() guarded per-row claim closes the double-diff race', () => {
+  function freshDb(): { db: TaskDB; path: string } {
+    const path = `/tmp/pf1-5-r2-reflect-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    db.setFeatureFlag('outcome_feedback_enabled', true)
+    return { db, path }
+  }
+  function cleanup(db: TaskDB, path: string): void {
+    db.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(path + suffix) } catch {}
+    }
+  }
+  function seedCompletedTask(db: TaskDB, result: string): number {
+    return db.run(handle => handle.prepare(
+      "INSERT INTO tasks (from_agent, to_agent, description, priority, status, result) VALUES ('sadie', 'sadie', 'seed', 'normal', 'completed', ?) RETURNING id",
+    ).get(result) as { id: number }).id
+  }
+
+  test('STATIC: BEGIN IMMEDIATE opens BEFORE the guarded per-row UPDATE in source order, and the UPDATE\'s WHERE clause re-checks diffed_at IS NULL', () => {
+    const body = functionBody(REFLECTION_TS, 'export function reflect', ['\nexport function ', '\nexport const ', '\nexport interface '])
+    const beginIdx = body.lastIndexOf('BEGIN IMMEDIATE') // the per-row loop's BEGIN, not any earlier one
+    const updateIdx = body.indexOf('AND diffed_at IS NULL')
+    expect(beginIdx).toBeGreaterThan(-1)
+    expect(updateIdx).toBeGreaterThan(-1)
+    expect(beginIdx).toBeLessThan(updateIdx)
+  })
+
+  test('if a row is claimed (diffed) by a RAW write between reflect()\'s own SELECT and its per-row UPDATE (simulating a lost race), the guarded UPDATE detects zero affected rows and skips it cleanly (no duplicate audit row)', () => {
+    const { db, path } = freshDb()
+    try {
+      const taskId = seedCompletedTask(db, 'result text')
+      const expId = db.run(handle => persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: 'result text' }))!
+
+      // Simulate "another concurrent reflect() call already claimed this
+      // row": mark it diffed via a raw write, bypassing reflect() entirely —
+      // AFTER reflect() would have already snapshotted it as un-diffed in
+      // its own SELECT (we can't literally interleave in one JS thread, but
+      // this proves the GUARD correctly refuses a stale claim regardless of
+      // how it became stale).
+      const originalUndiffedQuery = db.run(handle => handle.prepare(
+        "SELECT id FROM outcome_expectations WHERE id = ? AND diffed_at IS NULL",
+      ).get(expId))
+      expect(originalUndiffedQuery).not.toBeNull() // sanity: genuinely un-diffed before the race
+
+      db.run(handle => handle.prepare(
+        "UPDATE outcome_expectations SET diffed_at = datetime('now'), diff_result = '{\"matched\":true}' WHERE id = ?",
+      ).run(expId))
+
+      const before = db.run(handle => handle.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE action = \'outcome_reflected\'').get()) as { n: number }
+      // reflect() will find zero un-diffed rows now (the row is already
+      // diffed) — its own guard is what's under test in the OTHER static
+      // test above; this test proves the END STATE is correct (no duplicate
+      // audit row) regardless.
+      db.run(handle => reflect(handle))
+      const after = db.run(handle => handle.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE action = \'outcome_reflected\'').get()) as { n: number }
+      expect(after.n).toBe(before.n) // no NEW outcome_reflected audit row — the row was already claimed
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})

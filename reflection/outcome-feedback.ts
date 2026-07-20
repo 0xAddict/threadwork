@@ -193,6 +193,17 @@ export interface SharedPatternInput {
  * `outcome_feedback_enabled` exactly like persistOutcomeExpectation() — flag
  * check before any transaction opens, returns `null` with zero writes when
  * OFF. New rows default `is_active=1` (the DDL's column default).
+ *
+ * Kept as a standalone, spec-named primitive (the spec's Functions bullet
+ * lists `persistSharedPattern()` explicitly) — but as of PK-PF1-5 codex
+ * round 2's fold, `distillSharedPattern()` no longer calls this function; it
+ * inlines its own insert logic inside its own dedup-check-then-insert
+ * transaction instead (SQLite doesn't support nested `BEGIN IMMEDIATE` on
+ * one connection, and the dedup check needs to live INSIDE that same
+ * transaction to close a check-then-insert race — see
+ * `distillSharedPattern()`'s doc comment). This function remains a correct,
+ * independently-testable, flag-gated, transactional insert primitive for any
+ * future caller that doesn't need a co-transacted dedup check.
  */
 export function persistSharedPattern(db: Database, input: SharedPatternInput): number | null {
   const flagRow = db
@@ -245,11 +256,24 @@ export function computeSignature(matched: boolean, expectedOutcome: string): str
  * `shared_patterns` has no dedicated signature column (fixed DDL from
  * PK-PF1-1 — this packet cannot touch db.ts) so distillSharedPattern()'s
  * cross-call dedup embeds the signature as a machine-parseable tag inside
- * `pattern_text` and checks existing ACTIVE rows for it before re-distilling
- * the same signature on a later reflect() pass.
+ * `pattern_text` and checks existing rows for it before re-distilling the
+ * same signature on a later reflect() pass.
+ *
+ * PK-PF1-5 codex round 2 fold (HIGH): the raw signature is base64-encoded
+ * before being embedded in the tag. Round 1's fix (a plain-text tag) was
+ * itself exploitable: `signature` is built from user-controlled
+ * `expected_outcome` text (description-derived, per round 1's E2 fold), so a
+ * description containing the literal delimiter sequence `]] ` could forge a
+ * premature tag-close — a LONGER attacker tag like
+ * `[[sig:mismatch::...foo]] bar]]` then has a SHORTER, unrelated victim tag
+ * `[[sig:mismatch::...foo]]` as its own exact prefix, falsely suppressing the
+ * victim's real distillation (codex reproduced this). Base64's output
+ * alphabet (`A-Za-z0-9+/=`) cannot contain `[`, `]`, or a space, so this
+ * class of collision is now structurally impossible, not just unlikely.
  */
 function signatureTag(signature: string): string {
-  return `[[sig:${signature}]]`
+  const encoded = Buffer.from(signature, 'utf-8').toString('base64')
+  return `[[sig:${encoded}]]`
 }
 
 /**
@@ -287,6 +311,17 @@ function signatureTag(signature: string): string {
  * passed in here as a plain boolean — a deliberately simple v1 enrichment:
  * when true, nudges confidence up by a small fixed amount, capped at 1.
  * Deeper per-task correlation is a natural v2 extension.
+ *
+ * PK-PF1-5 codex round 2 fold (MED): the dedup check and the insert are now
+ * ONE atomic `BEGIN IMMEDIATE` transaction, not a check followed by a
+ * separately-transacted write. Round 1's fix left the dedup `SELECT` OUTSIDE
+ * any transaction, so two concurrent `reflect()` calls processing the same
+ * newly-eligible signature-group could both observe "no existing tag" before
+ * either committed, and both insert a duplicate active pattern for the same
+ * signature (codex reproduced this). This function does NOT call
+ * persistSharedPattern() — SQLite doesn't support nested `BEGIN IMMEDIATE`
+ * on one connection, so the insert logic is inlined here inside this
+ * function's own transaction instead.
  */
 export function distillSharedPattern(
   db: Database,
@@ -298,24 +333,22 @@ export function distillSharedPattern(
     return null
   }
 
-  const tag = signatureTag(signature)
-  const prefix = `${tag} `
-  const allPatternTexts = db
-    .prepare('SELECT pattern_text FROM shared_patterns')
-    .all() as { pattern_text: string }[]
-  const existing = allPatternTexts.some(r => r.pattern_text.startsWith(prefix))
-  if (existing) {
+  const flagRow = db
+    .prepare("SELECT enabled FROM feature_flags WHERE flag_name = 'outcome_feedback_enabled'")
+    .get() as { enabled: number } | null
+  if (!flagRow || flagRow.enabled !== 1) {
     return null
   }
 
-  // Representative row: the most recently-diffed member of the group (any
-  // member is a valid source_expectation_id — this is a deterministic,
-  // documented choice, not an arbitrary one).
+  const tag = signatureTag(signature)
+  const prefix = `${tag} `
+
+  // Representative row + confidence: pure derivation from already-fetched
+  // data (no DB access), safe to compute before acquiring the lock.
   const rep = [...matchingGroup].sort((a, b) => (a.diffed_at ?? '').localeCompare(b.diffed_at ?? ''))[matchingGroup.length - 1]
   const repDiff: DiffOutcomeResult = rep.diff_result
     ? (JSON.parse(rep.diff_result) as DiffOutcomeResult)
     : { matched: signature.startsWith('match::') }
-
   // Confidence v1: approaches 1 as the group grows, never reaches exactly 1
   // from the base formula alone — always in (0,1). A `corroborated` signal
   // adds a small deterministic bump, capped at 1.
@@ -323,14 +356,38 @@ export function distillSharedPattern(
   if (corroborated) {
     confidence = Math.min(1, confidence + 0.1)
   }
-
   const patternText = `${tag} ${repDiff.matched ? 'Consistently met' : 'Consistently missed'} expectation "${rep.expected_outcome}" (${matchingGroup.length} occurrences)`
 
-  return persistSharedPattern(db, {
-    pattern_text: patternText,
-    confidence,
-    source_expectation_id: rep.id,
-  })
+  db.prepare('BEGIN IMMEDIATE').run()
+  try {
+    const allPatternTexts = db
+      .prepare('SELECT pattern_text FROM shared_patterns')
+      .all() as { pattern_text: string }[]
+    const existing = allPatternTexts.some(r => r.pattern_text.startsWith(prefix))
+    if (existing) {
+      db.prepare('ROLLBACK').run()
+      return null
+    }
+
+    const inserted = db
+      .prepare(`
+        INSERT INTO shared_patterns (pattern_text, confidence, source_expectation_id)
+        VALUES (?, ?, ?)
+        RETURNING id
+      `)
+      .get(patternText, confidence, rep.id) as { id: number }
+
+    db.prepare(`
+      INSERT INTO audit_log (agent, action, detail, task_id)
+      VALUES (?, ?, ?, ?)
+    `).run('system', 'shared_pattern_distilled', JSON.stringify({ pattern_text: patternText, confidence, source_expectation_id: rep.id }), null)
+
+    db.prepare('COMMIT').run()
+    return inserted.id
+  } catch (err) {
+    try { db.prepare('ROLLBACK').run() } catch {}
+    throw err
+  }
 }
 
 /**
@@ -341,12 +398,25 @@ export function distillSharedPattern(
  * like every other PF1 write. Row count goes `n -> n+1`, never back down.
  *
  * Validates `oldPatternId` refers to a row that actually exists AND is
- * currently `is_active=1` BEFORE opening any transaction — returns `null`
- * with zero writes otherwise (PK-PF1-5 codex round 1 fold, MED-3: the
- * pre-fix version let a non-existent or already-superseded `oldPatternId`
- * silently "succeed", inserting an orphan replacement row and logging a
+ * currently `is_active=1` — returns `null` with zero writes otherwise
+ * (PK-PF1-5 codex round 1 fold, MED-3: the pre-fix version let a
+ * non-existent or already-superseded `oldPatternId` silently "succeed",
+ * inserting an orphan replacement row and logging a
  * `shared_pattern_superseded` audit action for a supersession that never
  * actually happened).
+ *
+ * PK-PF1-5 codex round 2 fold (MED): the existence/active-state validation
+ * now happens INSIDE the transaction (re-checked under the `BEGIN IMMEDIATE`
+ * lock, not before opening it), and the deactivating `UPDATE` is GUARDED
+ * (`WHERE ... AND is_active = 1`) with its affected-row-count checked before
+ * treating the supersession as successful. Round 1's fix validated BEFORE
+ * opening the transaction, so two concurrent callers could both observe the
+ * old pattern active, both pass validation, and both insert a competing
+ * "replacement" — the later `UPDATE` silently overwrites `superseded_by`,
+ * leaving two active replacement rows for one superseded original (codex
+ * reproduced this). If the guarded update affects zero rows (another caller
+ * won the race first), the whole transaction — including the replacement
+ * row this call inserted — is rolled back, so no orphan row is left behind.
  */
 export function supersedeSharedPattern(db: Database, oldPatternId: number, newInput: SharedPatternInput): number | null {
   const flagRow = db
@@ -356,15 +426,16 @@ export function supersedeSharedPattern(db: Database, oldPatternId: number, newIn
     return null
   }
 
-  const oldRow = db
-    .prepare('SELECT id FROM shared_patterns WHERE id = ? AND is_active = 1')
-    .get(oldPatternId)
-  if (!oldRow) {
-    return null
-  }
-
   db.prepare('BEGIN IMMEDIATE').run()
   try {
+    const oldRow = db
+      .prepare('SELECT id FROM shared_patterns WHERE id = ? AND is_active = 1')
+      .get(oldPatternId)
+    if (!oldRow) {
+      db.prepare('ROLLBACK').run()
+      return null
+    }
+
     const inserted = db
       .prepare(`
         INSERT INTO shared_patterns (pattern_text, confidence, source_expectation_id)
@@ -372,7 +443,14 @@ export function supersedeSharedPattern(db: Database, oldPatternId: number, newIn
         RETURNING id
       `)
       .get(newInput.pattern_text, newInput.confidence, newInput.source_expectation_id) as { id: number }
-    db.prepare('UPDATE shared_patterns SET is_active = 0, superseded_by = ? WHERE id = ?').run(inserted.id, oldPatternId)
+
+    const updateResult = db
+      .prepare('UPDATE shared_patterns SET is_active = 0, superseded_by = ? WHERE id = ? AND is_active = 1')
+      .run(inserted.id, oldPatternId)
+    if (updateResult.changes !== 1) {
+      db.prepare('ROLLBACK').run()
+      return null
+    }
 
     // ATM-PF1-09/REQ-PF1-09: distinct audit row, same transaction as the
     // insert+update pair above.
@@ -414,7 +492,16 @@ export function supersedeSharedPattern(db: Database, oldPatternId: number, newIn
  * (`complexity_user` NULL) reach `status = 'completed'` directly, unchanged
  * — this filter is a no-op for them. Each diff is persisted back onto its
  * own row (`diffed_at` + JSON-encoded `diff_result`) inside its own LOCAL
- * `BEGIN IMMEDIATE` transaction.
+ * `BEGIN IMMEDIATE` transaction, via a GUARDED `UPDATE ... WHERE id = ? AND
+ * diffed_at IS NULL` whose affected-row-count is checked (PK-PF1-5 codex
+ * round 2 fold, MED: round 1's version snapshotted the un-diffed row set in
+ * one unlocked `SELECT`, then unconditionally `UPDATE`d each row inside its
+ * own transaction — two concurrent `reflect()` calls could both select the
+ * same un-diffed row before either claimed it, and both proceed to update +
+ * audit it, producing a duplicate `outcome_reflected` audit row for one
+ * logical diff (codex reproduced this). Re-checking `diffed_at IS NULL`
+ * atomically under the lock and skipping (not erroring) when the guarded
+ * update affects zero rows closes that race.
  *
  * Phase 2 (REQ-PF1-11) — consumes P6/P7/P8's read-contract triad
  * (getFailureClassifications/getCrossFamilyCritiques/getTernaryRewards)
@@ -454,8 +541,16 @@ export function reflect(db: Database): { diffed: number; distilled: number } {
     const diff = diffOutcome({ expected: row.expected_outcome, actual: row.actual })
     db.prepare('BEGIN IMMEDIATE').run()
     try {
-      db.prepare("UPDATE outcome_expectations SET diffed_at = datetime('now'), diff_result = ? WHERE id = ?")
+      const updateResult = db
+        .prepare("UPDATE outcome_expectations SET diffed_at = datetime('now'), diff_result = ? WHERE id = ? AND diffed_at IS NULL")
         .run(JSON.stringify(diff), row.id)
+      if (updateResult.changes !== 1) {
+        // Lost the race — another concurrent reflect() call already claimed
+        // (diffed) this row first. Not an error; just don't double-count or
+        // double-audit it.
+        db.prepare('ROLLBACK').run()
+        continue
+      }
 
       // ATM-PF1-09/REQ-PF1-09: distinct audit row per diffed row, same
       // transaction as that row's UPDATE.
