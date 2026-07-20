@@ -1895,6 +1895,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const dryRun = (args.dry_run as boolean) ?? true
         const result = db.runHygiene(dryRun)
         audit.log(SELF_LABEL, 'hygiene_run', { dry_run: dryRun, ...result })
+        // T1 KO-SWEEP (#10376215, REQ-017 / ATM-016): one retention_prune_run
+        // audit entry per LIVE run that actually affected ≥1 row (dryRun runs and
+        // zero-affected live runs write none). Adjacent to the hygiene_run entry.
+        const retentionAffected =
+          result.pruned_failure_classifications +
+          result.pruned_cross_family_critiques +
+          result.archived_ternary_rewards
+        if (!dryRun && retentionAffected > 0) {
+          audit.log(SELF_LABEL, 'retention_prune_run', {
+            pruned_failure_classifications: result.pruned_failure_classifications,
+            pruned_cross_family_critiques: result.pruned_cross_family_critiques,
+            archived_ternary_rewards: result.archived_ternary_rewards,
+          })
+        }
         const mode = dryRun ? 'DRY RUN (preview)' : 'LIVE (changes applied)'
         const lines = [
           `Hygiene ${mode}:`,
@@ -1903,6 +1917,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           `  Expired artifacts to clean: ${result.expired_artifacts}`,
           `  Findings to compress (>7d): ${result.compressed_findings}`,
           `  Vacuumed: ${result.vacuumed}`,
+          // T1 KO-SWEEP (#10376215, REQ-014 / ATM-013): 3 new lines, always
+          // rendered (0 when retention_prune_enabled is OFF).
+          `  Failure classifications to prune (>90d): ${result.pruned_failure_classifications}`,
+          `  Cross-family critiques to prune (>90d): ${result.pruned_cross_family_critiques}`,
+          `  Ternary rewards to archive (>90d, consumed): ${result.archived_ternary_rewards}`,
         ]
         return { content: [{ type: 'text', text: lines.join('\n') }] }
       }

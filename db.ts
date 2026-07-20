@@ -133,6 +133,116 @@ export interface UpdateHeartbeatInput {
   etaSec?: number
 }
 
+// ── T1 KO-SWEEP prune helpers (BEGIN) ── (#10376215)
+// Generalized retention/prune over the 3 append-only tables. Module-scoped,
+// pure-ish helpers operating on a raw Database handle so they can (a) be reused
+// verbatim inside runHygiene()'s single BEGIN IMMEDIATE (REQ-013) and (b) be
+// unit-verified in isolation. This whole region is deliberately free of any P5
+// shared write-ordering primitive — T1 uses only its own LOCAL BEGIN IMMEDIATE
+// (REQ-013), as enforced by the ATM-012 imports guardrail.
+
+// REQ-001 / ATM-001 (M-001): the single in-code retention configuration. Not a
+// DB table — a frozen const. `archive_mode: 'archive'` ONLY for ternary_rewards
+// (the one table with a scoped future consumer, T4); plain 'delete' otherwise.
+// Each table carries an independently-settable retention_days (default 90,
+// reused from consolidate.ts's runPrune default).
+export type RetentionMode = 'archive' | 'delete'
+export interface RetentionPruneEntry {
+  table: string
+  retention_days: number
+  archive_mode: RetentionMode
+}
+export const RETENTION_PRUNE_CONFIG: readonly RetentionPruneEntry[] = Object.freeze([
+  { table: 'failure_classifications', retention_days: 90, archive_mode: 'delete' },
+  { table: 'cross_family_critiques', retention_days: 90, archive_mode: 'delete' },
+  { table: 'ternary_rewards', retention_days: 90, archive_mode: 'archive' },
+])
+
+// Allowlist derived from the config — the ONLY table names ever interpolated
+// into a prune SQL statement (defence-in-depth: table names are developer-owned
+// here, never request-derived, but the guard keeps it that way).
+const RETENTION_PRUNE_TABLES: ReadonlySet<string> = new Set(RETENTION_PRUNE_CONFIG.map(c => c.table))
+
+// REQ-002 / ATM-002 (M-004): age-based eligibility for any of the 3 tables —
+// returns the ids whose created_at is older than the retention window, ascending.
+export function computePruneEligibility(db: Database, tableName: string, retentionDays: number): number[] {
+  if (!RETENTION_PRUNE_TABLES.has(tableName)) {
+    throw new Error(`computePruneEligibility: refusing unknown table '${tableName}'`)
+  }
+  const rows = db.prepare(
+    `SELECT id FROM ${tableName} WHERE created_at < datetime('now', '-' || ? || ' days') ORDER BY id ASC`,
+  ).all(retentionDays) as { id: number }[]
+  return rows.map(r => r.id)
+}
+
+// REQ-008/REQ-009 / ATM-008 (M-007, M-008): read-only high-water-mark over T4's
+// (repo-absent-today) reward_consumption_cursor. Gated on reward_consumer_enabled.
+// ANY failure or invalid value ⇒ null (the fail-safe: prune ZERO ternary_rewards
+// this run). Never throws; never writes the cursor table. Computed by the caller
+// INSIDE the live prune's BEGIN IMMEDIATE so interleaved advances can't raise it.
+export function getRewardConsumptionHighWaterMark(db: Database): number | null {
+  try {
+    const flag = db.prepare('SELECT enabled FROM feature_flags WHERE flag_name = ?')
+      .get('reward_consumer_enabled') as { enabled: number } | undefined
+    if (!flag || !flag.enabled) return null
+    const row = db.prepare('SELECT MIN(last_consumed_reward_id) AS hwm FROM reward_consumption_cursor')
+      .get() as { hwm: unknown } | undefined
+    if (!row) return null
+    const v = row.hwm
+    // SQLite dynamic typing: a text/garbage value survives MIN() as a non-number.
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) return null
+    return v
+  } catch {
+    return null
+  }
+}
+
+// REQ-010 / ATM-009 (M-008, M-009): ternary_rewards eligibility = age-eligible
+// ∩ {id ≤ hwm}. hwm === null (absent/invalid guard) forces the EMPTY set
+// regardless of age — age eligibility alone can NEVER prune a ternary_reward.
+export function intersectHwmEligibility(ageEligibleIds: number[], hwm: number | null): number[] {
+  if (hwm === null) return []
+  return ageEligibleIds.filter(id => id <= hwm)
+}
+
+// Compose the ternary eligibility: age ∩ HWM, HWM read on the same handle.
+export function computeTernaryEligibleIds(db: Database, retentionDays: number): number[] {
+  const ageIds = computePruneEligibility(db, 'ternary_rewards', retentionDays)
+  const hwm = getRewardConsumptionHighWaterMark(db)
+  return intersectHwmEligibility(ageIds, hwm)
+}
+
+// REQ-007 / ATM-007 (M-006): plain DELETE (no archive copy) for the two
+// non-reward tables. Intentionally contains ZERO reference to
+// getRewardConsumptionHighWaterMark — the guard scopes ONLY ternary_rewards
+// (ATM-010 isolation guardrail). Returns the number of rows deleted.
+export function deleteAgeEligibleRows(db: Database, tableName: string, retentionDays: number): number {
+  const ids = computePruneEligibility(db, tableName, retentionDays)
+  if (ids.length === 0) return 0
+  const placeholders = ids.map(() => '?').join(',')
+  db.prepare(`DELETE FROM ${tableName} WHERE id IN (${placeholders})`).run(...ids)
+  return ids.length
+}
+
+// REQ-006 / ATM-006 (M-005): archive-then-delete for ternary_rewards. EXPLICIT
+// column list (never SELECT *, per the memory_archive LOW-9 base-DDL note) — the
+// same id set drives both the archive INSERT and the source DELETE. archived_at
+// is filled by its column default. Returns the number of rows archived.
+export function archiveThenDeleteTernaryEligible(db: Database, retentionDays: number): number {
+  const ids = computeTernaryEligibleIds(db, retentionDays)
+  if (ids.length === 0) return 0
+  const placeholders = ids.map(() => '?').join(',')
+  db.prepare(
+    `INSERT INTO ternary_rewards_archive
+       (id, policy_version, decision_id, task_id, subject_kind, cross_family_verdict, failure_severity, failure_signal_available, reward, created_at)
+     SELECT id, policy_version, decision_id, task_id, subject_kind, cross_family_verdict, failure_severity, failure_signal_available, reward, created_at
+       FROM ternary_rewards WHERE id IN (${placeholders})`,
+  ).run(...ids)
+  db.prepare(`DELETE FROM ternary_rewards WHERE id IN (${placeholders})`).run(...ids)
+  return ids.length
+}
+// ── T1 KO-SWEEP prune helpers (END) ──
+
 export class TaskDB {
   private db: Database
   private dbPath: string
@@ -636,6 +746,12 @@ export class TaskDB {
     // a scaffold stub in this stage); the Phase-5 consolidator call site and
     // full consume/lease/advance logic land in a later packet.
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('reward_consumer_enabled', 0)")
+    // T1 KO-SWEEP (#10376215, REQ-012/ATM-011): generalized retention/prune.
+    // DEFAULT OFF — the runHygiene() Step-6 prune path is flag-gated and inert
+    // until this flag is turned ON. All 3 append-only tables
+    // (failure_classifications, cross_family_critiques, ternary_rewards) ride
+    // this ONE flag. While OFF, runHygiene() is byte-identical to pre-T1 (REQ-003).
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('retention_prune_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
@@ -1245,6 +1361,31 @@ export class TaskDB {
     this.db.exec(
       "INSERT OR IGNORE INTO reward_consumption_cursor (consumer, last_consumed_reward_id) VALUES ('memory_importance', 0)",
     )
+    // T1 KO-SWEEP (#10376215, REQ-005/ATM-005): archive companion for the ONE
+    // table pruned via archive-then-delete (ternary_rewards). Mirrors the
+    // memory_archive base-DDL shape (db.ts:219-231): same base columns as
+    // ternary_rewards, but `id` is a plain PRIMARY KEY (the original id is
+    // preserved on copy — no AUTOINCREMENT) and `created_at` drops its
+    // datetime('now') default (the original value is copied verbatim by the
+    // explicit-column-list INSERT in PK-T1-3/ATM-006), plus `archived_at`.
+    // Additive-only; unused until retention_prune_enabled is ON (REQ-003).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ternary_rewards_archive (
+        id INTEGER PRIMARY KEY,
+        policy_version INTEGER NOT NULL,
+        decision_id INTEGER REFERENCES decisions(id),
+        task_id INTEGER,
+        subject_kind TEXT NOT NULL,
+        cross_family_verdict TEXT,
+        failure_severity TEXT,
+        failure_signal_available INTEGER NOT NULL,
+        reward INTEGER NOT NULL CHECK(reward IN (-1,0,1)),
+        created_at TEXT NOT NULL,
+        archived_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ternary_rewards_archive_archived_at ON ternary_rewards_archive(archived_at);
+    `)
   }
 
   createTask(input: CreateTaskInput): Task {
@@ -2355,6 +2496,11 @@ export class TaskDB {
     expired_artifacts: number
     compressed_findings: number
     vacuumed: boolean
+    // T1 KO-SWEEP (#10376215, REQ-014 / ATM-013): 3 new counts, present in BOTH
+    // flag states (0 when retention_prune_enabled is OFF — REQ-003).
+    pruned_failure_classifications: number
+    pruned_cross_family_critiques: number
+    archived_ternary_rewards: number
   } {
     return this.run(db => {
       const result = {
@@ -2363,6 +2509,9 @@ export class TaskDB {
         expired_artifacts: 0,
         compressed_findings: 0,
         vacuumed: false,
+        pruned_failure_classifications: 0,
+        pruned_cross_family_critiques: 0,
+        archived_ternary_rewards: 0,
       }
 
       // 1. Archive completed tasks older than 14 days
@@ -2427,9 +2576,73 @@ export class TaskDB {
         } catch { /* VACUUM can fail if in transaction */ }
       }
 
+      // 6. T1 KO-SWEEP (#10376215): generalized retention/prune over the 3
+      //    append-only tables, mirroring the Steps-1-4 count-then-mutate shape.
+      //    Runs AFTER the VACUUM so the prune's own BEGIN IMMEDIATE never nests
+      //    a VACUUM. Flag-gated (retention_prune_enabled, default OFF): while OFF
+      //    it issues ZERO statements against the target/cursor tables and reports
+      //    all-zero counts (REQ-003). Placed last and returning additive keys, so
+      //    the flag-OFF path is behaviourally byte-identical to pre-T1 hygiene.
+      const pruneCounts = this.runRetentionPruneStep6(db, dryRun)
+      result.pruned_failure_classifications = pruneCounts.pruned_failure_classifications
+      result.pruned_cross_family_critiques = pruneCounts.pruned_cross_family_critiques
+      result.archived_ternary_rewards = pruneCounts.archived_ternary_rewards
+
       return result
     })
   }
+
+  // ── T1 KO-SWEEP Step-6 method (BEGIN) ── (#10376215)
+  // T1 KO-SWEEP (#10376215) — runHygiene() Step 6. Generalized retention/prune.
+  // Receives the SAME db handle runHygiene() is already operating on (never
+  // re-enters this.run), so the live-path BEGIN IMMEDIATE below is a LOCAL
+  // transaction on that one connection (REQ-013, the decision.ts:157 pattern) —
+  // NEVER P5's shared write-ordering primitive.
+  private runRetentionPruneStep6(db: Database, dryRun: boolean): {
+    pruned_failure_classifications: number
+    pruned_cross_family_critiques: number
+    archived_ternary_rewards: number
+  } {
+    const counts = {
+      pruned_failure_classifications: 0,
+      pruned_cross_family_critiques: 0,
+      archived_ternary_rewards: 0,
+    }
+
+    // REQ-003 / ATM-003: flag OFF ⇒ short-circuit BEFORE any statement against
+    // the 3 target tables (or the cursor table) — functional parity, all-zero.
+    if (!this.isFeatureEnabled('retention_prune_enabled')) return counts
+
+    const fcCfg = RETENTION_PRUNE_CONFIG.find(c => c.table === 'failure_classifications')!
+    const cfcCfg = RETENTION_PRUNE_CONFIG.find(c => c.table === 'cross_family_critiques')!
+    const trCfg = RETENTION_PRUNE_CONFIG.find(c => c.table === 'ternary_rewards')!
+
+    if (dryRun) {
+      // REQ-004 / ATM-004: real eligible-counts, ZERO mutation. The ternary count
+      // still respects the HWM ∩ age intersection (never age alone).
+      counts.pruned_failure_classifications = computePruneEligibility(db, fcCfg.table, fcCfg.retention_days).length
+      counts.pruned_cross_family_critiques = computePruneEligibility(db, cfcCfg.table, cfcCfg.retention_days).length
+      counts.archived_ternary_rewards = computeTernaryEligibleIds(db, trCfg.retention_days).length
+      return counts
+    }
+
+    // REQ-013 / ATM-012: ONE local BEGIN IMMEDIATE wrapping the HWM read, every
+    // eligibility read, the archive INSERT, and every DELETE for this invocation.
+    // Any mid-sequence error ⇒ ROLLBACK (all 3 tables + the archive unchanged)
+    // then re-throw, mirroring finalizeDecision (decision.ts).
+    db.prepare('BEGIN IMMEDIATE').run()
+    try {
+      counts.pruned_failure_classifications = deleteAgeEligibleRows(db, fcCfg.table, fcCfg.retention_days)
+      counts.pruned_cross_family_critiques = deleteAgeEligibleRows(db, cfcCfg.table, cfcCfg.retention_days)
+      counts.archived_ternary_rewards = archiveThenDeleteTernaryEligible(db, trCfg.retention_days)
+      db.prepare('COMMIT').run()
+    } catch (err) {
+      try { db.prepare('ROLLBACK').run() } catch { /* already rolled back / no active txn */ }
+      throw err
+    }
+    return counts
+  }
+  // ── T1 KO-SWEEP Step-6 method (END) ──
 
   getDbStats(): Record<string, { row_count: number; oldest?: string; newest?: string }> {
     return this.run(db => {
