@@ -761,6 +761,16 @@ export class TaskDB {
     // (failure_classifications, cross_family_critiques, ternary_rewards) ride
     // this ONE flag. While OFF, runHygiene() is byte-identical to pre-T1 (REQ-003).
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('retention_prune_enabled', 0)")
+    // EPIC-PF2 (PF-spec.md REQ-PF2-09/ATM-PF2-02): declarative watchers.
+    // DEFAULT OFF — this packet (PK-PF2-1) only lays the flag + the two
+    // declarative_watchers/declarative_watcher_firings tables (ATM-PF2-01,
+    // below). No watchers/declarative-watchers.ts logic reads or writes
+    // through this flag yet (createWatcher()/persistWatcher() land in
+    // PK-PF2-2; the three bounded condition evaluators land in PK-PF2-3;
+    // fireWatcher()/idempotency land in PK-PF2-4; the watchdog.ts run() loop
+    // wiring + server.ts MCP tool cases land in PK-PF2-5). While OFF,
+    // watchdog.ts's tick loop stays byte-identical to pre-PF2 (REQ-PF2-09).
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('declarative_watchers_enabled', 0)")
 
     // Sprint 4: Circuit breaker columns on agent_sessions
     const circuitBreakerCols = [
@@ -1329,6 +1339,62 @@ export class TaskDB {
 
       CREATE INDEX IF NOT EXISTS idx_shared_patterns_active ON shared_patterns(is_active);
       CREATE INDEX IF NOT EXISTS idx_shared_patterns_source ON shared_patterns(source_expectation_id);
+    `)
+
+    // EPIC-PF2 (PF-spec.md REQ-PF2-01/02/05/16, ATM-PF2-01): declarative
+    // watchers schema. Mirrors the shared_patterns idiom above (CREATE TABLE
+    // IF NOT EXISTS + supporting indexes) — two NEW companion tables, editing
+    // zero lines of any existing table definition (incl. the pre-existing,
+    // unrelated watcher_heartbeat DDL above — db.ts:579 — which this must
+    // never touch). Gated inert by declarative_watchers_enabled (default 0,
+    // seeded above) — no write path exists yet in this packet (PK-PF2-1 is
+    // schema+flag only).
+    //
+    // declarative_watchers — deliberately NOT named `watchers` (collision
+    // guard vs. watcher_heartbeat, a different pre-existing mechanism).
+    // trigger_type is CHECK-constrained at the DB layer as defense in depth;
+    // createWatcher() (PK-PF2-2) additionally validates it in application
+    // code. last_fired_at backs the scheduled evaluator's pure
+    // (interval_seconds, last_fired_at, now) function (REQ-PF2-12).
+    // last_observed_value/last_observed_at are the state_change prior-
+    // snapshot store, read+updated inside the watcher-eval transaction
+    // (REQ-PF2-17, PK-PF2-3). condition_spec/action_spec are bounded, typed
+    // JSON structures — never an open expression language (REQ-PF2-15).
+    // Written by persistWatcher() in watchers/declarative-watchers.ts.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS declarative_watchers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        trigger_type TEXT NOT NULL CHECK(trigger_type IN ('scheduled', 'state_change', 'llm_eval')),
+        condition_spec TEXT NOT NULL,
+        action_spec TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        last_fired_at TEXT,
+        last_observed_value TEXT,
+        last_observed_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_declarative_watchers_enabled ON declarative_watchers(enabled);
+      CREATE INDEX IF NOT EXISTS idx_declarative_watchers_trigger_type ON declarative_watchers(trigger_type);
+    `)
+
+    // declarative_watcher_firings — the idempotency_key UNIQUE constraint is
+    // the DB-layer fire-once guard (REQ-PF2-16): a duplicate fire is rejected
+    // by the database itself, not merely by an application-level check.
+    // Written by persistWatcherFiring() in watchers/declarative-watchers.ts,
+    // via fireWatcher() (PK-PF2-4), which reuses the EXISTING create_task
+    // path — never a new task-creation primitive (REQ-PF2-06).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS declarative_watcher_firings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        watcher_id INTEGER NOT NULL REFERENCES declarative_watchers(id),
+        fired_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_task_id INTEGER REFERENCES tasks(id),
+        idempotency_key TEXT NOT NULL UNIQUE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_declarative_watcher_firings_watcher ON declarative_watcher_firings(watcher_id);
     `)
 
     // P8 EPIC-04 (REQ-010/ATM-016): durable ternary-reward persistence.
