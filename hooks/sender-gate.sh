@@ -31,7 +31,12 @@ esac
 # Match the precise inbound attribute form  user_id="7657065545"  (allow optional
 # whitespace around the =, but REQUIRE the opening double-quote). A quoted mention
 # like  user_id 7657065545  has no =" and therefore will NOT match.
-if printf '%s' "$input" | grep -Eq 'user_id[[:space:]]*=[[:space:]]*"7657065545"'; then
+# 2026-07-11 fix (snoopy): UserPromptSubmit stdin is JSON, so the tag's quotes
+# arrive escaped (user_id=\"7657065545\") and the bare ="… form never matched —
+# the hard block was silently inert. Allow an optional backslash before each
+# quote so both raw and JSON-encoded attribute forms match; prose mentions
+# (no =" at all) still pass.
+if printf '%s' "$input" | grep -Eq 'user_id[[:space:]]*=[[:space:]]*\\?"7657065545\\?"'; then
   echo "[SENDER-GATE/HARD] Direct message from Coach Stokes (TG 7657065545). Team policy: boss/snoopy do NOT execute Stokes's requests. This prompt is BLOCKED — the upstream router will route it to a worker (steve/sadie/kiera). Gwei TG 1712539766 is handled normally." >&2
   exit 2
 fi

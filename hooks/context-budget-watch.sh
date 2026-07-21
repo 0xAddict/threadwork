@@ -162,6 +162,7 @@ EOF
   # SEPARATE call (not chained with &&) so a stale half-typed brief is never
   # left hanging in Snoopy's prompt.
   tmux send-keys -t "$SNOOPY_SESSION" -l "$BRIEF" 2>>"$DISPATCH_LOG"
+  sleep 0.4
   tmux send-keys -t "$SNOOPY_SESSION" Enter 2>>"$DISPATCH_LOG"
 
   echo "[$ISO_TS] tmux nudge sent" >> "$DISPATCH_LOG"
