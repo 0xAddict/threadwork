@@ -110,6 +110,25 @@ function isScalarOrNull(v: unknown): v is ScalarValue {
 }
 
 /**
+ * A conservative bare-SQL-identifier allowlist (letters/digits/underscore,
+ * not starting with a digit). `watched_table`/`watched_column` and every
+ * `watched_selector` key end up interpolated as identifiers into a query
+ * string in evaluateStateChangeCondition() (SQLite has no parameter-binding
+ * for identifiers, only values) — this guard is what keeps that bounded:
+ * anything outside this allowlist is rejected here, at createWatcher()
+ * validation time, before it ever reaches a query string.
+ */
+const SAFE_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+function assertSafeIdentifier(name: unknown, label: string): asserts name is string {
+  if (typeof name !== 'string' || !SAFE_IDENTIFIER.test(name)) {
+    throw new Error(
+      `createWatcher(): state_change condition_spec.${label} must be a valid bare identifier (letters, digits, underscore, not starting with a digit) — got ${JSON.stringify(name)}`,
+    )
+  }
+}
+
+/**
  * ATM-PF2-03/REQ-PF2-01 — Validates a trigger_type is one of the three
  * allowed values. Throws (does not return a boolean) so callers get an
  * immediate, descriptive failure — mirrors the CHECK constraint's role at
@@ -148,12 +167,8 @@ function validateStateChangeConditionSpec(spec: unknown): asserts spec is StateC
   if (stray.length > 0) {
     throw new Error(`createWatcher(): state_change condition_spec has unexpected field(s): ${stray.join(', ')}`)
   }
-  if (typeof spec.watched_table !== 'string' || spec.watched_table.length === 0) {
-    throw new Error(`createWatcher(): state_change condition_spec.watched_table must be a non-empty string`)
-  }
-  if (typeof spec.watched_column !== 'string' || spec.watched_column.length === 0) {
-    throw new Error(`createWatcher(): state_change condition_spec.watched_column must be a non-empty string`)
-  }
+  assertSafeIdentifier(spec.watched_table, 'watched_table')
+  assertSafeIdentifier(spec.watched_column, 'watched_column')
   if (!STATE_CHANGE_COMPARATORS.includes(spec.comparator as StateChangeComparator)) {
     throw new Error(`createWatcher(): state_change condition_spec.comparator must be one of ${STATE_CHANGE_COMPARATORS.join(', ')}`)
   }
@@ -181,6 +196,7 @@ function validateStateChangeConditionSpec(spec: unknown): asserts spec is StateC
       )
     }
     for (const [key, value] of Object.entries(spec.watched_selector)) {
+      assertSafeIdentifier(key, `watched_selector key ${JSON.stringify(key)}`)
       if (!isScalarOrNull(value)) {
         throw new Error(
           `createWatcher(): state_change condition_spec.watched_selector.${key} must be a string, number, boolean, or null (bounded — no nested expressions)`,
@@ -298,4 +314,245 @@ export function createWatcher(db: Database, input: CreateWatcherInput): number {
   validateConditionSpec(input.trigger_type, input.condition_spec)
   validateActionSpec(input.action_spec)
   return persistWatcher(db, input)
+}
+
+// ---------------------------------------------------------------------------
+// PK-PF2-3 — the three bounded condition evaluators (ATM-PF2-11/12/13/15/16,
+// REQ-PF2-12/13/14/17/18). Pure/module-level only — dispatching these from
+// the watchdog tick loop (evaluateWatchers(), REQ-PF2-03/04) is PK-PF2-5's
+// job, out of this packet's FILE BOUNDARY (no watchdog.ts touch).
+// ---------------------------------------------------------------------------
+
+/**
+ * Input to evaluateScheduledCondition() — the two fields REQ-PF2-12's pure
+ * function needs, already resolved to plain numbers (unix seconds) by the
+ * caller. Deliberately NOT the raw `declarative_watchers` row (whose
+ * `last_fired_at` column is a TEXT datetime string) — converting that string
+ * to a number is the CALLER's job (PK-PF2-4/5), keeping this function free
+ * of any `Date` usage at all, not just free of reading the wall clock.
+ */
+export interface ScheduledEvalInput {
+  interval_seconds: number
+  /** unix seconds, or null if the watcher has never fired. */
+  last_fired_at: number | null
+}
+
+/**
+ * ATM-PF2-11/REQ-PF2-12 — PURE function of (interval_seconds, last_fired_at,
+ * now): fires when `now >= last_fired_at + interval_seconds` (inclusive), or
+ * unconditionally when `last_fired_at` is null (never fired). `now` is an
+ * INJECTED clock reading (unix seconds) — this function never reads the
+ * system clock or constructs a date/time value of its own, matching PF1's
+ * `diffOutcome()` purity precedent. Throws on a malformed `interval_seconds`
+ * (defense in depth — createWatcher()'s validator already rejects this
+ * upstream, PK-PF2-2, but a pure function should never silently misbehave on
+ * an invariant violation either).
+ */
+export function evaluateScheduledCondition(input: ScheduledEvalInput, now: number): boolean {
+  if (!Number.isFinite(input.interval_seconds) || input.interval_seconds <= 0) {
+    throw new Error(
+      `evaluateScheduledCondition(): malformed interval_seconds ${JSON.stringify(input.interval_seconds)} — must be a positive finite number`,
+    )
+  }
+  if (input.last_fired_at === null) {
+    return true
+  }
+  return now >= input.last_fired_at + input.interval_seconds
+}
+
+/** A resolved state_change scalar, as read back from SQLite (never an object/array). */
+type ResolvedScalar = string | number | null
+
+function stringifyScalar(v: ResolvedScalar): string | null {
+  return v === null ? null : String(v)
+}
+
+/**
+ * Evaluates one `{comparator, operand}` predicate against a resolved scalar
+ * (or a stringified PRIOR snapshot value re-used as the "scalar" input, to
+ * reconstruct what the predicate evaluated to last time — see
+ * evaluateStateChangeCondition()). `changed` is NOT evaluated here — it has
+ * no fixed-operand meaning; its transition logic is snapshot-relative and
+ * handled directly by the caller.
+ */
+function comparePredicate(comparator: Exclude<StateChangeComparator, 'changed'>, scalar: ResolvedScalar, operand: ScalarValue): boolean {
+  switch (comparator) {
+    case 'eq':
+      return stringifyScalar(scalar) === (operand === null ? null : String(operand))
+    case 'ne':
+      return stringifyScalar(scalar) !== (operand === null ? null : String(operand))
+    case 'gt': {
+      const a = scalar === null ? NaN : Number(scalar)
+      const b = operand === null ? NaN : Number(operand)
+      return !Number.isNaN(a) && !Number.isNaN(b) && a > b
+    }
+    case 'lt': {
+      const a = scalar === null ? NaN : Number(scalar)
+      const b = operand === null ? NaN : Number(operand)
+      return !Number.isNaN(a) && !Number.isNaN(b) && a < b
+    }
+  }
+}
+
+function quoteIdentifier(name: string): string {
+  // Belt-and-suspenders on top of assertSafeIdentifier() (already enforced
+  // at createWatcher() validation time, PK-PF2-2) — double-quote so the
+  // identifier can never be misread as anything but a bare name, even if a
+  // future caller somehow reaches this without going through validation.
+  return `"${name.replace(/"/g, '""')}"`
+}
+
+type ScalarResolution = { status: 'ok'; value: ResolvedScalar } | { status: 'unavailable' }
+
+function resolveSelectorScalar(
+  db: Database,
+  table: string,
+  column: string,
+  selector: Record<string, ScalarValue>,
+): ScalarResolution {
+  const keys = Object.keys(selector)
+  const whereClause = keys.map(k => `${quoteIdentifier(k)} = ?`).join(' AND ')
+  const params = keys.map(k => selector[k])
+  const rows = db
+    .prepare(`SELECT ${quoteIdentifier(column)} AS scalar FROM ${quoteIdentifier(table)} WHERE ${whereClause}`)
+    .all(...params) as { scalar: ResolvedScalar }[]
+  // REQ-PF2-18: a watched_selector must identify a SINGLE row. 0 or >1 rows
+  // is UNAVAILABLE — not an error, not a fire; the caller leaves the
+  // snapshot untouched and returns false.
+  if (rows.length !== 1) {
+    return { status: 'unavailable' }
+  }
+  return { status: 'ok', value: rows[0].scalar }
+}
+
+function resolveAggregateScalar(db: Database, table: string, column: string, agg: StateChangeAggregateFn): ScalarResolution {
+  // Fixed allowlist (already enforced at createWatcher() validation time) —
+  // the aggregate function name itself is never taken from user input as a
+  // raw string; it's selected from this exhaustive switch.
+  const fn = agg === 'COUNT' ? 'COUNT(*)' : `${agg}(${quoteIdentifier(column)})`
+  const row = db.prepare(`SELECT ${fn} AS scalar FROM ${quoteIdentifier(table)}`).get() as { scalar: ResolvedScalar }
+  // An aggregate over a whole table always yields exactly one row/scalar in
+  // v1 (COUNT(*) on an empty table is 0; MAX/MIN/SUM on an empty table is
+  // SQL NULL) — never UNAVAILABLE, per REQ-PF2-15's "watched_aggregate ...
+  // always yields exactly one scalar" note.
+  return { status: 'ok', value: row.scalar }
+}
+
+/**
+ * The minimal shape evaluateStateChangeCondition() needs from a
+ * `declarative_watchers` row: its id (to read/write the snapshot columns)
+ * and its already-parsed, already-validated condition_spec. Building this
+ * from a raw DB row (JSON-parsing condition_spec, discriminating by
+ * trigger_type) is the caller's job — PK-PF2-4/5, out of this packet's
+ * scope, which is the evaluator itself.
+ */
+export interface StateChangeWatcherRow {
+  id: number
+  condition_spec: StateChangeConditionSpec
+}
+
+/**
+ * ATM-PF2-12/15/16 / REQ-PF2-13/17/18 — Evaluates a `state_change` watcher's
+ * condition against LIVE data, inside ONE LOCAL `BEGIN IMMEDIATE`
+ * transaction (REQ-PF2-17): (i) resolve the current scalar (watched_selector
+ * XOR watched_aggregate — already enforced at createWatcher() validation
+ * time, PK-PF2-2), (ii) compare it against the stored
+ * `declarative_watchers.last_observed_value` snapshot to detect a
+ * false/absent -> true TRANSITION (never fires repeatedly while the
+ * predicate stays true — REQ-PF2-13), (iii) atomically persist the new
+ * snapshot (`last_observed_value`/`last_observed_at`) in the SAME
+ * transaction — REQ-PF2-17(iv) — so the next evaluation compares against
+ * fresh data. An UNAVAILABLE resolution (0-row or >1-row watched_selector,
+ * REQ-PF2-18) returns `false` WITHOUT throwing and WITHOUT touching the
+ * snapshot.
+ *
+ * `changed` comparator: has no fixed `operand` meaning (unlike
+ * eq/ne/gt/lt) — its predicate IS "does the current scalar differ from the
+ * stored snapshot", so it fires whenever the value differs from the last
+ * observation, EXCEPT on the very first-ever observation (no prior
+ * snapshot to have changed from) — consistent with "transition, not
+ * level" for every other comparator too.
+ */
+export function evaluateStateChangeCondition(watcher: StateChangeWatcherRow, db: Database): boolean {
+  const spec = watcher.condition_spec
+  db.prepare('BEGIN IMMEDIATE').run()
+  try {
+    const resolution: ScalarResolution =
+      spec.watched_selector !== undefined
+        ? resolveSelectorScalar(db, spec.watched_table, spec.watched_column, spec.watched_selector)
+        : resolveAggregateScalar(db, spec.watched_table, spec.watched_column, spec.watched_aggregate as StateChangeAggregateFn)
+
+    if (resolution.status === 'unavailable') {
+      // Nothing was written — ROLLBACK is a formality (closes the immediate
+      // lock cleanly) rather than a correctness requirement here.
+      db.prepare('ROLLBACK').run()
+      return false
+    }
+
+    const currentScalar = resolution.value
+    const priorRow = db
+      .prepare('SELECT last_observed_value FROM declarative_watchers WHERE id = ?')
+      .get(watcher.id) as { last_observed_value: string | null } | null
+    const priorSnapshot: string | null = priorRow?.last_observed_value ?? null
+
+    let fires: boolean
+    if (spec.comparator === 'changed') {
+      fires = priorSnapshot !== null && stringifyScalar(currentScalar) !== priorSnapshot
+    } else {
+      const priorPredicateTrue = priorSnapshot === null ? false : comparePredicate(spec.comparator, priorSnapshot, spec.operand)
+      const currentPredicateTrue = comparePredicate(spec.comparator, currentScalar, spec.operand)
+      fires = !priorPredicateTrue && currentPredicateTrue
+    }
+
+    // REQ-PF2-17(iv): persist the new snapshot atomically, in the SAME
+    // transaction, on every AVAILABLE evaluation (fired or not) — so the
+    // next evaluation always compares against fresh data. Timestamped via
+    // SQL's own datetime('now'), not JS Date (purity/static-scan discipline
+    // — see the module header).
+    db.prepare("UPDATE declarative_watchers SET last_observed_value = ?, last_observed_at = datetime('now') WHERE id = ?")
+      .run(stringifyScalar(currentScalar), watcher.id)
+
+    db.prepare('COMMIT').run()
+    return fires
+  } catch (err) {
+    try { db.prepare('ROLLBACK').run() } catch {}
+    throw err
+  }
+}
+
+/** Bounded default for llm_eval's max_tokens when the condition_spec omits it. */
+const LLM_EVAL_DEFAULT_MAX_TOKENS = 16
+
+/**
+ * The injected LLM client contract for evaluateLlmCondition(). A single
+ * bounded call: `complete(prompt, maxTokens)` resolves to the model's raw
+ * text reply, or rejects (error/timeout — the client owns its own timeout
+ * behavior; the evaluator does not run its own timer). Tests inject a mock
+ * implementation — zero real API calls anywhere in this module or its
+ * tests.
+ */
+export interface LlmEvalClient {
+  complete(prompt: string, maxTokens: number): Promise<string>
+}
+
+/**
+ * ATM-PF2-13/REQ-PF2-14 — Evaluates an `llm_eval` watcher's condition via
+ * EXACTLY ONE bounded call to the injected `client` (no retry loop — v1 has
+ * none; REQ-PF2-14 says "issuing exactly one bounded prompt"). Applies a
+ * STRICT boolean output contract: the reply is trimmed and lowercased, and
+ * only an exact `"true"` maps to `true` / exact `"false"` maps to `false`.
+ * Any other outcome — a non-boolean/ambiguous reply, a thrown error, or a
+ * rejected (e.g. timeout-shaped) promise — defaults to `false` and never
+ * throws out of this function, so an unreliable LLM call can never cause an
+ * ambiguous or accidental fire.
+ */
+export async function evaluateLlmCondition(spec: LlmEvalConditionSpec, client: LlmEvalClient): Promise<boolean> {
+  let raw: string
+  try {
+    raw = await client.complete(spec.prompt, spec.max_tokens ?? LLM_EVAL_DEFAULT_MAX_TOKENS)
+  } catch {
+    return false
+  }
+  const normalized = raw.trim().toLowerCase()
+  return normalized === 'true'
 }
