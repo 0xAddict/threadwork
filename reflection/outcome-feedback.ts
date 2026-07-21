@@ -576,6 +576,42 @@ export function supersedeSharedPattern(db: Database, oldPatternId: number, newIn
  * `BEGIN IMMEDIATE`, authoritative for that row's write. Phase 3's writes go
  * through `distillSharedPattern()`, which has its own internal re-check
  * (see that function's doc comment) — no separate re-check needed here.
+ *
+ * PK-PF1-5 codex round 4 fold (MED, boss-authorized — see BASELINES.md
+ * PK-PF1-5 section for the full disposition of round 4's HIGH/MED/LOW):
+ * the OUTER batch SELECT above (`status = 'completed' AND result IS NOT
+ * NULL`) is likewise only a fast-path PRE-FILTER now, not the source of the
+ * actual/status data a row is diffed against. The pre-fold version captured
+ * `t.result` in that same outer SELECT and used it directly to compute
+ * `diffOutcome()` BEFORE the per-row `BEGIN IMMEDIATE` even opened. That
+ * snapshot can go stale: a raw, non-transactional write elsewhere —
+ * `watchdog.ts`'s auto-resolve-via-sibling block (around lines 359-371)
+ * mutates `tasks.status`/`tasks.result` outside the normal claim/complete
+ * flow, with no coordination with `reflect()` and no live-status predicate
+ * on its own `UPDATE ... WHERE id = ?` — can land in the gap between this
+ * function's outer read and a given row's per-row lock. Codex reproduced
+ * exactly this: `reflect()` would diff and PERMANENTLY audit an outcome
+ * against data that was already obsolete by the time the diff was
+ * persisted. Each per-row transaction below now re-reads `tasks.status`/
+ * `tasks.result` FRESH, immediately after acquiring `BEGIN IMMEDIATE` (this
+ * is safe/consistent for the same reason the flag re-check above is: once
+ * the immediate lock is held, no other connection can mutate that row until
+ * this transaction commits/rolls back), and computes `diffOutcome()` from
+ * THAT fresh read, never from the outer snapshot. If the fresh read shows
+ * the row no longer qualifies under the exact same condition the outer
+ * SELECT (and PK-PF1-5 codex round 1's MED-1 fold, db.ts:1805/1874
+ * card-vs-task terminal semantics) already applies — `status` is no longer
+ * `'completed'`, or `result` is somehow NULL — the row is SKIPPED: not
+ * diffed, and `diffed_at` is deliberately left NULL (the same choice the
+ * "lost the race" branch a few lines below already makes for a row it
+ * didn't fully process). This is safe against infinite reprocessing without
+ * a separate "given up" marker, because the OUTER batch SELECT's own
+ * `t.status = 'completed'` filter is what gates whether a row is even
+ * considered on a FUTURE `reflect()` call: a row that stays disqualified
+ * simply stops matching that filter and is never re-selected, while a row
+ * that legitimately re-qualifies (status returns to `'completed'`) is
+ * correctly picked back up and diffed then — which permanently marking
+ * `diffed_at` here would incorrectly foreclose.
  */
 export function reflect(db: Database): { diffed: number; distilled: number } {
   const flagRow = db
@@ -585,18 +621,22 @@ export function reflect(db: Database): { diffed: number; distilled: number } {
     return { diffed: 0, distilled: 0 }
   }
 
+  // NOTE (PK-PF1-5 codex round 4 fold): this SELECT is a fast-path
+  // PRE-FILTER only — it decides which rows are even worth attempting this
+  // pass. It deliberately does NOT select `t.result`/`t.status` for use as
+  // the diff input; each row's actual/status is re-read FRESH inside its
+  // own per-row transaction below (see that loop's doc comment for why).
   const undiffed = db
     .prepare(`
-      SELECT oe.id AS id, oe.task_id AS task_id, oe.expected_outcome AS expected_outcome, t.result AS actual
+      SELECT oe.id AS id, oe.task_id AS task_id, oe.expected_outcome AS expected_outcome
       FROM outcome_expectations oe
       JOIN tasks t ON t.id = oe.task_id
       WHERE oe.diffed_at IS NULL AND t.result IS NOT NULL AND t.status = 'completed'
     `)
-    .all() as { id: number; task_id: number; expected_outcome: string; actual: string }[]
+    .all() as { id: number; task_id: number; expected_outcome: string }[]
 
   let diffedCount = 0
   for (const row of undiffed) {
-    const diff = diffOutcome({ expected: row.expected_outcome, actual: row.actual })
     db.prepare('BEGIN IMMEDIATE').run()
     try {
       const rowFlagRow = db
@@ -607,6 +647,20 @@ export function reflect(db: Database): { diffed: number; distilled: number } {
         db.prepare('ROLLBACK').run()
         continue
       }
+
+      // PK-PF1-5 codex round 4 fold (MED): re-read this row's task
+      // status/result FRESH, under the lock, instead of trusting the outer
+      // batch SELECT's snapshot (see this function's doc comment). Skip
+      // (leave diffed_at NULL, do not diff/audit) if it no longer qualifies.
+      const freshTask = db
+        .prepare('SELECT status, result FROM tasks WHERE id = ?')
+        .get(row.task_id) as { status: string; result: string | null } | null
+      if (!freshTask || freshTask.status !== 'completed' || freshTask.result === null) {
+        db.prepare('ROLLBACK').run()
+        continue
+      }
+
+      const diff = diffOutcome({ expected: row.expected_outcome, actual: freshTask.result })
 
       const updateResult = db
         .prepare("UPDATE outcome_expectations SET diffed_at = datetime('now'), diff_result = ? WHERE id = ? AND diffed_at IS NULL")

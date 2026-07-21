@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 import { readFileSync, unlinkSync } from 'fs'
 import { resolve } from 'path'
+import { Database } from 'bun:sqlite'
 import { TaskDB } from '../../db'
 import {
   recordExpectedOutcome,
@@ -1528,6 +1529,199 @@ describe('PK-PF1-5 fold (round 3, MED): signatureTag() uses utf16le (injective),
 
       const patterns = db.run(handle => getSharedPatterns(handle))
       expect(patterns.length).toBe(2)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PK-PF1-5 codex round 4 fold: 1 HIGH + 1 MED + 1 LOW.
+//
+// Per boss's disposition, ONLY the MED gets a code fold in this packet (PK-
+// PF1-5's fold authority is reflection/+tests/ only):
+//   - HIGH (reflection/outcome-feedback.ts:73): SQLite's own TEXT column
+//     round-trip is lossy for lone-surrogate strings -- it silently merges
+//     two genuinely different original inputs into the same code-unit
+//     sequence on readback, BEFORE round 3's injective utf16le signature
+//     encoding ever runs on that read-back data. NO code fix here -- boss
+//     ruled this a documented KNOWN LIMITATION / explicit PF1 activation
+//     blocker in BASELINES.md, tracked as parked card #10376381;
+//     `outcome_feedback_enabled` stays OFF until that card resolves or Gwei
+//     waives it.
+//   - MED (reflection/outcome-feedback.ts:588, this section): folded below.
+//   - LOW (reflection/outcome-feedback.ts:366): distillSharedPattern()
+//     bypasses persistSharedPattern() (REQ-PF1-05 says "via
+//     persistSharedPattern()") -- NO refactor. Documented as an accepted
+//     SPEC DEVIATION in BASELINES.md; rationale = R2's atomicity fix for
+//     SQLite's no-nested-BEGIN-IMMEDIATE constraint (distillSharedPattern()
+//     needs its OWN transaction for its co-transacted dedup check, and
+//     can't nest inside persistSharedPattern()'s own BEGIN IMMEDIATE).
+// ---------------------------------------------------------------------------
+
+describe('PK-PF1-5 fold (round 4, MED): reflect() re-reads tasks.status/result fresh inside its per-row BEGIN IMMEDIATE lock, not the outer batch-snapshot', () => {
+  function freshDb(): { db: TaskDB; path: string } {
+    const path = `/tmp/pf1-5-r4-stale-snapshot-${crypto.randomUUID()}.db`
+    const db = new TaskDB(path)
+    db.setFeatureFlag('outcome_feedback_enabled', true)
+    return { db, path }
+  }
+  function cleanup(db: TaskDB, path: string): void {
+    db.close()
+    for (const suffix of ['', '-shm', '-wal']) {
+      try { unlinkSync(path + suffix) } catch {}
+    }
+  }
+  function seedCompletedTask(db: TaskDB, result: string): number {
+    return db.run(handle => handle.prepare(
+      "INSERT INTO tasks (from_agent, to_agent, description, priority, status, result) VALUES ('sadie', 'sadie', 'seed', 'normal', 'completed', ?) RETURNING id",
+    ).get(result) as { id: number }).id
+  }
+
+  test('STATIC: reflect() computes diffOutcome() AFTER acquiring the per-row BEGIN IMMEDIATE lock (from a fresh re-read), not before it', () => {
+    const body = functionBody(REFLECTION_TS, 'export function reflect', ['\nexport function ', '\nexport const ', '\nexport interface '])
+    const perRowBeginIdx = body.lastIndexOf('BEGIN IMMEDIATE')
+    const diffCallIdx = body.indexOf('diffOutcome(')
+    const freshReadIdx = body.indexOf('SELECT status, result FROM tasks WHERE id = ?')
+    expect(perRowBeginIdx).toBeGreaterThan(-1)
+    expect(diffCallIdx).toBeGreaterThan(-1)
+    expect(freshReadIdx).toBeGreaterThan(-1)
+    // The fresh per-row task re-read and the diff computation both happen
+    // AFTER the per-row lock is acquired -- codex round 4's MED finding was
+    // that the pre-fold code computed `diff` from the outer batch SELECT's
+    // stale snapshot BEFORE `BEGIN IMMEDIATE` even ran.
+    expect(freshReadIdx).toBeGreaterThan(perRowBeginIdx)
+    expect(diffCallIdx).toBeGreaterThan(freshReadIdx)
+  })
+
+  test('a task whose result is mutated by a raw write (shaped like watchdog.ts:359-371\'s auto-resolve-via-sibling UPDATE) between reflect()\'s outer batch SELECT and its per-row transaction is diffed against the FRESH result, not the stale snapshot', () => {
+    const { db, path } = freshDb()
+    try {
+      const taskId = seedCompletedTask(db, 'stale result')
+      db.run(handle => persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: 'stale result' }))
+
+      // Scoped monkeypatch (mirrors the E3 fault-injection idiom in
+      // pf1-4-sequence-behavior.test.ts: scoped to ONE exact call site,
+      // restored in `finally`, never touches unrelated queries/instances).
+      // Intercept ONLY reflect()'s own outer batch SELECT (identified by a
+      // substring unique to that query -- the JOIN clause) and, the FIRST
+      // time it fires only, perform a raw UPDATE against `tasks` -- same
+      // shape as watchdog.ts:359-371's auto-resolve-via-sibling write (a
+      // bare `UPDATE tasks SET status=..., result=... WHERE id=?` outside
+      // the normal claim/complete flow, with no coordination with
+      // reflect()'s own transaction, no live-status predicate) -- landing in
+      // the real production gap between reflect()'s initial read and its
+      // per-row lock. bun:sqlite is single-threaded/synchronous so true OS
+      // concurrency can't be reproduced in-process; this reproduces the
+      // OBSERVABLE end state a real race would produce, same idiom already
+      // used by every earlier round's "raw write" race tests in this file.
+      const proto = Database.prototype as unknown as { prepare: (this: Database, ...args: unknown[]) => any }
+      const originalPrepare = proto.prepare
+      let fired = false
+      proto.prepare = function (this: Database, ...callArgs: unknown[]) {
+        const sql = callArgs[0] as string
+        const stmt = originalPrepare.apply(this, callArgs)
+        if (!fired && sql.includes('JOIN tasks t ON t.id = oe.task_id')) {
+          fired = true
+          const originalAll = stmt.all.bind(stmt)
+          stmt.all = (...args: unknown[]) => {
+            const rows = originalAll(...args)
+            this.prepare(
+              "UPDATE tasks SET status = 'completed', result = ?, completed_at = COALESCE(completed_at, datetime('now')) WHERE id = ?",
+            ).run('FRESH result via watchdog auto-resolve', taskId)
+            return rows
+          }
+        }
+        return stmt
+      }
+
+      let result: { diffed: number; distilled: number }
+      try {
+        result = db.run(handle => reflect(handle))
+      } finally {
+        proto.prepare = originalPrepare
+      }
+
+      expect(result.diffed).toBe(1) // the task is still 'completed' throughout -- still qualifies, just with different data
+      const row = db.run(handle => handle.prepare('SELECT diff_result FROM outcome_expectations WHERE task_id = ?').get(taskId)) as { diff_result: string }
+      const diff = JSON.parse(row.diff_result) as { matched: boolean; delta?: string }
+      // FIXED behavior: the per-row transaction re-reads live state and
+      // diffs against the FRESH watchdog-written result, which does NOT
+      // match the original expectation.
+      expect(diff.matched).toBe(false)
+      expect(diff.delta).toContain('FRESH result via watchdog auto-resolve')
+      // Pre-fold behavior (the bug this test proves is fixed): would have
+      // persisted matched:true, because `row.actual` was captured from the
+      // outer SELECT BEFORE the watchdog-shaped mutation landed
+      // ('stale result' === 'stale result') -- a diff computed and
+      // PERMANENTLY audited against data that was already obsolete by the
+      // time it was written.
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('a task whose status is mutated away from \'completed\' by a raw write between reflect()\'s outer batch SELECT and its per-row transaction is SKIPPED (not diffed, diffed_at stays NULL) -- it no longer qualifies under the same status=\'completed\' condition reflect() applies everywhere else (db.ts:1805/1874 terminal semantics)', () => {
+    const { db, path } = freshDb()
+    try {
+      const taskId = seedCompletedTask(db, 'original result')
+      db.run(handle => persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: 'original result' }))
+
+      const proto = Database.prototype as unknown as { prepare: (this: Database, ...args: unknown[]) => any }
+      const originalPrepare = proto.prepare
+      let fired = false
+      proto.prepare = function (this: Database, ...callArgs: unknown[]) {
+        const sql = callArgs[0] as string
+        const stmt = originalPrepare.apply(this, callArgs)
+        if (!fired && sql.includes('JOIN tasks t ON t.id = oe.task_id')) {
+          fired = true
+          const originalAll = stmt.all.bind(stmt)
+          stmt.all = (...args: unknown[]) => {
+            const rows = originalAll(...args)
+            // Simulate the task getting reopened/corrected mid-flight -- no
+            // longer 'completed', so it should no longer qualify.
+            this.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(taskId)
+            return rows
+          }
+        }
+        return stmt
+      }
+
+      let result: { diffed: number; distilled: number }
+      try {
+        result = db.run(handle => reflect(handle))
+      } finally {
+        proto.prepare = originalPrepare
+      }
+
+      expect(result.diffed).toBe(0) // skipped, not diffed against stale 'completed' data
+      const row = db.run(handle => handle.prepare('SELECT diffed_at, diff_result FROM outcome_expectations WHERE task_id = ?').get(taskId)) as { diffed_at: string | null; diff_result: string | null }
+      // Idempotency choice (documented here, mirrors the existing "lost the
+      // race" skip branch a few lines above in reflect(), which ALSO leaves
+      // diffed_at NULL rather than half-processing a row): do NOT mark
+      // diffed_at on a disqualified row. This is safe against "infinite
+      // reprocessing" without needing a separate "given up" marker: the
+      // OUTER batch SELECT's own `t.status = 'completed'` filter is what
+      // gates whether a row is even considered on a FUTURE reflect() call --
+      // a row that stays disqualified simply stops matching that filter and
+      // is never re-selected, while a row that legitimately re-qualifies
+      // (status returns to 'completed') is correctly picked back up and
+      // diffed then -- which permanently marking diffed_at here would
+      // incorrectly foreclose.
+      expect(row.diffed_at).toBeNull()
+      expect(row.diff_result).toBeNull()
+      const auditCount = db.run(handle => handle.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'outcome_reflected'").get()) as { n: number }
+      expect(auditCount.n).toBe(0)
+
+      // Prove the "future pass can retry" half of the invariant: once the
+      // task genuinely returns to 'completed', a LATER reflect() call picks
+      // it up and diffs it normally.
+      db.run(handle => handle.prepare("UPDATE tasks SET status = 'completed', result = 'original result' WHERE id = ?").run(taskId))
+      const laterResult = db.run(handle => reflect(handle))
+      expect(laterResult.diffed).toBe(1)
+      const laterRow = db.run(handle => handle.prepare('SELECT diffed_at, diff_result FROM outcome_expectations WHERE task_id = ?').get(taskId)) as { diffed_at: string | null; diff_result: string }
+      expect(laterRow.diffed_at).not.toBeNull()
+      expect(JSON.parse(laterRow.diff_result).matched).toBe(true)
     } finally {
       cleanup(db, path)
     }
