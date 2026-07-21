@@ -746,6 +746,15 @@ export class TaskDB {
     // a scaffold stub in this stage); the Phase-5 consolidator call site and
     // full consume/lease/advance logic land in a later packet.
     this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('reward_consumer_enabled', 0)")
+    // EPIC-PF1 (PF-spec.md REQ-PF1-08/ATM-PF1-02): outcome-feedback loop.
+    // DEFAULT OFF — this packet (PK-PF1-1) only lays the flag + the two
+    // outcome_expectations/shared_patterns tables (ATM-PF1-01, below). No
+    // reflection/outcome-feedback.ts logic reads or writes through this flag
+    // yet (recordExpectedOutcome()/reflect() land in PK-PF1-2/3; the
+    // debrief.ts/claim-delegation-path wiring lands in PK-PF1-4). While OFF,
+    // debrief.ts and the claim/delegation path stay byte-identical to
+    // pre-PF1 (REQ-PF1-08).
+    this.db.exec("INSERT OR IGNORE INTO feature_flags (flag_name, enabled) VALUES ('outcome_feedback_enabled', 0)")
     // T1 KO-SWEEP (#10376215, REQ-012/ATM-011): generalized retention/prune.
     // DEFAULT OFF — the runHygiene() Step-6 prune path is flag-gated and inert
     // until this flag is turned ON. All 3 append-only tables
@@ -1276,6 +1285,50 @@ export class TaskDB {
       CREATE INDEX IF NOT EXISTS idx_cross_family_critiques_decision ON cross_family_critiques(decision_id);
       CREATE INDEX IF NOT EXISTS idx_cross_family_critiques_verdict ON cross_family_critiques(verdict);
       CREATE INDEX IF NOT EXISTS idx_cross_family_critiques_created ON cross_family_critiques(created_at);
+    `)
+
+    // EPIC-PF1 (PF-spec.md REQ-PF1-01/02/05/06, ATM-PF1-01): outcome-feedback
+    // loop schema. Mirrors the cross_family_critiques idiom above (CREATE
+    // TABLE IF NOT EXISTS + supporting indexes) — two NEW companion tables,
+    // editing zero lines of any existing table definition. Gated inert by
+    // outcome_feedback_enabled (default 0, seeded above) — no write path
+    // exists yet in this packet (PK-PF1-1 is schema+flag only).
+    //
+    // outcome_expectations — append-only (never updated in place except to
+    // fill diffed_at/diff_result once, by reflect() in a later packet).
+    // Written by persistOutcomeExpectation() in reflection/outcome-feedback.ts.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS outcome_expectations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL,
+        expected_outcome TEXT NOT NULL,
+        recorded_at TEXT NOT NULL DEFAULT (datetime('now')),
+        diffed_at TEXT,
+        diff_result TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_outcome_expectations_task ON outcome_expectations(task_id);
+      CREATE INDEX IF NOT EXISTS idx_outcome_expectations_diffed ON outcome_expectations(diffed_at);
+    `)
+
+    // shared_patterns — supersedeable, NEVER deleted (REQ-PF1-06):
+    // supersedeSharedPattern() sets the prior row's is_active=0 /
+    // superseded_by=<new id> and appends the replacement row; it must never
+    // issue a DELETE. Written by persistSharedPattern() in
+    // reflection/outcome-feedback.ts.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS shared_patterns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pattern_text TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        source_expectation_id INTEGER REFERENCES outcome_expectations(id),
+        is_active INTEGER NOT NULL DEFAULT 1,
+        superseded_by INTEGER REFERENCES shared_patterns(id),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_shared_patterns_active ON shared_patterns(is_active);
+      CREATE INDEX IF NOT EXISTS idx_shared_patterns_source ON shared_patterns(source_expectation_id);
     `)
 
     // P8 EPIC-04 (REQ-010/ATM-016): durable ternary-reward persistence.

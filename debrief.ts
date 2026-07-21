@@ -11,6 +11,10 @@ import { AuditLog } from './audit'
 import { postToGroup } from './notify'
 import { DEBRIEF_DEFAULTS, TEAM_AGENTS } from './config'
 import { sanitizeMemoryContent, escapeFenceFragment } from './memory-integrity'
+// EPIC-PF1 (PK-PF1-4, REQ-PF1-04): additive, flag-gated, try/catch-swallowed
+// post-summarise reflect() call in checkAndRunDebrief()/forceDebrief() below.
+// See PF1-4-DESIGN.md.
+import { reflect } from './reflection/outcome-feedback'
 
 // ---------------------------------------------------------------------------
 // P4 anti-laundering, Stage 4 (#10376048/EPIC-03): defense-in-depth on the
@@ -858,7 +862,22 @@ export async function checkAndRunDebrief(
   }
 
   log('All 3 gates passed — triggering debrief')
-  return daemon.runDebrief(false)
+  const result = await daemon.runDebrief(false)
+  // EPIC-PF1 (PK-PF1-4, REQ-PF1-04): additive post-summarise pass, AFTER the
+  // existing summarise step completes — never before, never in place of it.
+  // Flag-gated, try/catch-swallowed; must never affect checkAndRunDebrief()'s
+  // own return value. PK-PF1-5 (codex round 1 fold, E3/MED — boss-amended
+  // R1 allowlist): the flag READ itself now lives INSIDE the try too — a
+  // throwing isFeatureEnabled() (e.g. a DB error) must be swallowed exactly
+  // like a throwing reflect(), not propagate and alter pre-PF1 control flow.
+  try {
+    if (taskDb.isFeatureEnabled('outcome_feedback_enabled')) {
+      reflect(taskDb.getHandle())
+    }
+  } catch {
+    // swallowed — REQ-PF1-10
+  }
+  return result
 }
 
 /**
@@ -871,5 +890,16 @@ export async function forceDebrief(
   audit: AuditLog,
 ): Promise<DebriefResult> {
   const daemon = new DebriefDaemon(taskDb, mem, dec, audit)
-  return daemon.runDebrief(true)
+  const result = await daemon.runDebrief(true)
+  // EPIC-PF1 (PK-PF1-4, REQ-PF1-04): same additive post-summarise pass as
+  // checkAndRunDebrief() above. PK-PF1-5 (codex round 1 fold, E3/MED): flag
+  // read moved inside the try too — see checkAndRunDebrief()'s comment.
+  try {
+    if (taskDb.isFeatureEnabled('outcome_feedback_enabled')) {
+      reflect(taskDb.getHandle())
+    }
+  } catch {
+    // swallowed — REQ-PF1-10
+  }
+  return result
 }
