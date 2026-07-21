@@ -1726,4 +1726,49 @@ describe('PK-PF1-5 fold (round 4, MED): reflect() re-reads tasks.status/result f
       cleanup(db, path)
     }
   })
+
+  test('a task whose result is mutated to NULL (status staying \'completed\') by a raw write between reflect()\'s outer batch SELECT and its per-row transaction is SKIPPED (not diffed, diffed_at stays NULL) -- exercises the freshTask.result === null disqualification branch specifically, not just the status branch (codex round 5 focused pass 1, LOW finding: tests/reflection/outcome-feedback.test.ts:1664 previously covered a status change and a result VALUE change, but never a result becoming NULL while status stayed \'completed\' -- a regression that dropped only the null-result half of the disqualification check would have passed all 3 prior tests undetected)', () => {
+    const { db, path } = freshDb()
+    try {
+      const taskId = seedCompletedTask(db, 'original result')
+      db.run(handle => persistOutcomeExpectation(handle, { task_id: taskId, expected_outcome: 'original result' }))
+
+      const proto = Database.prototype as unknown as { prepare: (this: Database, ...args: unknown[]) => any }
+      const originalPrepare = proto.prepare
+      let fired = false
+      proto.prepare = function (this: Database, ...callArgs: unknown[]) {
+        const sql = callArgs[0] as string
+        const stmt = originalPrepare.apply(this, callArgs)
+        if (!fired && sql.includes('JOIN tasks t ON t.id = oe.task_id')) {
+          fired = true
+          const originalAll = stmt.all.bind(stmt)
+          stmt.all = (...args: unknown[]) => {
+            const rows = originalAll(...args)
+            // Simulate the task's result being wiped mid-flight -- status
+            // STAYS 'completed' (isolating the result===null branch from the
+            // status!=='completed' branch already covered above).
+            this.prepare("UPDATE tasks SET result = NULL WHERE id = ?").run(taskId)
+            return rows
+          }
+        }
+        return stmt
+      }
+
+      let result: { diffed: number; distilled: number }
+      try {
+        result = db.run(handle => reflect(handle))
+      } finally {
+        proto.prepare = originalPrepare
+      }
+
+      expect(result.diffed).toBe(0) // skipped -- result went NULL, no longer qualifies
+      const row = db.run(handle => handle.prepare('SELECT diffed_at, diff_result FROM outcome_expectations WHERE task_id = ?').get(taskId)) as { diffed_at: string | null; diff_result: string | null }
+      expect(row.diffed_at).toBeNull()
+      expect(row.diff_result).toBeNull()
+      const auditCount = db.run(handle => handle.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'outcome_reflected'").get()) as { n: number }
+      expect(auditCount.n).toBe(0)
+    } finally {
+      cleanup(db, path)
+    }
+  })
 })
