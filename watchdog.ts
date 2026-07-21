@@ -35,6 +35,20 @@ import {
 } from './verification/failure-classification'
 import { DecisionDB, expireStaleDecisions, type Decision, type DecisionWithDetail } from './decision'
 import { AuditLog } from './audit'
+// EPIC-PF2 (PK-PF2-5, ATM-PF2-04/REQ-PF2-03/04): additive, flag-gated,
+// fault-isolated evaluateWatchers() step. See PF2-5-DESIGN.md.
+import {
+  getWatchers,
+  fireWatcher,
+  evaluateScheduledCondition,
+  evaluateStateChangeCondition,
+  evaluateLlmCondition,
+  computeIdempotencyKey,
+  stubLlmEvalClient,
+  type ScheduledConditionSpec,
+  type StateChangeConditionSpec,
+  type LlmEvalConditionSpec,
+} from './watchers/declarative-watchers'
 import { dispatchAgentNudge, configureNudgeDebounce } from './nudge'
 import { postToGroup, formatDecisionExpired, esc } from './notify'
 import { checkAndRunDebrief } from './debrief'
@@ -109,6 +123,24 @@ export interface ReconcileResult {
   decisions_ready: number
   idle_nudges: number
   circuits_recovered: number
+  // EPIC-PF2 (PK-PF2-5, PF2-5-DESIGN.md open item #3): additive counter,
+  // mirrors the sibling counter fields' TYPE exactly, but declared
+  // OPTIONAL (not required like its siblings) — 7 pre-existing test files
+  // construct ReconcileResult object literals without it (e.g.
+  // tests/decision-monitor.test.ts), and this packet must not touch files
+  // outside its own scope to backfill a field on every one of them. Not in
+  // any DO-NOT-TOUCH set (ReconcileResult is a plain data interface, not
+  // one of findStaleTasks()/determineAction()/escalation-creation) — the
+  // optionality is a blast-radius choice, not a protection-scope one.
+  // evaluateWatchers() below always treats it as `?? 0` before
+  // incrementing, so it behaves as a normal counter wherever it IS
+  // present. NOT wired into run()'s existing `hasActivity`/"Cycle
+  // complete" log line (watchdog.ts, just before Step 4) — doing so would
+  // require MODIFYING those two existing lines, which this packet's
+  // diff-allowlist guard (tests/guardrails/pf2-5-wiring.guard.test.ts)
+  // requires to stay at zero deleted/modified lines. This is a deliberate,
+  // documented scope-limiting choice, not an oversight.
+  watchers_fired?: number
 }
 
 export interface WatchdogConfig {
@@ -1594,6 +1626,112 @@ export class TaskReconciler {
     }
   }
 
+  /**
+   * ATM-PF2-04/REQ-PF2-03/04 \u2014 Additive, fault-isolated pass: evaluates
+   * every enabled `declarative_watchers` row and fires ones whose
+   * condition is newly satisfied. Flag-gated as the FIRST statement
+   * (REQ-PF2-09) \u2014 while `declarative_watchers_enabled=0`, this performs
+   * literally zero further work (no `getWatchers()` call, no writes of
+   * any kind).
+   *
+   * Occasion-context derivation (PF2-5-DESIGN.md section 4) \u2014 each
+   * trigger_type's idempotency key is computed HERE, from real tick-level
+   * data, then handed to `computeIdempotencyKey()` (PK-PF2-4, pure) and
+   * `fireWatcher()` (PK-PF2-4, opaque-key-accepting):
+   *
+   * - `scheduled`: ONE `Date.now()` read per tick (this method is impure
+   *   by design, same category as `monitorDecisions()`/
+   *   `monitorIdleAgents()`) feeds BOTH the "is it due" check AND the
+   *   `windowBucket` the idempotency key is keyed on, so a watcher still
+   *   due on a LATER tick within the SAME `interval_seconds`-wide window
+   *   computes the SAME key and is gracefully rejected by the `UNIQUE`
+   *   constraint (REQ-PF2-16), not by any app-level pre-check.
+   *   `evaluateScheduledCondition()` itself stays pure/injected-clock, per
+   *   PK-PF2-3's contract \u2014 no `Date` usage crosses into it.
+   *   `last_fired_at` is updated via a follow-up statement AFTER a
+   *   genuine (non-already-fired) fire \u2014 an EFFICIENCY optimization, not
+   *   a correctness requirement: the windowBucket-keyed idempotency key
+   *   is the real fire-once guarantee. Proof: `tests/watchdog-pf2-evaluate-watchers.test.ts`'s
+   *   mandated crash-window test simulates the `last_fired_at` UPDATE
+   *   being lost after a committed fire and shows the NEXT tick still
+   *   computes the identical `windowBucket` (since `now` alone drives it)
+   *   and is rejected by the same `UNIQUE` constraint \u2014 zero duplicate
+   *   task, even with a stale `last_fired_at`. Per main's ruling, a
+   *   same-window `UNIQUE` rejection (`fireResult.alreadyFired`) is an
+   *   EXPECTED, QUIET outcome for this trigger_type \u2014 deliberately NEVER
+   *   logged as an anomaly/warning.
+   * - `state_change`: `evaluateStateChangeCondition()` already persists
+   *   `last_observed_value`/`last_observed_at` inside its OWN `BEGIN
+   *   IMMEDIATE` transaction (PK-PF2-3, REQ-PF2-17) before returning \u2014
+   *   this method re-reads those two columns immediately after a `true`
+   *   result and uses them as the key's `newValue`/`transitionTimestamp`.
+   *   Safe specifically because (a) the snapshot was persisted in the
+   *   SAME transaction as the transition detection itself, so no separate
+   *   write could have landed in between, and (b) watchdog ticks are
+   *   sequential \u2014 this method is never re-entered concurrently with
+   *   itself, so nothing else can have mutated that row between the eval
+   *   and this read. No signature change to `evaluateStateChangeCondition()`
+   *   itself (PK-PF2-3, already shipped, 31 existing tests untouched).
+   * - `llm_eval`: uses `stubLlmEvalClient` \u2014 KNOWN LIMITATION, see
+   *   BASELINES.md's PF2-5 section; no production `LlmEvalClient` exists
+   *   yet. Every enabled `llm_eval` watcher is still evaluated every tick
+   *   (REQ-PF2-03 covers ALL enabled watchers, not a subset \u2014 main's
+   *   ratification of the anti-recommendation against skip-dispatch), but
+   *   the stub never returns an affirmative reply, so none can ever fire.
+   */
+  async evaluateWatchers(result: ReconcileResult): Promise<void> {
+    if (!this.taskDb.isFeatureEnabled('declarative_watchers_enabled')) return
+
+    const now = Date.now()
+    const watchers = this.taskDb.run(db => getWatchers(db))
+
+    for (const row of watchers) {
+      if (row.trigger_type === 'scheduled') {
+        const spec = JSON.parse(row.condition_spec) as ScheduledConditionSpec
+        const lastFiredAtMs = row.last_fired_at === null ? null : Date.parse(row.last_fired_at)
+        const lastFiredAtSec = lastFiredAtMs === null || Number.isNaN(lastFiredAtMs) ? null : Math.floor(lastFiredAtMs / 1000)
+        const nowSec = Math.floor(now / 1000)
+        if (evaluateScheduledCondition({ interval_seconds: spec.interval_seconds, last_fired_at: lastFiredAtSec }, nowSec)) {
+          const windowBucket = Math.floor(nowSec / spec.interval_seconds)
+          const idempotencyKey = computeIdempotencyKey({ triggerType: 'scheduled', watcherId: row.id, windowBucket })
+          const fireResult = fireWatcher(this.taskDb, { id: row.id, action_spec: JSON.parse(row.action_spec) }, idempotencyKey)
+          if (fireResult.fired) {
+            result.watchers_fired = (result.watchers_fired ?? 0) + 1
+            this.taskDb.run(db => db.prepare("UPDATE declarative_watchers SET last_fired_at = datetime('now') WHERE id = ?").run(row.id))
+          }
+        }
+      } else if (row.trigger_type === 'state_change') {
+        const spec = JSON.parse(row.condition_spec) as StateChangeConditionSpec
+        const fired = this.taskDb.run(db => evaluateStateChangeCondition({ id: row.id, condition_spec: spec }, db))
+        if (fired) {
+          const fresh = this.taskDb.run(db =>
+            db.prepare('SELECT last_observed_value, last_observed_at FROM declarative_watchers WHERE id = ?').get(row.id),
+          ) as { last_observed_value: string | null; last_observed_at: string | null }
+          const idempotencyKey = computeIdempotencyKey({
+            triggerType: 'state_change',
+            watcherId: row.id,
+            newValue: fresh.last_observed_value,
+            transitionTimestamp: fresh.last_observed_at ?? '',
+          })
+          const fireResult = fireWatcher(this.taskDb, { id: row.id, action_spec: JSON.parse(row.action_spec) }, idempotencyKey)
+          if (fireResult.fired) {
+            result.watchers_fired = (result.watchers_fired ?? 0) + 1
+          }
+        }
+      } else if (row.trigger_type === 'llm_eval') {
+        const spec = JSON.parse(row.condition_spec) as LlmEvalConditionSpec
+        const fired = await evaluateLlmCondition(spec, stubLlmEvalClient)
+        if (fired) {
+          const idempotencyKey = computeIdempotencyKey({ triggerType: 'llm_eval', watcherId: row.id, evaluationTimestamp: new Date(now).toISOString() })
+          const fireResult = fireWatcher(this.taskDb, { id: row.id, action_spec: JSON.parse(row.action_spec) }, idempotencyKey)
+          if (fireResult.fired) {
+            result.watchers_fired = (result.watchers_fired ?? 0) + 1
+          }
+        }
+      }
+    }
+  }
+
   // -------------------------------------------------------------------------
   // 10. PERSISTENT LOOP
   // -------------------------------------------------------------------------
@@ -1679,6 +1817,13 @@ export class TaskReconciler {
           await this.runConsolidationIfDue()
         } catch (err) {
           logError('Consolidation scheduler failed', err)
+        }
+
+        // Step 3e: Evaluate declarative watchers (EPIC-PF2, PK-PF2-5, ATM-PF2-04)
+        try {
+          await this.evaluateWatchers(reconcileResult)
+        } catch (err) {
+          logError('Watcher evaluation failed', err)
         }
 
         // Log cycle summary

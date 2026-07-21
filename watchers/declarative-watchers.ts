@@ -284,6 +284,17 @@ function validateActionSpec(actionSpec: unknown): void {
  * (mirrors P6/P7/P8/PF1's own persist fns). `created_at` is left to the
  * column's own `DEFAULT (datetime('now'))` (db.ts DDL) — this function
  * never reads a wall clock itself.
+ *
+ * PK-PF2-5/ATM-PF2-09/REQ-PF2-10 — also appends the `watcher_created`
+ * `audit_log` row, in the SAME transaction as the `INSERT` above (so a
+ * rollback of one rolls back both) — the raw-`INSERT`-inside-the-
+ * function's-own-transaction idiom, mirroring
+ * `verification/ternary-reward.ts`'s `persistTernaryReward()` (its
+ * `audit_log` insert at the time of writing) and
+ * `reflection/outcome-feedback.ts`'s `persistOutcomeExpectation()` (line
+ * 85) — never `server.ts`'s `AuditLog.log()` class-instance idiom, since
+ * this EPIC's domain objects already own dedicated persist functions with
+ * their own transactions the same way PF1/P8's do.
  */
 export function persistWatcher(db: Database, input: CreateWatcherInput): number {
   db.prepare('BEGIN IMMEDIATE').run()
@@ -295,6 +306,10 @@ export function persistWatcher(db: Database, input: CreateWatcherInput): number 
         RETURNING id
       `)
       .get(input.name, input.trigger_type, JSON.stringify(input.condition_spec), JSON.stringify(input.action_spec)) as { id: number }
+    db.prepare(`
+      INSERT INTO audit_log (agent, action, detail, task_id)
+      VALUES (?, ?, ?, ?)
+    `).run('system', 'watcher_created', JSON.stringify({ watcher_id: inserted.id, name: input.name, trigger_type: input.trigger_type }), null)
     db.prepare('COMMIT').run()
     return inserted.id
   } catch (err) {
@@ -600,15 +615,24 @@ function isUniqueConstraintViolation(err: unknown): boolean {
  * `createTask()` path from a watcher's `action_spec`. `action_spec` was
  * only validated as "a plain object" at createWatcher() time (PK-PF2-2;
  * its deeper task-template field shape was explicitly out of ATM-PF2-14's
- * scope) — so this defensively re-validates the one field createTask()
- * actually requires (`description`, non-empty string) and throws a clear,
- * descriptive error rather than letting a malformed action_spec reach
- * createTask() as `undefined`/a wrong type. `to`/`priority` fall back to
- * createTask()'s own defaults (`to: null`, `priority` left to its DEFAULT
- * 'normal' — mirrored here explicitly since CreateTaskInput has no default
- * value of its own) when absent or malformed, rather than throwing, since
- * omitting them is a legitimate, addressable-later watcher config, not a
- * structural violation the way a missing description is.
+ * scope) — so this defensively re-validates the fields `createTask()`
+ * actually requires and throws a clear, descriptive error rather than
+ * letting a malformed action_spec reach `createTask()` as `undefined`/a
+ * wrong type / a value the live schema rejects.
+ *
+ * PK-PF2-5 FIX (found via this packet's own testing, not present before):
+ * `to` is now REQUIRED (non-empty string), same treatment as
+ * `description` — NOT defaulted to `null` as an earlier draft of this
+ * function did. `CreateTaskInput.to`'s TYPE is `string | null`, but the
+ * live `tasks` DDL declares `to_agent TEXT NOT NULL` (db.ts:298) — passing
+ * `to: null` through to `createTask()` throws a raw `SQLiteError: NOT NULL
+ * constraint failed: tasks.to_agent` from deep inside `createTask()`,
+ * *after* the task-creating transaction has already opened, rather than a
+ * clear validation error here, before any DB work starts. `priority`
+ * remains optional (falls back to `'normal'`, `createTask()`'s own DEFAULT
+ * — mirrored here explicitly since `CreateTaskInput` has no default value
+ * of its own) — omitting it is a legitimate, addressable-later watcher
+ * config, unlike `to`/`description`, which the schema itself requires.
  */
 function buildCreateTaskInputFromActionSpec(actionSpec: FireableWatcherRow['action_spec'], fromAgent: string): CreateTaskInput {
   if (typeof actionSpec.description !== 'string' || actionSpec.description.length === 0) {
@@ -616,9 +640,14 @@ function buildCreateTaskInputFromActionSpec(actionSpec: FireableWatcherRow['acti
       `fireWatcher(): action_spec.description must be a non-empty string — got ${JSON.stringify(actionSpec.description)}`,
     )
   }
+  if (typeof actionSpec.to !== 'string' || actionSpec.to.length === 0) {
+    throw new Error(
+      `fireWatcher(): action_spec.to must be a non-empty string — got ${JSON.stringify(actionSpec.to)} (tasks.to_agent is NOT NULL, db.ts:298)`,
+    )
+  }
   return {
     from: fromAgent,
-    to: typeof actionSpec.to === 'string' ? actionSpec.to : null,
+    to: actionSpec.to,
     description: actionSpec.description,
     priority: typeof actionSpec.priority === 'string' && actionSpec.priority.length > 0 ? actionSpec.priority : 'normal',
   }
@@ -656,6 +685,13 @@ const WATCHER_FIRING_FROM_AGENT = 'system'
  * rejection is caught and returned as a graceful `{fired: false,
  * alreadyFired: true}` result, never thrown; any OTHER error (not a UNIQUE
  * violation) still rolls back and rethrows.
+ *
+ * PK-PF2-5/ATM-PF2-09/REQ-PF2-10 — also appends the `watcher_fired`
+ * `audit_log` row, in the SAME transaction as the task + firing `INSERT`s
+ * above, ONLY on the genuinely-fired path (never on the already-fired/
+ * `alreadyFired` graceful-rejection path — REQ-PF2-10 names one row per
+ * actual fire, not per attempt). Same raw-`INSERT`-inside-the-transaction
+ * idiom as `persistWatcher()`'s `watcher_created` row above.
  */
 export function fireWatcher(taskDb: TaskDB, watcher: FireableWatcherRow, idempotencyKey: string): FireResult {
   return taskDb.run(db => {
@@ -669,6 +705,10 @@ export function fireWatcher(taskDb: TaskDB, watcher: FireableWatcherRow, idempot
           RETURNING id
         `)
         .get(watcher.id, task.id, idempotencyKey) as { id: number }
+      db.prepare(`
+        INSERT INTO audit_log (agent, action, detail, task_id)
+        VALUES (?, ?, ?, ?)
+      `).run('system', 'watcher_fired', JSON.stringify({ watcher_id: watcher.id, firing_id: firing.id, idempotency_key: idempotencyKey }), task.id)
       db.prepare('COMMIT').run()
       return { fired: true, taskId: task.id, firingId: firing.id, alreadyFired: false }
     } catch (err) {
@@ -824,4 +864,29 @@ export function computeIdempotencyKey(input: IdempotencyKeyInput): string {
     case 'llm_eval':
       return composeKey([input.watcherId, 'llm', input.evaluationTimestamp])
   }
+}
+
+// ---------------------------------------------------------------------------
+// PK-PF2-5 Stage B — stubLlmEvalClient. KNOWN LIMITATION (main's ruling,
+// PF2-5 open item #2): no production LlmEvalClient implementation exists
+// anywhere in this codebase — provisioning one is a new outbound-API-call
+// capability surface this build explicitly does not build, an activation-
+// scope decision (main is escalating a ticket to boss for "production
+// LlmEvalClient provisioning," parallel to card #10376381). This stub
+// ships instead so `llm_eval` watchers are structurally wired end-to-end
+// (evaluateWatchers() dispatches to evaluateLlmCondition() for every
+// enabled llm_eval watcher, every tick, per REQ-PF2-03's "additively
+// invoke evaluateWatchers()" covering ALL enabled watchers, not a subset)
+// but functionally INERT: the stub's reply is deliberately not the exact
+// string `'true'`, so evaluateLlmCondition()'s existing strict-boolean
+// default-false semantics (PK-PF2-3, REQ-PF2-14) apply and no `llm_eval`
+// watcher can ever fire until a real client replaces this stub. See
+// BASELINES.md's PF2-5 section for the full KNOWN LIMITATION writeup and
+// tracked-TODO framing.
+// ---------------------------------------------------------------------------
+
+export const stubLlmEvalClient: LlmEvalClient = {
+  async complete(_prompt: string, _maxTokens: number): Promise<string> {
+    return 'stub: no production LlmEvalClient provisioned — see BASELINES.md PF2-5 KNOWN LIMITATION'
+  },
 }
