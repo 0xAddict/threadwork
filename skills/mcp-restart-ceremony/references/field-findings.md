@@ -122,6 +122,47 @@ Other findings from the same run:
   connection — stronger than reading a picker line, and it avoids all
   the ESC/rewind hazards.
 
+### F6 — `/mcp reconnect <server>` arg form works directly on CC 2.1.215+ (PREFERRED — eliminates the picker entirely)
+
+Discovered 2026-07-20 during the T4 reward-consumer activation ceremony
+(snoopy operator), CC **2.1.215**.
+
+`/mcp` accepts a `reconnect <server-name>` argument and executes it as a
+direct client-side command:
+
+```
+tmux send-keys -t claude-<agent> -l '/mcp reconnect task-board'
+sleep 0.4
+tmux send-keys -t claude-<agent> Enter
+```
+
+The pane prints an inline `⎿ Successfully reconnected to task-board`
+and returns to a clean composer. **No picker opens. No navigation. Zero
+ESC/Rewind hazard exposure.** This supersedes picker-driving as the
+preferred reconnect mechanism wherever the CC version supports it.
+
+Verification stack (all three used in the T4 ceremony, 5/5):
+
+1. The inline `Successfully reconnected` line (CC's own handshake
+   confirmation — it completes the MCP initialize + tool listing).
+2. **Fresh server pid**: `ps -eo pid,ppid,lstart,command | grep "bun run"
+   | grep task-board` filtered to `ppid == <pane claude pid>`. The
+   reconnect restarts the server subprocess, so a new pid with a fresh
+   lstart proves the server reloaded current code (this is how you prove
+   a re-anchored checkout is actually being served).
+3. Optional functional proof: any successful task-board call afterward
+   (audit-log row or a live `nudge_agent`).
+
+Self-application (supersedes the spirit of F4's "never on snoopy's own
+pane" for THIS mechanism): the operator CAN reconnect their own session
+by `send-keys`-ing the command into their own pane mid-turn — it queues
+in the composer and executes client-side at turn end. Two caveats:
+(a) a client-side slash command does NOT re-invoke the model, so launch
+a `run_in_background` sentinel FIRST (sleep ~20s → capture own pane +
+ps pid check); its completion wakes the operator to verify and report.
+(b) this remains a last-in-sequence move — reconnect everyone else
+before yourself.
+
 ### kiera 2026-06-23 — remediation under the F5 hazard
 
 Kiera was parked ~18h at a Rewind/restore-checkpoint modal + a flapping
@@ -176,3 +217,16 @@ Memory #1282 captured the v4 playbook in long-form. After this skill
 exists, that memory should be superseded with a thin pointer back to
 this skill (`/mcp-restart-ceremony`) so the playbook has exactly one
 canonical home.
+
+### T4 ceremony — 2026-07-20 20:47–20:50 (CC 2.1.215)
+
+**5/5** (steve → sadie → kiera → boss → snoopy-self), the T4
+reward-consumer activation reconnect after boss-runner re-anchored the
+task-board checkout to `4db813f`. First ceremony run entirely on the
+**F6 arg form** — no picker opened on any pane, zero ESC exposure, no
+aborts, no unsubmitted intent found (all agents were pre-warned idle).
+Fresh server pids verified for all five (81472 / 81914 / 82210 / 82488 /
+83060, spawned post-re-anchor). `migrate()` seeding confirmed via
+read-only sqlite: `reward_consumer_enabled=0` (OFF) +
+`reward_consumption_cursor` row present. Snoopy self-reconnect used the
+queued-composer + background-sentinel pattern documented in F6.

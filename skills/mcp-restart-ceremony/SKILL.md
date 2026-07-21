@@ -1,6 +1,6 @@
 ---
 name: mcp-restart-ceremony
-description: Reconnect threadwork agents (boss/steve/sadie/kiera) to the task-board MCP server after disconnects, /clear ceremonies, or team-wide reconnect requests. Reads pane first; ESC-ESC clears; opens /mcp picker; verifies task-board ✔ connected · 40 tools. Surfaces field findings F0-F4. Do NOT run on snoopy.
+description: Reconnect threadwork agents (boss/steve/sadie/kiera, optionally snoopy-self last) to the task-board MCP server after disconnects, /clear ceremonies, or team-wide reconnect requests. Reads pane first; on CC 2.1.215+ uses the direct '/mcp reconnect task-board' arg form (F6 — no picker, no ESC); verifies inline success + FRESH server pid. NEVER ESC-ESC on CC 2.1.183+ (opens Rewind modal — F5). Surfaces field findings F0-F6.
 ---
 
 # mcp-restart-ceremony
@@ -95,7 +95,25 @@ tmux send-keys -t claude-<agent> Enter
 
 Do NOT use `C-u` for multi-line input — it's unreliable (F2).
 
-### 3. Open the /mcp picker
+### 3. Reconnect — PREFERRED: direct arg form (F6, CC 2.1.215+)
+
+On CC 2.1.215+ use the argument form — it reconnects inline with **no
+picker and zero ESC/Rewind exposure** (proven 5/5, T4 ceremony
+2026-07-20):
+
+```
+tmux send-keys -t claude-<agent> -l '/mcp reconnect task-board'
+sleep 0.4
+tmux send-keys -t claude-<agent> Enter
+```
+
+Success = inline `⎿ Successfully reconnected to task-board` + clean
+composer. Then verify a **fresh server pid** (ps: `bun run …
+task-board/server.ts` with ppid = the pane's claude pid, new lstart).
+See F6 in `references/field-findings.md` — including the safe
+self-application pattern for the operator's own pane.
+
+**Fallback only** (older CC, or arg form errors) — open the picker:
 
 ```
 tmux send-keys -t claude-<agent> '/mcp'
@@ -172,3 +190,12 @@ surfaced them) lives in
   but can submit dangerous content if the history item is non-trivial.
 - **F4:** Never run the ceremony on snoopy's own pane — snoopy is the
   operator.
+- **F5 (2026-06-23):** On CC 2.1.183+ ESC-ESC OPENS the Rewind modal
+  (destructive on Enter) — single-Escape only; prefer functional
+  verification.
+- **F6 (2026-07-20, CC 2.1.215):** `/mcp reconnect task-board` works as
+  a direct argument command — inline success, no picker, zero ESC
+  exposure. Now the PREFERRED reconnect. Verify via fresh server pid.
+  Includes a safe operator-self-reconnect pattern (queued composer +
+  background sentinel) that supersedes F4's blanket ban for this
+  mechanism.
