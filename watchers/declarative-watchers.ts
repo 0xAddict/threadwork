@@ -33,6 +33,7 @@
 // expression.
 
 import type { Database } from 'bun:sqlite'
+import type { TaskDB, CreateTaskInput } from '../db'
 
 /** The three trigger_type values a declarative_watchers row may have. */
 export type TriggerType = 'scheduled' | 'state_change' | 'llm_eval'
@@ -555,4 +556,272 @@ export async function evaluateLlmCondition(spec: LlmEvalConditionSpec, client: L
   }
   const normalized = raw.trim().toLowerCase()
   return normalized === 'true'
+}
+
+// ---------------------------------------------------------------------------
+// PK-PF2-4 — fireWatcher() + idempotency (ATM-PF2-05/06, REQ-PF2-05/06/16)
+// and the getWatchers()/disableWatcher() lifecycle read-contracts
+// (ATM-PF2-07, REQ-PF2-07). evaluateWatchers()'s watchdog-tick dispatch
+// (REQ-PF2-03/04) is PK-PF2-5's job, out of this packet's FILE BOUNDARY (no
+// watchdog.ts/server.ts touch).
+// ---------------------------------------------------------------------------
+
+/**
+ * The minimal shape fireWatcher() needs from a `declarative_watchers` row:
+ * its id (for the firing row's `watcher_id` FK) and its already-parsed
+ * `action_spec` (the bounded task-template fields, validated as a plain
+ * object at createWatcher() time, PK-PF2-2). Building this from a raw DB
+ * row is the caller's job (PK-PF2-5's evaluateWatchers()).
+ */
+export interface FireableWatcherRow {
+  id: number
+  action_spec: {
+    description: unknown
+    to?: unknown
+    priority?: unknown
+    from?: unknown
+  }
+}
+
+export interface FireResult {
+  fired: boolean
+  taskId: number | null
+  firingId: number | null
+  /** true when this call was rejected because idempotencyKey was already fired (graceful, not an error). */
+  alreadyFired: boolean
+}
+
+function isUniqueConstraintViolation(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'SQLITE_CONSTRAINT_UNIQUE'
+}
+
+/**
+ * Builds the CreateTaskInput fireWatcher() passes to the EXISTING
+ * `createTask()` path from a watcher's `action_spec`. `action_spec` was
+ * only validated as "a plain object" at createWatcher() time (PK-PF2-2;
+ * its deeper task-template field shape was explicitly out of ATM-PF2-14's
+ * scope) — so this defensively re-validates the one field createTask()
+ * actually requires (`description`, non-empty string) and throws a clear,
+ * descriptive error rather than letting a malformed action_spec reach
+ * createTask() as `undefined`/a wrong type. `to`/`priority` fall back to
+ * createTask()'s own defaults (`to: null`, `priority` left to its DEFAULT
+ * 'normal' — mirrored here explicitly since CreateTaskInput has no default
+ * value of its own) when absent or malformed, rather than throwing, since
+ * omitting them is a legitimate, addressable-later watcher config, not a
+ * structural violation the way a missing description is.
+ */
+function buildCreateTaskInputFromActionSpec(actionSpec: FireableWatcherRow['action_spec'], fromAgent: string): CreateTaskInput {
+  if (typeof actionSpec.description !== 'string' || actionSpec.description.length === 0) {
+    throw new Error(
+      `fireWatcher(): action_spec.description must be a non-empty string — got ${JSON.stringify(actionSpec.description)}`,
+    )
+  }
+  return {
+    from: fromAgent,
+    to: typeof actionSpec.to === 'string' ? actionSpec.to : null,
+    description: actionSpec.description,
+    priority: typeof actionSpec.priority === 'string' && actionSpec.priority.length > 0 ? actionSpec.priority : 'normal',
+  }
+}
+
+/** The system-agent name fireWatcher() supplies as `from` on the tasks it creates. */
+const WATCHER_FIRING_FROM_AGENT = 'system'
+
+/**
+ * ATM-PF2-05/REQ-PF2-05/06 — Fires a watcher: creates exactly one task via
+ * the EXISTING `createTask()` path (db.ts:1444/1510 — never a new
+ * task-creation primitive, REQ-PF2-06) and records exactly one
+ * `declarative_watcher_firings` row, atomically, inside ONE LOCAL `BEGIN
+ * IMMEDIATE` transaction.
+ *
+ * `idempotencyKey` is an OPAQUE, caller-supplied string — this function
+ * does not derive it. The actual per-trigger-type derivation formula
+ * (what makes a given evaluation a distinct "occasion" worth firing once)
+ * requires context only `evaluateWatchers()` has (which tick, what `now`
+ * was used, which transition fired) — PK-PF2-5's scope. fireWatcher() only
+ * needs the key to be a string and relies on the DB-layer
+ * `UNIQUE(idempotency_key)` constraint (PK-PF2-1) as the actual fire-once
+ * enforcement (REQ-PF2-16) — never an app-level pre-check substituting for
+ * it (ATM-PF2-06: "not merely skipped by an app check").
+ *
+ * ATOMICITY: `taskDb.createTask()` internally does a single raw INSERT
+ * against `taskDb`'s own persistent connection (db.ts `run()` is not
+ * itself a transaction — see db.ts:281) with no BEGIN/COMMIT of its own,
+ * so calling it from INSIDE this function's own `BEGIN IMMEDIATE` (opened
+ * on that exact same connection, via `taskDb.run()`) makes the task INSERT
+ * part of this transaction. If the SUBSEQUENT firing-row INSERT is
+ * rejected by the UNIQUE constraint (a duplicate `idempotencyKey`), the
+ * whole transaction — including the task INSERT that already ran — rolls
+ * back, so a duplicate fire attempt leaves ZERO orphan task row. The
+ * rejection is caught and returned as a graceful `{fired: false,
+ * alreadyFired: true}` result, never thrown; any OTHER error (not a UNIQUE
+ * violation) still rolls back and rethrows.
+ */
+export function fireWatcher(taskDb: TaskDB, watcher: FireableWatcherRow, idempotencyKey: string): FireResult {
+  return taskDb.run(db => {
+    db.prepare('BEGIN IMMEDIATE').run()
+    try {
+      const task = taskDb.createTask(buildCreateTaskInputFromActionSpec(watcher.action_spec, WATCHER_FIRING_FROM_AGENT))
+      const firing = db
+        .prepare(`
+          INSERT INTO declarative_watcher_firings (watcher_id, created_task_id, idempotency_key)
+          VALUES (?, ?, ?)
+          RETURNING id
+        `)
+        .get(watcher.id, task.id, idempotencyKey) as { id: number }
+      db.prepare('COMMIT').run()
+      return { fired: true, taskId: task.id, firingId: firing.id, alreadyFired: false }
+    } catch (err) {
+      try { db.prepare('ROLLBACK').run() } catch {}
+      if (isUniqueConstraintViolation(err)) {
+        return { fired: false, taskId: null, firingId: null, alreadyFired: true }
+      }
+      throw err
+    }
+  })
+}
+
+/** A durable `declarative_watchers` row, as returned by getWatchers(). */
+export interface DeclarativeWatcherRow {
+  id: number
+  name: string
+  trigger_type: TriggerType
+  condition_spec: string
+  action_spec: string
+  enabled: number
+  last_fired_at: string | null
+  last_observed_value: string | null
+  last_observed_at: string | null
+  created_at: string
+}
+
+/**
+ * ATM-PF2-07/REQ-PF2-07 — Read-only lifecycle contract. Defaults to
+ * `enabled=1` only (mirrors PF1's `getSharedPatterns()`'s `activeOnly`
+ * default) — the natural input set for a subsequent `evaluateWatchers()`
+ * pass (PK-PF2-5). Pass `{enabledOnly: false}` to see disabled watchers
+ * too (e.g. for an admin listing). SELECT-only — never writes.
+ */
+export function getWatchers(db: Database, options: { enabledOnly?: boolean } = {}): DeclarativeWatcherRow[] {
+  const enabledOnly = options.enabledOnly ?? true
+  const where = enabledOnly ? 'WHERE enabled = 1' : ''
+  return db.prepare(`SELECT * FROM declarative_watchers ${where} ORDER BY id ASC`).all() as DeclarativeWatcherRow[]
+}
+
+/**
+ * ATM-PF2-07/REQ-PF2-07 — Disables a watcher by setting `enabled = 0`.
+ * NEVER deletes the row (declarative_watchers rows are never removed by
+ * this module). Returns `true` if a row was actually updated, `false` if
+ * `watcherId` doesn't exist (no error — a no-op disable is not a failure).
+ * A single `UPDATE` statement is already atomic under SQLite's autocommit
+ * mode — no explicit transaction wrapper needed.
+ */
+export function disableWatcher(db: Database, watcherId: number): boolean {
+  const result = db.prepare('UPDATE declarative_watchers SET enabled = 0 WHERE id = ?').run(watcherId)
+  return result.changes > 0
+}
+
+// ---------------------------------------------------------------------------
+// PK-PF2-4 hybrid addendum (main's ruling, msg a2661b4f) — computeIdempotencyKey().
+// SPEC-SILENT, SADIE-DECIDED ADDITION BEYOND THIS PACKET'S ORIGINAL ATM LIST
+// (ATM-PF2-05/06/07 name only fireWatcher()/getWatchers()/disableWatcher()),
+// RATIFIED BY MAIN, FLAGGED FOR CODEX REVIEW (see BASELINES.md's PF2-4
+// section for the full note + the PF2-6 codex checkpoint on these formulas
+// vs. REQ text). Built here, under calm TDD, rather than invented mid-wiring
+// inside PK-PF2-5 — fireWatcher() itself only ever consumes an opaque
+// caller-supplied idempotencyKey string (see fireWatcher()'s own docstring
+// above); this is that string's producer, for PK-PF2-5 to call.
+// ---------------------------------------------------------------------------
+
+/**
+ * A dynamic segment of an idempotency key. Deliberately narrow (matches
+ * `ScalarValue` plus plain strings/numbers) — every value this module ever
+ * feeds in is either a resolved DB scalar, a watcher id, a computed bucket
+ * number, or an ISO timestamp string.
+ */
+type KeySegmentValue = string | number | boolean | null
+
+/**
+ * Encodes one dynamic segment as a SELF-DELIMITING JSON token —
+ * `JSON.stringify` for string/number/boolean/null, or the bare literal
+ * `'undefined'` for `undefined` (JSON.stringify(undefined) is itself
+ * `undefined`, not a string, so it needs an explicit fallback to keep this
+ * encoding TOTAL). This is what makes composeKey() COLLISION-SAFE: every
+ * segment is a complete, independently-parseable JSON value (a quoted
+ * string with all internal quotes/backslashes escaped, or a bare number/
+ * bool/null/the `undefined` literal) — a literal `:` inside a dynamic
+ * string value can never be mistaken for the `:` JOIN separator between
+ * segments, because it only ever appears INSIDE a quoted segment's escaped
+ * content, never adjacent to an unescaped quote boundary. Raw `:`-joined
+ * interpolation (no per-segment encoding) does NOT have this property —
+ * e.g. `{a:'x', b:'y:z'}` and `{a:'x:y', b:'z'}` both naively join to the
+ * identical string `x:y:z`; JSON.stringify-ing each segment first makes
+ * them `"x":"y:z"` vs `"x:y":"z"` — distinct.
+ *
+ * KL-3 CAVEAT (BASELINES.md, PF1's own R4-HIGH finding, card #10376381):
+ * this encoding is injective GIVEN ITS INPUT, but SQLite's TEXT column
+ * round-trip is documented as LOSSY for lone-surrogate strings (a
+ * malformed UTF-16 sequence with no valid UTF-8 representation) — so if a
+ * dynamic segment here originated from a value already read back out of
+ * SQLite (e.g. `evaluateStateChangeCondition()`'s resolved scalar), two
+ * distinct ORIGINAL values could in principle have already collapsed to
+ * the same lossy string before ever reaching this function, defeating
+ * injectivity upstream of anything this function can control. Accepted
+ * for v1 (same disposition as KL-3 itself) — documented here and in
+ * BASELINES.md rather than silently assumed away; codex will weigh it.
+ */
+function encodeKeySegment(value: KeySegmentValue | undefined): string {
+  if (value === undefined) return 'undefined'
+  return JSON.stringify(value)
+}
+
+function composeKey(segments: ReadonlyArray<KeySegmentValue | undefined>): string {
+  return segments.map(encodeKeySegment).join(':')
+}
+
+/**
+ * Discriminated input to computeIdempotencyKey(), one shape per
+ * trigger_type — mirrors `ConditionSpec`'s own discriminated-union shape.
+ * The caller (PK-PF2-5's `evaluateWatchers()`) is responsible for
+ * computing `windowBucket`/`transitionTimestamp`/`evaluationTimestamp`
+ * from its own tick/evaluation context; this function only encodes them.
+ */
+export type IdempotencyKeyInput =
+  | { triggerType: 'scheduled'; watcherId: number; windowBucket: number }
+  | { triggerType: 'state_change'; watcherId: number; newValue: KeySegmentValue; transitionTimestamp: string }
+  | { triggerType: 'llm_eval'; watcherId: number; evaluationTimestamp: string }
+
+/**
+ * Computes the OPAQUE (to fireWatcher()) idempotency_key string for one
+ * fire-worthy evaluation occasion. PURE — no DB access, no wall-clock read
+ * (every timestamp/bucket is caller-supplied). Formulas (ratified by main,
+ * amended from sadie's original proposal for collision-safety —
+ * see BASELINES.md):
+ *
+ * - `scheduled`  -> watcherId + 'sched' + windowBucket
+ *   (`windowBucket` = `Math.floor(dueTimestamp / interval_seconds)`,
+ *   computed by the caller — each new due-window is a fresh occasion; the
+ *   SAME window re-evaluated twice before `last_fired_at` updates produces
+ *   the SAME key, correctly deduped by the DB UNIQUE constraint.)
+ * - `state_change` -> watcherId + 'state' + newValue + transitionTimestamp
+ *   (ties the key to the SPECIFIC transition's resulting value + the
+ *   timestamp it was observed at — a later, different transition gets a
+ *   fresh key.)
+ * - `llm_eval` -> watcherId + 'llm' + evaluationTimestamp
+ *   (each bounded prompt call is its own occasion; there is no natural
+ *   dedup key beyond time for this trigger_type — see the OPEN DESIGN NOTE
+ *   in BASELINES.md's PF2-4 section: this makes `llm_eval` idempotency
+ *   effectively per-evaluation-only, which REQ-PF2-05/14's text does not
+ *   resolve either way. Flagged for PK-PF2-6 codex review, not decided
+ *   here.)
+ */
+export function computeIdempotencyKey(input: IdempotencyKeyInput): string {
+  switch (input.triggerType) {
+    case 'scheduled':
+      return composeKey([input.watcherId, 'sched', input.windowBucket])
+    case 'state_change':
+      return composeKey([input.watcherId, 'state', input.newValue, input.transitionTimestamp])
+    case 'llm_eval':
+      return composeKey([input.watcherId, 'llm', input.evaluationTimestamp])
+  }
 }
