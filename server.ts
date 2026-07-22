@@ -33,6 +33,9 @@ import { forceDebrief } from './debrief'
 // flag-gated, try/catch-swallowed pre-act hook at all 4 claim/delegation
 // sites below. See PF1-4-DESIGN.md.
 import { recordExpectedOutcome } from './reflection/outcome-feedback'
+// EPIC-PF2 (PK-PF2-5, ATM-PF2-08/REQ-PF2-08): additive create_watcher/
+// list_watchers/disable_watcher MCP tool cases below. See PF2-5-DESIGN.md.
+import { createWatcher, getWatchers, disableWatcher } from './watchers/declarative-watchers'
 import {
   DELEGATION_BRIEFS_FLAG,
   assembleDelegationBrief,
@@ -781,6 +784,47 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           task_id: { type: 'number', description: 'The task ID to unpark' },
         },
         required: ['task_id'],
+      },
+    },
+    {
+      // EPIC-PF2 (PK-PF2-5, ATM-PF2-08). Works regardless of
+      // declarative_watchers_enabled's current value (REQ-PF2-08 names no
+      // flag conditionality; REQ-PF2-09's byte-identical-tick guarantee is
+      // scoped to the automatic evaluateWatchers() pass, not this explicit
+      // tool — PF2-5-DESIGN.md open item #1, ratified Reading A).
+      name: 'create_watcher',
+      description: "Create a declarative watcher (a when-X-do-Y rule: trigger_type scheduled/state_change/llm_eval, a bounded condition_spec, and an action_spec task template). Validates condition_spec against its trigger_type's schema and rejects any open-expression shape. Works regardless of declarative_watchers_enabled's current value — the flag only gates the automatic watchdog-tick evaluation pass, not explicit watcher configuration.",
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          name: { type: 'string', description: 'A human-readable watcher name' },
+          trigger_type: { type: 'string', enum: ['scheduled', 'state_change', 'llm_eval'], description: 'Which bounded condition evaluator this watcher uses' },
+          condition_spec: { type: 'object', description: "Bounded, typed JSON matching trigger_type's schema — scheduled: {interval_seconds}; state_change: {watched_table, watched_column, comparator, operand, watched_selector? XOR watched_aggregate?}; llm_eval: {prompt, max_tokens?}. Rejected (with a descriptive error) if it does not conform." },
+          action_spec: { type: 'object', description: 'Task-template fields for the task fireWatcher() creates on a match — requires {description, to}, optionally {priority}.' },
+        },
+        required: ['name', 'trigger_type', 'condition_spec', 'action_spec'],
+      },
+    },
+    {
+      name: 'list_watchers',
+      description: 'List declarative watchers. Defaults to enabled-only.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          include_disabled: { type: 'boolean', description: 'Include disabled watchers too (default: false, enabled-only).' },
+        },
+        required: [],
+      },
+    },
+    {
+      name: 'disable_watcher',
+      description: 'Disable a declarative watcher (sets enabled=0). Never deletes the row.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          watcher_id: { type: 'number', description: 'The watcher ID to disable' },
+        },
+        required: ['watcher_id'],
       },
     },
   ],
@@ -2203,6 +2247,38 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         await postToGroupThreaded(`▶️ #${task.id} unparked → ${task.status} by ${SELF_LABEL}.`, task.id)
         audit.log(SELF_LABEL, 'task_unparked', { task_id: taskId, restored_status: task.status }, taskId)
         return { content: [{ type: 'text', text: `Task #${task.id} unparked — restored to ${task.status}.${rearmed}` }] }
+      }
+
+      case 'create_watcher': {
+        // EPIC-PF2 (PK-PF2-5, ATM-PF2-08/REQ-PF2-08). createWatcher()
+        // itself performs all validation + persistence + the
+        // 'watcher_created' audit row (in its own BEGIN IMMEDIATE
+        // transaction, watchers/declarative-watchers.ts) — this case is a
+        // thin, direct pass-through, matching this file's own
+        // error-response idiom (isError: true text, never an uncaught
+        // exception at the MCP transport boundary).
+        try {
+          const id = db.run(handle => createWatcher(handle, {
+            name: args.name as string,
+            trigger_type: args.trigger_type as string,
+            condition_spec: args.condition_spec,
+            action_spec: args.action_spec,
+          }))
+          return { content: [{ type: 'text', text: `Watcher #${id} ("${args.name}") created.` }] }
+        } catch (err) {
+          return { content: [{ type: 'text', text: `create_watcher failed: ${err instanceof Error ? err.message : String(err)}`, isError: true }] }
+        }
+      }
+
+      case 'list_watchers': {
+        const watchers = db.run(handle => getWatchers(handle, { enabledOnly: !(args.include_disabled as boolean | undefined) }))
+        return { content: [{ type: 'text', text: JSON.stringify(watchers, null, 2) }] }
+      }
+
+      case 'disable_watcher': {
+        const watcherId = args.watcher_id as number
+        const changed = db.run(handle => disableWatcher(handle, watcherId))
+        return { content: [{ type: 'text', text: changed ? `Watcher #${watcherId} disabled.` : `Watcher #${watcherId} not found — no change.` }] }
       }
 
       default:
