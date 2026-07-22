@@ -705,6 +705,15 @@ describe('ATM-PF2-13: evaluateLlmCondition() (runtime, mocked LLM client)', () =
     expect(client.callCount).toBe(2) // one more call per one more evaluation, never internally retried within a single call
   })
 
+  test('PK-PF2-6 round 2 fold: a malformed client that resolves a non-string value (boolean, object) defaults to false, never throws -- the "never throws" contract (REQ-PF2-14/ATM-PF2-13) covers the WHOLE call, not just the awaited promise rejecting', async () => {
+    for (const malformed of [true, { ok: true }, 42, null]) {
+      const client = { async complete(): Promise<unknown> { return malformed } } as unknown as LlmEvalClient
+      let result: boolean | undefined
+      await expect((async () => { result = await evaluateLlmCondition({ prompt: 'p' }, client) })()).resolves.toBeUndefined()
+      expect(result).toBe(false)
+    }
+  })
+
   test('max_tokens is passed through to the client; defaults to a bounded value when omitted', async () => {
     const client = mockClient('true')
     await evaluateLlmCondition({ prompt: 'p', max_tokens: 42 }, client)

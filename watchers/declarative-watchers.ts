@@ -589,14 +589,20 @@ export interface LlmEvalClient {
  * ambiguous or accidental fire.
  */
 export async function evaluateLlmCondition(spec: LlmEvalConditionSpec, client: LlmEvalClient): Promise<boolean> {
-  let raw: string
+  // PK-PF2-6 round 2 fold (codex, LOW): normalization used to happen AFTER
+  // the try/catch, so a malformed client resolving something other than a
+  // string (the interface promises `Promise<string>`, but nothing enforces
+  // that at runtime) threw at `raw.trim()` instead of defaulting to false —
+  // violating REQ-PF2-14/ATM-PF2-13's "never throws" contract, which covers
+  // the WHOLE call, not just the awaited promise rejecting. The type check
+  // now lives inside the guarded block, alongside the reject-path catch.
   try {
-    raw = await client.complete(spec.prompt, spec.max_tokens ?? LLM_EVAL_DEFAULT_MAX_TOKENS)
+    const raw = await client.complete(spec.prompt, spec.max_tokens ?? LLM_EVAL_DEFAULT_MAX_TOKENS)
+    if (typeof raw !== 'string') return false
+    return raw.trim().toLowerCase() === 'true'
   } catch {
     return false
   }
-  const normalized = raw.trim().toLowerCase()
-  return normalized === 'true'
 }
 
 // ---------------------------------------------------------------------------
