@@ -426,9 +426,16 @@ function resolveSelectorScalar(
   column: string,
   selector: Record<string, ScalarValue>,
 ): ScalarResolution {
+  // PK-PF2-6 round 1 fold — HIGH finding 4a: SQL `=` is never true against
+  // a NULL operand (`x = NULL` is always UNKNOWN, not TRUE, per SQL's
+  // three-valued logic) — binding a null selector value as a `= ?`
+  // parameter meant a row whose actual column value IS NULL could never
+  // be matched, silently returning UNAVAILABLE forever. A null-valued
+  // selector term now generates `IS NULL` (no bound parameter for that
+  // term) instead.
   const keys = Object.keys(selector)
-  const whereClause = keys.map(k => `${quoteIdentifier(k)} = ?`).join(' AND ')
-  const params = keys.map(k => selector[k])
+  const whereClause = keys.map(k => (selector[k] === null ? `${quoteIdentifier(k)} IS NULL` : `${quoteIdentifier(k)} = ?`)).join(' AND ')
+  const params = keys.filter(k => selector[k] !== null).map(k => selector[k])
   const rows = db
     .prepare(`SELECT ${quoteIdentifier(column)} AS scalar FROM ${quoteIdentifier(table)} WHERE ${whereClause}`)
     .all(...params) as { scalar: ResolvedScalar }[]
@@ -507,15 +514,26 @@ export function evaluateStateChangeCondition(watcher: StateChangeWatcherRow, db:
 
     const currentScalar = resolution.value
     const priorRow = db
-      .prepare('SELECT last_observed_value FROM declarative_watchers WHERE id = ?')
-      .get(watcher.id) as { last_observed_value: string | null } | null
+      .prepare('SELECT last_observed_value, last_observed_at FROM declarative_watchers WHERE id = ?')
+      .get(watcher.id) as { last_observed_value: string | null; last_observed_at: string | null } | null
     const priorSnapshot: string | null = priorRow?.last_observed_value ?? null
+    // PK-PF2-6 round 1 fold — HIGH finding 4b: SQL NULL is a valid resolved
+    // scalar (a watched column can genuinely hold NULL), so
+    // `priorSnapshot === null` cannot distinguish "never observed" from
+    // "was observed and the value WAS null" — both left `last_observed_value`
+    // as NULL. That conflation made every repeat observation of a genuine
+    // null value look like a fresh "never observed" state, causing a
+    // spurious re-fire on every single evaluation instead of only on the
+    // real transition. `last_observed_at` is the correct presence marker:
+    // it is set (non-null) the moment ANY observation — including a null
+    // one — is first persisted, and stays null only when truly unobserved.
+    const hasPriorObservation = (priorRow?.last_observed_at ?? null) !== null
 
     let fires: boolean
     if (spec.comparator === 'changed') {
-      fires = priorSnapshot !== null && stringifyScalar(currentScalar) !== priorSnapshot
+      fires = hasPriorObservation && stringifyScalar(currentScalar) !== priorSnapshot
     } else {
-      const priorPredicateTrue = priorSnapshot === null ? false : comparePredicate(spec.comparator, priorSnapshot, spec.operand)
+      const priorPredicateTrue = hasPriorObservation ? comparePredicate(spec.comparator, priorSnapshot, spec.operand) : false
       const currentPredicateTrue = comparePredicate(spec.comparator, currentScalar, spec.operand)
       fires = !priorPredicateTrue && currentPredicateTrue
     }

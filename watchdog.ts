@@ -161,6 +161,26 @@ function logError(msg: string, err?: unknown): void {
   console.error(`[${new Date().toISOString()}] [watchdog] ERROR: ${msg}`, err ?? '')
 }
 
+/**
+ * PK-PF2-6 round 1 fold — HIGH finding 1. Parses a SQLite `datetime('now')`
+ * -shaped string (`YYYY-MM-DD HH:MM:SS`, always UTC, no timezone marker) as
+ * UTC. A bare `Date.parse()` on that exact format is NOT safe: Bun/Node
+ * (per the ECMA-262 spec's non-ISO fallback parsing) interpret a
+ * space-separated, marker-less datetime string as LOCAL time, introducing
+ * a host-timezone-dependent offset — empirically confirmed to be a full
+ * 3-hour error in this build's own environment (Europe/Helsinki, UTC+3 in
+ * July), enough to make a just-fired watcher with an `interval_seconds`
+ * under ~3 hours appear immediately due again. Fixed by converting to an
+ * unambiguous ISO-8601 string (`T` separator + explicit `Z` suffix) before
+ * parsing — a form every JS engine parses as UTC deterministically, per
+ * spec, regardless of host timezone. Pure, exported for direct unit
+ * testing (mirrors `findStaleTasks()`/`determineAction()`'s own
+ * top-level-exported-utility pattern below).
+ */
+export function parseUtcSqliteDatetime(value: string): number {
+  return Date.parse(value.replace(' ', 'T') + 'Z')
+}
+
 // ---------------------------------------------------------------------------
 // Legacy exports (backward compatibility)
 // ---------------------------------------------------------------------------
@@ -1688,7 +1708,7 @@ export class TaskReconciler {
     for (const row of watchers) {
       if (row.trigger_type === 'scheduled') {
         const spec = JSON.parse(row.condition_spec) as ScheduledConditionSpec
-        const lastFiredAtMs = row.last_fired_at === null ? null : Date.parse(row.last_fired_at)
+        const lastFiredAtMs = row.last_fired_at === null ? null : parseUtcSqliteDatetime(row.last_fired_at)
         const lastFiredAtSec = lastFiredAtMs === null || Number.isNaN(lastFiredAtMs) ? null : Math.floor(lastFiredAtMs / 1000)
         const nowSec = Math.floor(now / 1000)
         if (evaluateScheduledCondition({ interval_seconds: spec.interval_seconds, last_fired_at: lastFiredAtSec }, nowSec)) {

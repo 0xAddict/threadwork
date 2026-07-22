@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { unlinkSync } from 'fs'
 import { TaskDB } from '../db'
 import { AuditLog } from '../audit'
-import { TaskReconciler, type ReconcileResult, findStaleTasks, determineAction } from '../watchdog'
+import { TaskReconciler, type ReconcileResult, findStaleTasks, determineAction, parseUtcSqliteDatetime } from '../watchdog'
 import { createWatcher } from '../watchers/declarative-watchers'
 
 // PK-PF2-5 Stage B (ATM-PF2-04, REQ-PF2-03/04/09) — evaluateWatchers(),
@@ -228,6 +228,68 @@ describe('scheduled watcher dispatch (flag ON)', () => {
       condition_spec: { interval_seconds: -5 },
       action_spec: { description: 'x', to: 'sadie' },
     }))).toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PK-PF2-6 round 1 fold — HIGH finding 1: `last_fired_at` (SQLite
+// `datetime('now')`, a UTC, timezone-marker-less "YYYY-MM-DD HH:MM:SS"
+// string) was being parsed via a bare `Date.parse()`, which Bun/Node
+// interpret as LOCAL time for that space-separated, non-ISO format —
+// introducing a host-timezone-dependent offset into every scheduled
+// due-check. `parseUtcSqliteDatetime()` fixes this by converting to an
+// unambiguous ISO-8601 string (`T` separator + explicit `Z` suffix)
+// before parsing — a form every JS engine parses as UTC per spec,
+// regardless of the host's ambient timezone.
+//
+// DETERMINISTIC, TZ-INDEPENDENT test design (per main's instruction): a
+// FIXED `last_fired_at` string + a FIXED injected `now` (via `Date.now()`
+// override, in epoch milliseconds — never a locale-formatted read), with
+// the expected due/not-due result computed independently via
+// `Date.UTC(...)` (never `new Date(...).getHours()`-style local accessors)
+// — so this test's own PASS/FAIL does not depend on the CI/dev host's
+// timezone either, only on `parseUtcSqliteDatetime()` genuinely parsing as
+// UTC. Confirmed by running this exact test unmodified: it was RED before
+// the fix (misparsed as local time, wrong due-calc) and GREEN after.
+// ---------------------------------------------------------------------------
+
+describe('PK-PF2-6 round 1 fold: parseUtcSqliteDatetime() parses SQLite datetime(\'now\') strings as UTC, independent of host timezone', () => {
+  test('parseUtcSqliteDatetime("2026-07-22 00:00:00") equals the UTC epoch millisecond value for that exact wall-clock moment, computed independently via Date.UTC()', () => {
+    const expected = Date.UTC(2026, 6, 22, 0, 0, 0) // month is 0-indexed: 6 = July
+    expect(parseUtcSqliteDatetime('2026-07-22 00:00:00')).toBe(expected)
+  })
+
+  test('a scheduled watcher fired exactly at a KNOWN UTC instant is correctly judged NOT due one second before its interval elapses, and DUE the instant it does -- both computed relative to a FIXED, injected now (Date.now() override), never the ambient host clock/timezone', async () => {
+    taskDb.setFeatureFlag('declarative_watchers_enabled', true)
+    const id = taskDb.run(handle => createWatcher(handle, {
+      name: 'utc-fixed-clock watcher',
+      trigger_type: 'scheduled',
+      condition_spec: { interval_seconds: 7200 }, // 2 hours -- exactly the width of a plausible host UTC offset, per the round-1 finding
+      action_spec: { description: 'utc test', to: 'sadie' },
+    }))
+    // Seed last_fired_at directly as SQLite's own datetime('now') would
+    // produce it -- a fixed, known UTC instant, space-separated, no
+    // timezone marker.
+    const firedAtUtc = '2026-07-22 00:00:00'
+    taskDb.run(d => d.prepare('UPDATE declarative_watchers SET last_fired_at = ? WHERE id = ?').run(firedAtUtc, id))
+    const firedAtMs = Date.UTC(2026, 6, 22, 0, 0, 0)
+
+    const originalNow = Date.now
+    try {
+      // 1 second before the 2-hour interval elapses -- must NOT be due.
+      Date.now = () => firedAtMs + 7200_000 - 1000
+      const r1 = freshResult()
+      await reconciler.evaluateWatchers(r1)
+      expect(r1.watchers_fired ?? 0).toBe(0)
+
+      // Exactly at the 2-hour mark -- must be due (inclusive boundary, REQ-PF2-12).
+      Date.now = () => firedAtMs + 7200_000
+      const r2 = freshResult()
+      await reconciler.evaluateWatchers(r2)
+      expect(r2.watchers_fired).toBe(1)
+    } finally {
+      Date.now = originalNow
+    }
   })
 })
 

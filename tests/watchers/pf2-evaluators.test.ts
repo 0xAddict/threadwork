@@ -416,7 +416,7 @@ describe('ATM-PF2-12/15/16: evaluateStateChangeCondition() (runtime, fresh DB)',
       proto.prepare = function (this: Database, ...callArgs: unknown[]) {
         const sql = (callArgs[0] as string).trim()
         if (sql === 'BEGIN IMMEDIATE') sequence.push('BEGIN IMMEDIATE')
-        else if (/^SELECT last_observed_value FROM declarative_watchers/.test(sql)) sequence.push('SNAPSHOT_READ')
+        else if (/^SELECT last_observed_value, last_observed_at FROM declarative_watchers/.test(sql)) sequence.push('SNAPSHOT_READ')
         else if (/^UPDATE declarative_watchers SET last_observed_value/.test(sql)) sequence.push('SNAPSHOT_WRITE')
         else if (sql === 'COMMIT') sequence.push('COMMIT')
         return originalPrepare.apply(this, callArgs)
@@ -453,6 +453,140 @@ describe('ATM-PF2-12/15/16: evaluateStateChangeCondition() (runtime, fresh DB)',
       }))).toThrow()
       const count = db.run(d => d.prepare('SELECT COUNT(*) AS n FROM declarative_watchers').get()) as { n: number }
       expect(count.n).toBe(0)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PK-PF2-6 round 1 fold — HIGH finding 4 (both halves): SQL NULL was
+// conflated with "no prior snapshot"/"selector never matches".
+// ---------------------------------------------------------------------------
+
+describe('PK-PF2-6 round 1 fold: null-valued watched_selector terms use IS NULL, not = ? (a NULL parameter never matches via "=")', () => {
+  test('a watched_selector with a null value correctly resolves a row whose actual column value IS NULL (previously always UNAVAILABLE -- 0 rows -- since SQL `col = NULL` never matches)', () => {
+    const { db, path } = freshDb()
+    try {
+      db.run(d => d.prepare(
+        "INSERT INTO tasks (from_agent, to_agent, description, priority, status, result) VALUES ('sadie','sadie','seed','normal','pending', NULL)",
+      ).run())
+
+      const watcher: StateChangeWatcherRow = {
+        id: db.run(handle => createWatcher(handle, {
+          name: 'null-selector watcher',
+          trigger_type: 'state_change',
+          condition_spec: {
+            watched_table: 'tasks', watched_column: 'status', comparator: 'eq', operand: 'completed',
+            watched_selector: { result: null }, // selects the row WHERE result IS NULL
+          },
+          action_spec: {},
+        })),
+        condition_spec: {
+          watched_table: 'tasks', watched_column: 'status', comparator: 'eq', operand: 'completed',
+          watched_selector: { result: null },
+        },
+      }
+
+      // If the selector resolved to UNAVAILABLE (the pre-fix bug), the
+      // snapshot would stay NULL forever and this would never distinguish
+      // from "never observed". Prove resolution actually happens: fire the
+      // eval once to seed the snapshot, then transition and fire again --
+      // both must work, which is only possible if the null-valued selector
+      // genuinely matched the seeded row.
+      const r1 = db.run(handle => evaluateStateChangeCondition(watcher, handle))
+      expect(r1).toBe(false) // status='pending' -> eq 'completed' is false, seeds snapshot
+
+      const row = db.run(d => d.prepare('SELECT last_observed_value FROM declarative_watchers WHERE id = ?').get(watcher.id)) as { last_observed_value: string | null }
+      expect(row.last_observed_value).toBe('pending') // proves the selector resolved the row, not UNAVAILABLE (which would leave it NULL)
+
+      db.run(d => d.prepare("UPDATE tasks SET status = 'completed' WHERE result IS NULL").run())
+      const r2 = db.run(handle => evaluateStateChangeCondition(watcher, handle))
+      expect(r2).toBe(true) // genuine transition, fires
+    } finally {
+      cleanup(db, path)
+    }
+  })
+})
+
+describe('PK-PF2-6 round 1 fold: last_observed_at (not last_observed_value===null) is the "never observed" presence marker', () => {
+  test('a watched column that is genuinely NULL on its first observation, and STAYS null on the second observation, does NOT re-fire (a stable level, not a fresh transition) -- the pre-fix bug conflated "genuinely observed null" with "never observed", causing a spurious re-fire every time', () => {
+    const { db, path } = freshDb()
+    try {
+      const taskId = db.run(d => (d.prepare(
+        "INSERT INTO tasks (from_agent, to_agent, description, priority, status, result) VALUES ('sadie','sadie','seed','normal','pending', NULL) RETURNING id",
+      ).get() as { id: number }).id)
+
+      const watcher: StateChangeWatcherRow = {
+        id: db.run(handle => createWatcher(handle, {
+          name: 'genuine-null watcher',
+          trigger_type: 'state_change',
+          condition_spec: {
+            watched_table: 'tasks', watched_column: 'result', comparator: 'eq', operand: null,
+            watched_selector: { id: taskId },
+          },
+          action_spec: {},
+        })),
+        condition_spec: {
+          watched_table: 'tasks', watched_column: 'result', comparator: 'eq', operand: null,
+          watched_selector: { id: taskId },
+        },
+      }
+
+      // Eval 1: result IS NULL, first-ever observation -- "eq null" is
+      // true, and there's genuinely no prior data, so this is a legitimate
+      // absent->true transition (fires, matches Checkpoint 4's own
+      // "absent->true is explicit" reasoning).
+      const r1 = db.run(handle => evaluateStateChangeCondition(watcher, handle))
+      expect(r1).toBe(true)
+
+      // Eval 2: result is STILL NULL, unchanged -- "eq null" is still
+      // true, but it was ALSO true last time (a genuine prior observation
+      // of null, not "unobserved") -- must NOT re-fire.
+      const r2 = db.run(handle => evaluateStateChangeCondition(watcher, handle))
+      expect(r2).toBe(false)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
+  test('"changed" comparator: a genuinely-observed null that transitions to a non-null value fires; repeating the same non-null value afterward does not re-fire', () => {
+    const { db, path } = freshDb()
+    try {
+      const taskId = db.run(d => (d.prepare(
+        "INSERT INTO tasks (from_agent, to_agent, description, priority, status, result) VALUES ('sadie','sadie','seed','normal','pending', NULL) RETURNING id",
+      ).get() as { id: number }).id)
+
+      const watcher: StateChangeWatcherRow = {
+        id: db.run(handle => createWatcher(handle, {
+          name: 'changed-from-null watcher',
+          trigger_type: 'state_change',
+          condition_spec: {
+            watched_table: 'tasks', watched_column: 'result', comparator: 'changed', operand: null,
+            watched_selector: { id: taskId },
+          },
+          action_spec: {},
+        })),
+        condition_spec: {
+          watched_table: 'tasks', watched_column: 'result', comparator: 'changed', operand: null,
+          watched_selector: { id: taskId },
+        },
+      }
+
+      // First-ever observation (result=null) -- no prior snapshot to have
+      // "changed" from -- must not fire (matches the existing, already-
+      // shipped "changed" contract for the non-null case).
+      const r1 = db.run(handle => evaluateStateChangeCondition(watcher, handle))
+      expect(r1).toBe(false)
+
+      // Value changes from null to a real value -- genuine change, fires.
+      db.run(d => d.prepare("UPDATE tasks SET result = 'done' WHERE id = ?").run(taskId))
+      const r2 = db.run(handle => evaluateStateChangeCondition(watcher, handle))
+      expect(r2).toBe(true)
+
+      // Unchanged again -- no re-fire.
+      const r3 = db.run(handle => evaluateStateChangeCondition(watcher, handle))
+      expect(r3).toBe(false)
     } finally {
       cleanup(db, path)
     }
