@@ -436,8 +436,16 @@ function resolveSelectorScalar(
   const keys = Object.keys(selector)
   const whereClause = keys.map(k => (selector[k] === null ? `${quoteIdentifier(k)} IS NULL` : `${quoteIdentifier(k)} = ?`)).join(' AND ')
   const params = keys.filter(k => selector[k] !== null).map(k => selector[k])
+  // PK-PF2-6 round 1 fold — Checkpoint 1 sub-finding (MED, codex): this
+  // query was unbounded (`.all()` with no LIMIT), so a watched_selector
+  // that happens to match many rows (misconfiguration, not attacker input
+  // — assertSafeIdentifier() already closes the injection surface) could
+  // materialize an arbitrarily large result set before the rows.length!==1
+  // check below ever runs. LIMIT 2 is the smallest bound that still lets
+  // that check tell "exactly 1" from "more than 1" apart — pure resource
+  // bounding, zero change to the returned ScalarResolution for any input.
   const rows = db
-    .prepare(`SELECT ${quoteIdentifier(column)} AS scalar FROM ${quoteIdentifier(table)} WHERE ${whereClause}`)
+    .prepare(`SELECT ${quoteIdentifier(column)} AS scalar FROM ${quoteIdentifier(table)} WHERE ${whereClause} LIMIT 2`)
     .all(...params) as { scalar: ResolvedScalar }[]
   // REQ-PF2-18: a watched_selector must identify a SINGLE row. 0 or >1 rows
   // is UNAVAILABLE — not an error, not a fire; the caller leaves the

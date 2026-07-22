@@ -436,6 +436,32 @@ describe('ATM-PF2-12/15/16: evaluateStateChangeCondition() (runtime, fresh DB)',
     }
   })
 
+  test('PK-PF2-6 round 1 fold: Checkpoint 1 -- the selector-scalar query is bounded with LIMIT 2, so a non-unique selector cannot materialize an unbounded result set before the single-row check runs', () => {
+    const { db, path } = freshDb()
+    try {
+      const taskId = db.run(d => (d.prepare("INSERT INTO tasks (from_agent, to_agent, description, priority, status) VALUES ('sadie','sadie','seed','normal','completed') RETURNING id").get() as { id: number }).id)
+      const watcher = createSelectorWatcher(db, taskId)
+
+      const proto = Database.prototype as unknown as { prepare: (this: Database, ...args: unknown[]) => any }
+      const originalPrepare = proto.prepare
+      let selectorSql: string | null = null
+      proto.prepare = function (this: Database, ...callArgs: unknown[]) {
+        const sql = (callArgs[0] as string).trim()
+        if (/^SELECT "status" AS scalar FROM "tasks"/.test(sql)) selectorSql = sql
+        return originalPrepare.apply(this, callArgs)
+      }
+      try {
+        db.run(handle => evaluateStateChangeCondition(watcher, handle))
+      } finally {
+        proto.prepare = originalPrepare
+      }
+      expect(selectorSql).not.toBeNull()
+      expect(selectorSql as unknown as string).toMatch(/LIMIT 2\s*$/)
+    } finally {
+      cleanup(db, path)
+    }
+  })
+
   test('watched_table/watched_column with unsafe identifier characters are rejected upstream by createWatcher() (identifier-injection guard)', () => {
     const { db, path } = freshDb()
     try {
